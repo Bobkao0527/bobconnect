@@ -395,6 +395,11 @@
             }
         }
 
+        // --- 接收端：啟動相機掃描 ---
+        function startJoinerScanner() {
+            startScanner();
+        }
+
         // --- 相機掃描控制 ---
         async function startScanner() {
             const modal = document.getElementById('scanner-modal');
