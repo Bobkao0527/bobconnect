@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC P2P 免伺服器大檔案直連傳輸工具</title>
+    <!-- 引入 Tailwind CSS 提供現代美觀的 UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3b82f6',
+                        secondary: '#10b981',
+                        darkBg: '#0f172a',
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-slate-900 text-slate-100 font-sans min-h-screen flex flex-col">
+
+    <!-- 頂部導航欄 -->
+    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50 px-6 py-4">
+        <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+            <div class="flex items-center gap-3">
+                <div class="bg-blue-500 text-white p-2 rounded-lg shadow-lg shadow-blue-500/30">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+                </div>
+                <div>
+                    <h1 class="font-bold text-xl tracking-tight bg-gradient-to-r bg-clip-text text-transparent from-blue-400 to-emerald-400">WebRTC P2P 瀏覽器大檔案直傳</h1>
+                    <p class="text-xs text-slate-400">無需上傳雲端 · 無檔案大小限制 · 安全加密</p>
+                </div>
+            </div>
+            <div class="flex gap-2">
+                <a href="#tech-intro" class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-lg transition">技術原理解析</a>
+            </div>
+        </div>
+    </header>
+
+    <!-- 主要內容區 -->
+    <main class="flex-grow max-w-6xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        <!-- 左側：P2P 傳輸控制台 (12格中佔7格) -->
+        <section class="lg:col-span-7 space-y-6">
+            
+            <!-- 第一步：建立連線控制面板 -->
+            <div class="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-6 backdrop-blur">
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold">1</span>
+                    <h2 class="text-lg font-semibold">建立 P2P 聯絡通道</h2>
+                </div>
+                
+                <p class="text-sm text-slate-300 mb-4 leading-relaxed">
+                    本工具採用**無伺服器（Signaling-free 手動信令）**模式。請在兩台裝置同時打開此網頁，一台扮演「發起者」，另一台扮演「接收者」，互相複製貼上信令程式碼即可連線。
+                </p>
+
+                <!-- 角色選擇與初始化 -->
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <button id="btn-role-host" onclick="initHost()" class="py-3 px-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 font-medium transition text-center flex flex-col items-center gap-1">
+                        <span class="text-lg font-bold">我是「發起者」</span>
+                        <span class="text-xs text-blue-400/80">我要傳送或接收檔案</span>
+                    </button>
+                    <button id="btn-role-joiner" onclick="initJoiner()" class="py-3 px-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium transition text-center flex flex-col items-center gap-1">
+                        <span class="text-lg font-bold">我是「接收者」</span>
+                        <span class="text-xs text-emerald-400/80">我準備與發起者對接</span>
+                    </button>
+                </div>
+
+                <!-- 手動信令交換流程 UI -->
+                <div id="signaling-box" class="hidden space-y-4 border-t border-slate-700/50 pt-4">
+                    <!-- 發起者步驟一 -->
+                    <div id="host-step-1" class="hidden space-y-2">
+                        <label class="block text-sm text-blue-300 font-medium">1. 請複製下方「您的邀請碼」傳給對方：</label>
+                        <div class="flex gap-2">
+                            <textarea id="local-offer" readonly class="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono text-slate-300 resize-none focus:outline-none"></textarea>
+                        </div>
+                        <button onclick="copySignaling('local-offer')" class="w-full bg-slate-700 hover:bg-slate-600 py-1.5 rounded text-xs font-medium transition">複製邀請碼</button>
+                    </div>
+
+                    <!-- 接收者步驟一 -->
+                    <div id="joiner-step-1" class="hidden space-y-2">
+                        <label class="block text-sm text-emerald-300 font-medium">1. 請在下方貼上「發起者的邀請碼」：</label>
+                        <textarea id="remote-offer" placeholder="在此處貼上對方的邀請碼..." class="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono text-slate-300 resize-none focus:outline-none focus:border-emerald-500"></textarea>
+                        <button onclick="createAnswer()" class="w-full bg-emerald-600 hover:bg-emerald-500 py-2 rounded text-xs font-bold transition">解析邀請並生成「回覆碼」</button>
+                    </div>
+
+                    <!-- 接收者步驟二 -->
+                    <div id="joiner-step-2" class="hidden space-y-2">
+                        <label class="block text-sm text-emerald-300 font-medium">2. 請複製下方生成的「您的回覆碼」給發起者：</label>
+                        <textarea id="local-answer" readonly class="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono text-slate-300 resize-none focus:outline-none"></textarea>
+                        <button onclick="copySignaling('local-answer')" class="w-full bg-slate-700 hover:bg-slate-600 py-1.5 rounded text-xs font-medium transition">複製回覆碼</button>
+                    </div>
+
+                    <!-- 發起者步驟二 -->
+                    <div id="host-step-2" class="hidden space-y-2">
+                        <label class="block text-sm text-blue-300 font-medium">2. 請在下方貼上「接收者的回覆碼」：</label>
+                        <textarea id="remote-answer" placeholder="在此處貼上對方的回覆碼..." class="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg p-2 text-xs font-mono text-slate-300 resize-none focus:outline-none focus:border-blue-500"></textarea>
+                        <button onclick="acceptAnswer()" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded text-xs font-bold transition">確認對接，建立連線</button>
+                    </div>
+                </div>
+
+                <!-- 狀態指示器 -->
+                <div id="connection-status" class="mt-4 p-3 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
+                    <span class="text-xs text-slate-400">目前連線狀態：</span>
+                    <div class="flex items-center gap-2">
+                        <span id="status-indicator" class="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse"></span>
+                        <span id="status-text" class="text-xs font-semibold text-red-400">未連線</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 第二步：檔案選取與傳輸控制 -->
+            <div id="transfer-panel" class="opacity-50 pointer-events-none bg-slate-800/50 border border-slate-700/50 rounded-2xl p-6 backdrop-blur transition-opacity duration-300">
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold">2</span>
+                    <h2 class="text-lg font-semibold">選擇大檔案並傳輸</h2>
+                </div>
+
+                <!-- 拖曳上傳區 -->
+                <div id="drop-zone" class="border-2 border-dashed border-slate-600 hover:border-blue-500 rounded-xl p-8 text-center cursor-pointer transition-colors group">
+                    <input type="file" id="file-input" class="hidden" />
+                    <svg class="w-12 h-12 text-slate-500 group-hover:text-blue-400 mx-auto mb-2 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                    <p class="text-sm font-medium text-slate-300 group-hover:text-white transition-colors">點擊選擇大檔案，或拖曳檔案到這裡</p>
+                    <p class="text-xs text-slate-500 mt-1">本地讀取，不限格式與容量大小</p>
+                </div>
+
+                <!-- 檔案資訊與進度條 -->
+                <div id="file-info-container" class="hidden mt-4 space-y-3 bg-slate-900/80 p-4 rounded-xl border border-slate-700">
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <p id="info-file-name" class="font-semibold text-sm text-white truncate max-w-xs md:max-w-md">檔案名稱.ext</p>
+                            <p id="info-file-size" class="text-xs text-slate-400 mt-0.5">檔案大小: 0 Bytes</p>
+                        </div>
+                        <button id="btn-send" onclick="sendFileChunks()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow-md shadow-blue-600/20">開始發送</button>
+                    </div>
+
+                    <!-- 進度條 -->
+                    <div class="space-y-1">
+                        <div class="flex justify-between text-xs">
+                            <span id="progress-status" class="text-slate-400">準備傳輸...</span>
+                            <span id="progress-percent" class="font-bold text-blue-400">0%</span>
+                        </div>
+                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                            <div id="progress-bar" class="bg-gradient-to-r from-blue-500 to-emerald-400 h-2 w-0 transition-all duration-100"></div>
+                        </div>
+                        <div class="flex justify-between text-[10px] text-slate-500 pt-0.5">
+                            <span id="transfer-speed">速度: 0 MB/s</span>
+                            <span id="transfer-time">剩餘時間: --:--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 接收檔案提示區 -->
+                <div id="incoming-file-box" class="hidden mt-4 bg-emerald-950/40 border border-emerald-500/30 p-4 rounded-xl space-y-2">
+                    <p class="text-sm text-emerald-300 font-semibold flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
+                        正在接收來自對方的檔案...
+                    </p>
+                    <div class="space-y-1">
+                        <div class="flex justify-between text-xs">
+                            <span id="recv-file-name" class="text-slate-300 truncate max-w-xs">檔案中...</span>
+                            <span id="recv-percent" class="font-bold text-emerald-400">0%</span>
+                        </div>
+                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                            <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-2 w-0"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 自訂通知訊息元件 -->
+            <div id="alert-toast" class="hidden p-4 rounded-xl border bg-slate-800 text-slate-200 transition-all duration-300 shadow-xl flex items-center justify-between">
+                <span id="toast-msg">提示訊息</span>
+                <button onclick="hideToast()" class="text-slate-400 hover:text-white ml-4 text-xs font-bold">關閉</button>
+            </div>
+
+        </section>
+
+        <!-- 右側：大檔案傳輸原理與技術指南 (12格中佔5格) -->
+        <section id="tech-intro" class="lg:col-span-5 space-y-6">
+            <div class="bg-slate-800/30 border border-slate-800 rounded-2xl p-6 space-y-4">
+                <h3 class="text-lg font-bold text-blue-400 border-b border-slate-800 pb-2 flex items-center gap-2">
+                    <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
+                    大檔案傳輸的技術核心
+                </h3>
+
+                <div class="space-y-4 text-sm leading-relaxed text-slate-300">
+                    <div>
+                        <h4 class="font-semibold text-white mb-1">1. 為什麼一般網頁無法傳大檔案？</h4>
+                        <p class="text-xs text-slate-400">
+                            傳統網頁傳輸使用 HTTP POST，會把整個檔案讀入記憶體或一次性推送到後端伺服器。這會導致瀏覽器記憶體崩潰（Memory Out of Memory）、伺服器連線超時，或是被 Nginx 等中介代理器拒絕接收大檔案。
+                        </p>
+                    </div>
+
+                    <div>
+                        <h4 class="font-semibold text-white mb-1">2. 解決方案一：前端檔案切片 (Chunking)</h4>
+                        <p class="text-xs text-slate-400">
+                            利用 HTML5 的 <code class="bg-slate-900 px-1 py-0.5 rounded text-blue-400 font-mono">File API (Slice)</code>。瀏覽器不一次讀取數 GB 的檔案，而是透過迴圈將檔案分割成例如 16KB ~ 1MB 的多個小碎片（Chunks），按順序依次發送，這使得傳輸數十 GB 的檔案也不會佔用過多記憶體。
+                        </p>
+                    </div>
+
+                    <div>
+                        <h4 class="font-semibold text-white mb-1">3. 解決方案二：WebRTC P2P 點對點連線</h4>
+                        <p class="text-xs text-slate-400">
+                            本網頁所實作的技術。兩台設備之間透過 WebRTC DataChannel 連線後，檔案碎片直接從 A 設備的記憶體，經過加密通道（SCTP 協定）直達 B 設備。**全程不經過任何伺服器**，省去雲端空間成本，且私密性極高。
+                        </p>
+                    </div>
+
+                    <div>
+                        <h4 class="font-semibold text-white mb-1">4. 接收大檔案時的記憶體優化</h4>
+                        <p class="text-xs text-slate-400">
+                            在接收端，本機如果一次把所有碎片積攢在記憶體中（ArrayBuffer），最後整合成 Blob 下載，若檔案大於 2GB 依然會引發瀏覽器崩潰。現代網頁會使用 <code class="bg-slate-900 px-1 py-0.5 rounded text-blue-400 font-mono">FileSystemWritableFileStream</code> API 或是將碎片分批暫存，以維持記憶體穩定。
+                        </p>
+                    </div>
+
+                    <div class="p-3 bg-blue-950/30 rounded-xl border border-blue-500/20 text-xs">
+                        <span class="font-bold text-blue-300 block mb-1">💡 如何在本機測試此網頁？</span>
+                        在同一台電腦上，**開啟兩個不同的瀏覽器分頁**（例如一個一般視窗，一個無痕視窗），一邊選「發起者」，另一邊選「接收者」，照著步驟複製貼上代碼，即可體驗極速的 P2P 本機傳輸！
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- 底部資訊 -->
+    <footer class="border-t border-slate-800 text-center py-6 text-xs text-slate-500 mt-auto bg-slate-950">
+        <p>© 2026 WebRTC P2P File Transfer Tool. 100% Client-Side Code.</p>
+    </footer>
+
+    <!-- WebRTC JavaScript 邏輯實作 -->
+    <script>
+        // --- 全域變數定義 ---
+        let peerConnection = null;
+        let dataChannel = null;
+        let selectedFile = null;
+        let receiveBuffer = [];
+        let receivedSize = 0;
+        let incomingFileInfo = null;
+        let rtcRole = null; // 'host' or 'joiner'
+
+        // 建立 WebRTC 連線配置 (使用免費公開的 STUN 伺服器來穿透 NAT 獲取外網 IP)
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // --- 自訂 UI 互動與 Toast 通知 ---
+        function showToast(msg, type = 'info') {
+            const toast = document.getElementById('alert-toast');
+            const toastMsg = document.getElementById('toast-msg');
+            toastMsg.innerText = msg;
+            
+            toast.className = `fixed bottom-6 right-6 z-50 p-4 rounded-xl border shadow-2xl flex items-center justify-between transition-all duration-300 max-w-sm w-full`;
+            if (type === 'success') {
+                toast.classList.add('bg-emerald-900', 'border-emerald-500', 'text-emerald-100');
+            } else if (type === 'error') {
+                toast.classList.add('bg-rose-950', 'border-rose-500', 'text-rose-100');
+            } else {
+                toast.classList.add('bg-slate-800', 'border-slate-600', 'text-slate-100');
+            }
+            toast.classList.remove('hidden');
+            
+            setTimeout(hideToast, 5000);
+        }
+
+        function hideToast() {
+            document.getElementById('alert-toast').classList.add('hidden');
+        }
+
+        // 用於取代限制多的 navigator.clipboard
+        function copySignaling(elementId) {
+            const textarea = document.getElementById(elementId);
+            textarea.select();
+            try {
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    showToast('複製成功！請將該代碼發送給連線夥伴。', 'success');
+                } else {
+                    showToast('複製失敗，請手動全選複製。', 'error');
+                }
+            } catch (err) {
+                showToast('瀏覽器不支援此複製方式，請手動複製。', 'error');
+            }
+        }
+
+        // --- 初始化發起者 (Host) 流程 ---
+        async function initHost() {
+            rtcRole = 'host';
+            document.getElementById('signaling-box').classList.remove('hidden');
+            document.getElementById('host-step-1').classList.remove('hidden');
+            document.getElementById('host-step-2').classList.remove('hidden');
+            document.getElementById('joiner-step-1').classList.add('hidden');
+            document.getElementById('joiner-step-2').classList.add('hidden');
+            
+            updateRoleUI('host');
+
+            try {
+                // 1. 建立 RTCPeerConnection
+                peerConnection = new RTCPeerConnection(rtcConfig);
+
+                // 2. 主動創建 DataChannel (只有發起端需要主動建立)
+                dataChannel = peerConnection.createDataChannel('fileTransfer', {
+                    ordered: true // 保證檔案分片按順序送達
+                });
+                setupDataChannelListeners();
+
+                // 3. 收集 ICE 候選地址
+                peerConnection.onicecandidate = (event) => {
+                    if (!event.candidate) {
+                        // 當所有 ICE 候選收集完畢，將 Offer 轉換成 Base64 方便複製
+                        const offer = btoa(JSON.stringify(peerConnection.localDescription));
+                        document.getElementById('local-offer').value = offer;
+                    }
+                };
+
+                // 4. 創建 Offer 提議
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                updateStatus('正在生成並收集邀請碼...', 'yellow');
+
+            } catch (e) {
+                console.error(e);
+                showToast('初始化發起者失敗: ' + e.message, 'error');
+            }
+        }
+
+        // --- 初始化接收者 (Joiner) 流程 ---
+        function initJoiner() {
+            rtcRole = 'joiner';
+            document.getElementById('signaling-box').classList.remove('hidden');
+            document.getElementById('joiner-step-1').classList.remove('hidden');
+            document.getElementById('host-step-1').classList.add('hidden');
+            document.getElementById('host-step-2').classList.add('hidden');
+            
+            updateRoleUI('joiner');
+            updateStatus('等待輸入發起者的邀請碼...', 'yellow');
+
+            // 建立 RTCPeerConnection
+            peerConnection = new RTCPeerConnection(rtcConfig);
+
+            // 監聽對端建立的 Data Channel
+            peerConnection.ondatachannel = (event) => {
+                dataChannel = event.channel;
+                setupDataChannelListeners();
+            };
+
+            // 收集 ICE 候選
+            peerConnection.onicecandidate = (event) => {
+                if (!event.candidate) {
+                    // ICE 候選完成後，輸出 Answer Base64
+                    const answer = btoa(JSON.stringify(peerConnection.localDescription));
+                    document.getElementById('local-answer').value = answer;
+                    document.getElementById('joiner-step-2').classList.remove('hidden');
+                }
+            };
+        }
+
+        // --- 接收者：解析 Offer 並建立 Answer ---
+        async function createAnswer() {
+            const rawOffer = document.getElementById('remote-offer').value.trim();
+            if (!rawOffer) {
+                showToast('請先貼入有效的邀請碼！', 'error');
+                return;
+            }
+
+            try {
+                const offerDesc = JSON.parse(atob(rawOffer));
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(offerDesc));
+                
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+
+                showToast('已解析邀請！正在為您生成回覆碼...', 'info');
+            } catch (e) {
+                console.error(e);
+                showToast('解析邀請碼失敗，請確認代碼是否完整。', 'error');
+            }
+        }
+
+        // --- 發起者：接受 Answer 建立最終連線 ---
+        async function acceptAnswer() {
+            const rawAnswer = document.getElementById('remote-answer').value.trim();
+            if (!rawAnswer) {
+                showToast('請先貼入對方的回覆碼！', 'error');
+                return;
+            }
+
+            try {
+                const answerDesc = JSON.parse(atob(rawAnswer));
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(answerDesc));
+                showToast('正在嘗試建立 P2P 直連...', 'info');
+            } catch (e) {
+                console.error(e);
+                showToast('解析回覆碼失敗，請確認代碼是否完整。', 'error');
+            }
+        }
+
+        // --- 設定 DataChannel 監聽器 ---
+        function setupDataChannelListeners() {
+            // 連線開啟
+            dataChannel.onopen = () => {
+                updateStatus('連線成功！已建立點對點加密通道。', 'green');
+                showToast('P2P 連線成功！現在可以開始傳輸檔案。', 'success');
+                // 啟用傳輸控制面板
+                const panel = document.getElementById('transfer-panel');
+                panel.classList.remove('opacity-50', 'pointer-events-none');
+            };
+
+            // 連線關閉
+            dataChannel.onclose = () => {
+                updateStatus('連線已中斷。', 'red');
+                showToast('連線中斷，請重試。', 'error');
+                document.getElementById('transfer-panel').classList.add('opacity-50', 'pointer-events-none');
+            };
+
+            // 接收到訊息/檔案碎片
+            dataChannel.onmessage = (event) => {
+                handleIncomingData(event.data);
+            };
+        }
+
+        // --- 處理接收到的資料流 ---
+        function handleIncomingData(data) {
+            // WebRTC 只能傳輸 String 或是 ArrayBuffer
+            if (typeof data === 'string') {
+                // 如果是字串，代表是傳輸控制指令（JSON）
+                try {
+                    const message = JSON.parse(data);
+                    
+                    if (message.type === 'file-meta') {
+                        // 收到檔案元數據 (Metadata)
+                        incomingFileInfo = {
+                            name: message.name,
+                            size: message.size
+                        };
+                        receiveBuffer = [];
+                        receivedSize = 0;
+
+                        // 顯示接收區 UI
+                        document.getElementById('incoming-file-box').classList.remove('hidden');
+                        document.getElementById('recv-file-name').innerText = `接收中: ${incomingFileInfo.name}`;
+                        document.getElementById('recv-percent').innerText = '0%';
+                        document.getElementById('recv-progress-bar').style.width = '0%';
+                    } else if (message.type === 'file-end') {
+                        // 檔案傳輸結束，將碎片整合成 Blob 並觸發下載
+                        const blob = new Blob(receiveBuffer);
+                        const url = URL.createObjectURL(blob);
+                        
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = incomingFileInfo.name;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+
+                        // 更新接收 UI 狀態
+                        document.getElementById('recv-percent').innerText = '100% (下載完成)';
+                        document.getElementById('recv-progress-bar').style.width = '100%';
+                        document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-2 w-full";
+                        showToast(`檔案「${incomingFileInfo.name}」已成功接收並下載！`, 'success');
+                    }
+                } catch (e) {
+                    console.error("解析指令錯誤", e);
+                }
+            } else {
+                // 如果是二進制 ArrayBuffer，直接寫入接收緩衝區
+                receiveBuffer.push(data);
+                receivedSize += data.byteLength;
+
+                if (incomingFileInfo) {
+                    const percent = Math.min(100, Math.round((receivedSize / incomingFileInfo.size) * 100));
+                    document.getElementById('recv-percent').innerText = `${percent}%`;
+                    document.getElementById('recv-progress-bar').style.width = `${percent}%`;
+                }
+            }
+        }
+
+        // --- 檔案發送切片的核心邏輯 ---
+        function sendFileChunks() {
+            if (!selectedFile || !dataChannel || dataChannel.readyState !== 'open') {
+                showToast('連線未準備好，或未選擇檔案！', 'error');
+                return;
+            }
+
+            const btnSend = document.getElementById('btn-send');
+            btnSend.disabled = true;
+            btnSend.classList.add('opacity-50', 'cursor-not-allowed');
+
+            // 1. 先發送檔案元數據 (告知接收端：檔案名稱與大小)
+            const meta = {
+                type: 'file-meta',
+                name: selectedFile.name,
+                size: selectedFile.size
+            };
+            dataChannel.send(JSON.stringify(meta));
+
+            // 2. 定義切片大小 (16KB 是 WebRTC 的極其穩定的每片大小，能防止緩衝區溢位)
+            const chunkSize = 16384; 
+            let offset = 0;
+            const fileReader = new FileReader();
+            const startTime = Date.now();
+
+            document.getElementById('progress-status').innerText = '正在發送檔案碎片...';
+
+            // 讀取一片、傳送一片的遞迴讀取器
+            const readSlice = (currentOffset) => {
+                const slice = selectedFile.slice(currentOffset, currentOffset + chunkSize);
+                fileReader.readAsArrayBuffer(slice);
+            };
+
+            fileReader.onload = (e) => {
+                const buffer = e.target.result;
+                
+                // 檢查 DataChannel 的發送緩衝區 (bufferedAmount) 是否過載
+                // 如果積壓太多資料 (超過 1MB)，必須等待緩衝區排空 (bufferedAmountLow) 後再傳送，防止瀏覽器當掉
+                if (dataChannel.bufferedAmount > 1048576) {
+                    dataChannel.onbufferedamountlow = () => {
+                        dataChannel.onbufferedamountlow = null; // 清除監聽
+                        dataChannel.send(buffer);
+                        continueSending();
+                    };
+                } else {
+                    dataChannel.send(buffer);
+                    continueSending();
+                }
+            };
+
+            const continueSending = () => {
+                offset += chunkSize;
+                
+                // 計算並更新傳輸進度 UI
+                const percent = Math.min(100, Math.round((offset / selectedFile.size) * 100));
+                document.getElementById('progress-percent').innerText = `${percent}%`;
+                document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                // 計算傳輸速度與剩餘時間
+                const elapsedTime = (Date.now() - startTime) / 1000; // 秒
+                const speedBytes = offset / elapsedTime; // bytes/sec
+                const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
+                document.getElementById('transfer-speed').innerText = `速度: ${speedMB} MB/s`;
+
+                if (speedBytes > 0) {
+                    const remainingBytes = selectedFile.size - offset;
+                    const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
+                    const mins = Math.floor(remainingSeconds / 60);
+                    const secs = remainingSeconds % 60;
+                    document.getElementById('transfer-time').innerText = `剩餘時間: ${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                }
+
+                if (offset < selectedFile.size) {
+                    readSlice(offset);
+                } else {
+                    // 全部分片傳送完畢，傳送結束指令
+                    dataChannel.send(JSON.stringify({ type: 'file-end' }));
+                    document.getElementById('progress-status').innerText = '發送完成！';
+                    showToast('檔案發送成功！', 'success');
+                    
+                    // 恢復按鈕
+                    btnSend.disabled = false;
+                    btnSend.classList.remove('opacity-50', 'cursor-not-allowed');
+                }
+            };
+
+            // 設定緩衝閾值為 1MB 以下觸發 onbufferedamountlow
+            dataChannel.bufferedAmountLowThreshold = 1048576;
+            
+            // 啟動第一次讀取
+            readSlice(0);
+        }
+
+        // --- 拖曳與選擇檔案相關 UI 事件 ---
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('border-blue-500', 'bg-slate-800/80');
+        });
+
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('border-blue-500', 'bg-slate-800/80');
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('border-blue-500', 'bg-slate-800/80');
+            if (e.dataTransfer.files.length > 0) {
+                handleFileSelect(e.dataTransfer.files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelect(e.target.files[0]);
+            }
+        });
+
+        function handleFileSelect(file) {
+            selectedFile = file;
+            
+            // 格式化檔案大小
+            let sizeStr = file.size + ' Bytes';
+            if (file.size > 1024 * 1024 * 1024) {
+                sizeStr = (file.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+            } else if (file.size > 1024 * 1024) {
+                sizeStr = (file.size / (1024 * 1024)).toFixed(2) + ' MB';
+            } else if (file.size > 1024) {
+                sizeStr = (file.size / 1024).toFixed(2) + ' KB';
+            }
+
+            // 更新 UI
+            document.getElementById('file-info-container').classList.remove('hidden');
+            document.getElementById('info-file-name').innerText = file.name;
+            document.getElementById('info-file-size').innerText = `檔案大小: ${sizeStr}`;
+            
+            // 重設進度條
+            document.getElementById('progress-status').innerText = '準備就緒。';
+            document.getElementById('progress-percent').innerText = '0%';
+            document.getElementById('progress-bar').style.width = '0%';
+            document.getElementById('transfer-speed').innerText = `速度: 0 MB/s`;
+            document.getElementById('transfer-time').innerText = `剩餘時間: --:--`;
+        }
+
+        // --- UI 更新輔助函式 ---
+        function updateRoleUI(role) {
+            const btnHost = document.getElementById('btn-role-host');
+            const btnJoiner = document.getElementById('btn-role-joiner');
+            
+            if (role === 'host') {
+                btnHost.classList.add('bg-blue-500/30', 'border-blue-500', 'text-white');
+                btnJoiner.classList.add('opacity-40');
+                btnJoiner.disabled = true;
+            } else {
+                btnJoiner.classList.add('bg-emerald-500/30', 'border-emerald-500', 'text-white');
+                btnHost.classList.add('opacity-40');
+                btnHost.disabled = true;
+            }
+        }
+
+        function updateStatus(text, color) {
+            const indicator = document.getElementById('status-indicator');
+            const statusText = document.getElementById('status-text');
+
+            statusText.innerText = text;
+            
+            // 顏色對應
+            indicator.className = "w-2.5 h-2.5 rounded-full";
+            if (color === 'green') {
+                indicator.classList.add('bg-emerald-500', 'animate-pulse');
+                statusText.className = "text-xs font-semibold text-emerald-400";
+            } else if (color === 'yellow') {
+                indicator.classList.add('bg-yellow-500', 'animate-pulse');
+                statusText.className = "text-xs font-semibold text-yellow-400";
+            } else {
+                indicator.classList.add('bg-red-500');
+                statusText.className = "text-xs font-semibold text-red-400";
+            }
+        }
+    </script>
+</body>
+</html>
