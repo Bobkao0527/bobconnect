@@ -483,7 +483,7 @@
         function setupDataChannelListeners() {
             dataChannel.onopen = () => {
                 updateStatus('P2P 直連已開通 (加密)', 'green');
-                showToast('通道對打洞成功！安全極速 P2P 連結就緒。', 'success');
+                showToast('極速P2P連結就緒。', 'success');
                 
                 // 【觸發安全機制】通道一開，立刻向 Worker 發送 DELETE 請求銷毀雲端暫存
                 destroyCloudRoom();
