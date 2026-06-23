@@ -206,9 +206,10 @@
         let isHost = false;
         let answerCheckInterval = null;
 
-        // 相機相關
+        // 相機與 UI 更新節流計時器
         let videoStream = null;
         let scanAnimationId = null;
+        let lastRecvUiTime = 0;
 
         const rtcConfig = {
             iceServers: [
@@ -521,6 +522,7 @@
                         };
                         receiveBuffer = [];
                         receivedSize = 0;
+                        lastRecvUiTime = 0;
 
                         document.getElementById('incoming-file-box').classList.remove('hidden');
                         document.getElementById('recv-file-name').innerText = incomingFileInfo.name;
@@ -551,15 +553,20 @@
                 receivedSize += data.byteLength;
 
                 if (incomingFileInfo) {
-                    const percent = Math.min(100, Math.round((receivedSize / incomingFileInfo.size) * 100));
-                    document.getElementById('recv-percent').innerText = `${percent}%`;
-                    document.getElementById('recv-progress-bar').style.width = `${percent}%`;
+                    // 接收端 UI 同步引入 100 毫秒節流閥，防止接收超大檔案時瀏覽器重繪凍結
+                    const now = Date.now();
+                    if (now - lastRecvUiTime > 100 || receivedSize >= incomingFileInfo.size) {
+                        lastRecvUiTime = now;
+                        const percent = Math.min(100, Math.round((receivedSize / incomingFileInfo.size) * 100));
+                        document.getElementById('recv-percent').innerText = `${percent}%`;
+                        document.getElementById('recv-progress-bar').style.width = `${percent}%`;
+                    }
                 }
             }
         }
 
-        // --- 發送端：黃金級流控非同步切片傳輸 (解決 10% 凍結死結) ---
-        function sendFileChunks() {
+        // --- 發送端：黃金級高效非同步流控傳輸 (完美支援 5GB+ 超大檔案而不卡頓) ---
+        async function sendFileChunks() {
             if (!selectedFile || !dataChannel || dataChannel.readyState !== 'open') {
                 showToast('通道尚未連線或未選擇檔案', 'error');
                 return;
@@ -579,68 +586,79 @@
             };
             dataChannel.send(JSON.stringify(meta));
 
-            const chunkSize = 16384; // 最穩定的 16KB 標準切片
+            const chunkSize = 16384; // 最穩定的 16KB 標準傳輸切片
             let offset = 0;
-            const fileReader = new FileReader();
             const startTime = Date.now();
+            let lastUiUpdateTime = 0;
 
             document.getElementById('progress-status').innerText = '發送中...';
 
-            // 強制設定低水位，確保當快取清空到 128KB 以下時，才會觸發 low 事件
+            // 強制設定 RTC DataChannel 的低水位閾值，確保當快取清空到 128KB 以下時會觸發 low 事件
             dataChannel.bufferedAmountLowThreshold = 131072;
 
-            const readNextChunk = () => {
-                if (offset >= selectedFile.size) {
-                    dataChannel.send(JSON.stringify({ type: 'file-end' }));
-                    document.getElementById('progress-status').innerText = '傳送完畢';
-                    showToast('檔案已完全投遞給接收端！', 'success');
-                    if (btnSend) {
-                        btnSend.disabled = false;
-                        btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+            try {
+                // 使用現代高效率 async / await 迴圈，從根本上解決遞迴回呼與 FileReader 佇列凍結問題
+                while (offset < selectedFile.size) {
+                    
+                    // 【1. 流量控制：緩衝安全阻斷】
+                    // 如果當前發送佇列已超過 256KB，則非同步暫停，直至緩衝下降到 128KB 觸發事件解鎖
+                    if (dataChannel.bufferedAmount > 262144) {
+                        await new Promise(resolve => {
+                            dataChannel.onbufferedamountlow = () => {
+                                dataChannel.onbufferedamountlow = null; // 即刻清理防重複觸發
+                                resolve();
+                            };
+                        });
                     }
-                    return;
+
+                    // 【2. 現代高效非同步分片讀取】
+                    // 使用原生 Promise-based arrayBuffer API，不霸佔 JS 主要線程，垃圾回收（GC）能即時清除舊內存
+                    const slice = selectedFile.slice(offset, offset + chunkSize);
+                    const buffer = await slice.arrayBuffer();
+
+                    // 【3. 二進位傳輸與位移增量】
+                    dataChannel.send(buffer);
+                    offset += buffer.byteLength;
+
+                    // 【4. UI 更新節流機制 (Throttling)】
+                    // 限制每 100 毫秒（0.1 秒）最多只更新一次進度與速度 DOM，徹底消除大檔案時 30 萬次 Layout 造成的瀏覽器凍結
+                    const now = Date.now();
+                    if (now - lastUiUpdateTime > 100 || offset >= selectedFile.size) {
+                        lastUiUpdateTime = now;
+
+                        const percent = Math.min(100, Math.round((offset / selectedFile.size) * 100));
+                        document.getElementById('progress-percent').innerText = `${percent}%`;
+                        document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                        const elapsedTime = (now - startTime) / 1000;
+                        const speedBytes = offset / elapsedTime;
+                        const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
+                        document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
+
+                        if (speedBytes > 0) {
+                            const remainingBytes = selectedFile.size - offset;
+                            const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
+                            const mins = Math.floor(remainingSeconds / 60);
+                            const secs = remainingSeconds % 60;
+                            document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                        }
+                    }
                 }
 
-                const slice = selectedFile.slice(offset, offset + chunkSize);
-                fileReader.readAsArrayBuffer(slice);
-            };
+                // 發送完畢宣告
+                dataChannel.send(JSON.stringify({ type: 'file-end' }));
+                document.getElementById('progress-status').innerText = '傳送完畢';
+                showToast('檔案已完全投遞給接收端！', 'success');
 
-            fileReader.onload = (e) => {
-                const buffer = e.target.result;
-                dataChannel.send(buffer);
-                offset += buffer.byteLength;
-
-                // 即時 UI 計算
-                const percent = Math.min(100, Math.round((offset / selectedFile.size) * 100));
-                document.getElementById('progress-percent').innerText = `${percent}%`;
-                document.getElementById('progress-bar').style.width = `${percent}%`;
-
-                const elapsedTime = (Date.now() - startTime) / 1000;
-                const speedBytes = offset / elapsedTime;
-                const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
-                document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
-
-                if (speedBytes > 0) {
-                    const remainingBytes = selectedFile.size - offset;
-                    const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
-                    const mins = Math.floor(remainingSeconds / 60);
-                    const secs = remainingSeconds % 60;
-                    document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+            } catch (e) {
+                console.error("傳輸發生嚴重錯誤:", e);
+                showToast('傳輸中斷，請重試。', 'error');
+            } finally {
+                if (btnSend) {
+                    btnSend.disabled = false;
+                    btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
                 }
-
-                // 【極其重要：流控阻斷與調度保護】
-                if (dataChannel.bufferedAmount > 262144) {
-                    dataChannel.onbufferedamountlow = () => {
-                        dataChannel.onbufferedamountlow = null; // 即刻清空監聽，避免重複回呼
-                        readNextChunk();
-                    };
-                } else {
-                    setTimeout(readNextChunk, 0);
-                }
-            };
-
-            // 開始安全讀取發送
-            readNextChunk();
+            }
         }
 
         // --- 拖曳與選擇檔案相關 UI 事件 ---
