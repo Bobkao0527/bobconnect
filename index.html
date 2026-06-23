@@ -3,11 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC P2P 免伺服器大檔案直連傳輸工具 (純 QR 碼對接版)</title>
+    <title>WebRTC P2P 免手動中轉大檔案直連傳輸工具</title>
     <!-- 引入 Tailwind CSS 提供現代美觀的 UI -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- 引入 Pako 用於壓縮 SDP 資料，大幅降低 QR Code 複雜度 -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
     <!-- 引入 QRious 用於生成高品質 QR Code -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
     <!-- 引入 jsQR 用於相機即時解析 QR Code -->
@@ -46,12 +44,12 @@
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
                 </div>
                 <div>
-                    <h1 class="font-bold text-xl tracking-tight bg-gradient-to-r bg-clip-text text-transparent from-blue-400 to-emerald-400">WebRTC P2P 瀏覽器大檔案直傳</h1>
-                    <p class="text-xs text-slate-400">動態 QR Code 秒速對接 · 無需伺服器 · 零文字輸入</p>
+                    <h1 class="font-bold text-xl tracking-tight bg-gradient-to-r bg-clip-text text-transparent from-blue-400 to-emerald-400">WebRTC P2P 瀏覽器大檔案直傳 (單向對接版)</h1>
+                    <p class="text-xs text-slate-400">專屬信令中轉 · 掃描一次即可連線 · 零文字輸入</p>
                 </div>
             </div>
             <div class="flex gap-2">
-                <a href="#tech-intro" class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-lg transition">技術原理解析</a>
+                <a href="#tech-intro" class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-lg transition">技術說明</a>
             </div>
         </div>
     </header>
@@ -68,65 +66,47 @@
                     <span class="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold">1</span>
                     <h2 class="text-lg font-semibold">建立 P2P 聯絡通道</h2>
                 </div>
-                
-                <p class="text-sm text-slate-300 mb-4 leading-relaxed">
-                    本工具採用**無伺服器手動信令**。已移除所有繁瑣的文字貼上步驟，請直接使用**相機掃描 QR Code** 即可在裝置間建立對接。
-                </p>
 
-                <!-- 角色選擇與初始化 -->
-                <div class="grid grid-cols-2 gap-4 mb-6">
-                    <button id="btn-role-host" onclick="initHost()" class="py-3 px-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 font-medium transition text-center flex flex-col items-center gap-1">
-                        <span class="text-lg font-bold">我是「發起者」</span>
-                        <span class="text-xs text-blue-400/80">產生邀請 QR 碼供對方掃描</span>
-                    </button>
-                    <button id="btn-role-joiner" onclick="initJoiner()" class="py-3 px-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium transition text-center flex flex-col items-center gap-1">
-                        <span class="text-lg font-bold">我是「接收者」</span>
-                        <span class="text-xs text-emerald-400/80">掃描發起者並產生回覆 QR 碼</span>
-                    </button>
+                <div id="setup-view" class="space-y-4">
+                    <p class="text-sm text-slate-300 leading-relaxed">
+                        本網頁已預設使用專屬信令伺服器進行對接。請選擇您的角色。發起者會產生一個極簡的專屬連結 QR Code，接收者<strong>僅需掃描一次</strong>即可自動雙向握手！
+                    </p>
+
+                    <!-- 角色選擇與初始化 -->
+                    <div class="grid grid-cols-2 gap-4">
+                        <button id="btn-role-host" onclick="initHost()" class="py-3 px-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 font-medium transition text-center flex flex-col items-center gap-1">
+                            <span class="text-lg font-bold">我是「發起者」</span>
+                            <span class="text-xs text-blue-400/80">產生超簡單 QR 碼供掃描</span>
+                        </button>
+                        <button id="btn-role-joiner" onclick="startJoinerScanner()" class="py-3 px-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium transition text-center flex flex-col items-center gap-1">
+                            <span class="text-lg font-bold">我是「接收者」</span>
+                            <span class="text-xs text-emerald-400/80">開啟相機直接掃描對接</span>
+                        </button>
+                    </div>
                 </div>
 
-                <!-- 信令交換流程 UI (完全無 Input / Textarea 乾淨版) -->
+                <!-- 信令交換流程 UI (中轉版 - 極度乾淨) -->
                 <div id="signaling-box" class="hidden space-y-4 border-t border-slate-700/50 pt-4">
                     
-                    <!-- 發起者步驟一：展示邀請 QR Code -->
-                    <div id="host-step-1" class="hidden space-y-3">
-                        <label class="block text-sm text-blue-300 font-semibold">第一步：請「接收者」掃描下方的邀請 QR Code：</label>
+                    <!-- 發起者展示極簡 QR Code -->
+                    <div id="host-panel" class="hidden space-y-3">
+                        <label class="block text-sm text-blue-300 font-semibold text-center">請「接收者」掃描下方的極簡 QR Code：</label>
                         <div class="flex flex-col items-center bg-slate-900/60 p-6 rounded-xl border border-slate-800">
                             <!-- QR Code 畫布 -->
-                            <canvas id="qr-offer" class="bg-white p-3 rounded-xl shadow-lg shadow-blue-500/5"></canvas>
-                            <p class="text-xs text-slate-400 mt-3 animate-pulse">正在等待對方掃描此條碼並建立回覆...</p>
+                            <canvas id="qr-canvas" class="bg-white p-3 rounded-xl shadow-lg"></canvas>
+                            <p id="room-url-display" class="text-xs text-slate-400 mt-3 font-mono break-all text-center">網址生成中...</p>
+                            <p class="text-xs text-blue-400 mt-2 animate-pulse">正在透過信令伺服器等待對方接入...</p>
                         </div>
                     </div>
 
-                    <!-- 接收者步驟一：掃描發起者邀請 -->
-                    <div id="joiner-step-1" class="hidden space-y-3">
-                        <label class="block text-sm text-emerald-300 font-semibold">第一步：請開啟相機，掃描「發起者」的邀請 QR Code：</label>
-                        <div class="flex flex-col gap-3">
-                            <button id="btn-scan-offer" onclick="startScanner('offer')" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-4 px-4 rounded-xl flex items-center justify-center gap-2 transition shadow-lg shadow-emerald-600/10">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 20h2M4 12h2m0 0h.01M4 8h2m0 0h.01M4 16h2m0 0h.01M8 8h.01M16 8h.01M16 12h.01M12 16h.01M4 20h2m0 0h.01M20 8h2m0 0h.01M20 12h2m0 0h.01M20 16h2m0 0h.01M20 20h2m0 0h.01"></path></svg>
-                                開啟相機掃描邀請
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- 接收者步驟二：生成回覆 QR Code (掃描完 offer 後自動進入這裡) -->
-                    <div id="joiner-step-2" class="hidden space-y-3 animate-fade-in">
-                        <label class="block text-sm text-emerald-300 font-semibold">第二步：已成功解析邀請！請讓「發起者」掃描下方的回覆 QR Code：</label>
-                        <div class="flex flex-col items-center bg-slate-900/60 p-6 rounded-xl border border-slate-800">
-                            <!-- QR Code 畫布 -->
-                            <canvas id="qr-answer" class="bg-white p-3 rounded-xl shadow-lg shadow-emerald-500/5"></canvas>
-                            <p class="text-xs text-emerald-400 mt-3 animate-pulse">對手掃描後，兩端就會自動連線！</p>
-                        </div>
-                    </div>
-
-                    <!-- 發起者步驟二：掃描接收者回覆 -->
-                    <div id="host-step-2" class="hidden space-y-3">
-                        <label class="block text-sm text-blue-300 font-semibold">第二步：請掃描「接收者」的回覆 QR Code 來完成最終直連：</label>
-                        <div class="flex flex-col gap-3">
-                            <button id="btn-scan-answer" onclick="startScanner('answer')" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-4 rounded-xl flex items-center justify-center gap-2 transition shadow-lg shadow-blue-600/10">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 20h2M4 12h2m0 0h.01M4 8h2m0 0h.01M4 16h2m0 0h.01M8 8h.01M16 8h.01M16 12h.01M12 16h.01M4 20h2m0 0h.01M20 8h2m0 0h.01M20 12h2m0 0h.01M20 16h2m0 0h.01M20 20h2m0 0h.01"></path></svg>
-                                開啟相機掃描回覆
-                            </button>
+                    <!-- 接收者自動接通處理面板 -->
+                    <div id="joiner-panel" class="hidden space-y-3">
+                        <div class="flex flex-col items-center bg-slate-900/60 p-6 rounded-xl border border-slate-800 space-y-4">
+                            <div class="w-12 h-12 rounded-full border-4 border-emerald-400 border-t-transparent animate-spin"></div>
+                            <div class="text-center">
+                                <p class="text-sm text-emerald-300 font-semibold">已偵測到房間，正在自動對接...</p>
+                                <p class="text-xs text-slate-500 mt-1">取得邀請 Offer ➜ 產生回覆 Answer ➜ 背景上傳中</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -210,36 +190,23 @@
 
         <!-- 右側：大檔案傳輸原理與技術指南 (12格中佔5格) -->
         <section id="tech-intro" class="lg:col-span-5 space-y-6">
-            <div class="bg-slate-800/30 border border-slate-800 rounded-2xl p-6 space-y-4">
+            <div class="bg-slate-800/30 border border-slate-800 rounded-2xl p-6 space-y-4 text-sm leading-relaxed text-slate-300">
                 <h3 class="text-lg font-bold text-blue-400 border-b border-slate-800 pb-2 flex items-center gap-2">
                     <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
-                    動態 QR 碼與雙向握手
+                    技術說明：P2P 直傳優勢
                 </h3>
 
-                <div class="space-y-4 text-sm leading-relaxed text-slate-300">
-                    <div class="p-3 bg-emerald-950/30 rounded-xl border border-emerald-500/20 text-xs text-emerald-300">
-                        <span class="font-bold text-emerald-200 block mb-1">💡 為什麼需要雙向掃描？</span>
-                        WebRTC 要求雙方彼此持有對方的<strong>加密憑證指紋 (DTLS)</strong> 與<strong>網路出口 IP / 通訊埠 (ICE Candidates)</strong> 才能穿透防火牆並加密安全連線。在「純網頁、無伺服器」的架構下，雙向掃描是物理上唯一能接通的解法。
-                    </div>
+                <div class="p-3 bg-blue-950/30 rounded-xl border border-blue-500/20 text-xs text-blue-300 space-y-2">
+                    <span class="font-bold text-blue-200 block">⚡️ 專屬中轉讓對接變得無比簡單！</span>
+                    <p>以往 WebRTC 需要手動交換複雜的金鑰憑證。現在透過預設的信令伺服器，發起端能暫時將加密 Offer 送至雲端，生成的 QR 碼中僅包含精簡的房間 ID。</p>
+                    <p><strong>掃描時：</strong>接收端手機掃描一次，就會自動至信令伺服器取得 Offer 並上傳 Answer，雙方在背景瞬間完成握手並改採純 P2P 直連，檔案傳輸完全不耗費伺服器流量！</p>
+                </div>
 
-                    <div>
-                        <h4 class="font-semibold text-white mb-1">1. 二進位高度壓縮 (Pako)</h4>
-                        <p class="text-xs text-slate-400">
-                            原生的 WebRTC 描述協定字串（SDP）非常冗長，如果直接製成 QR Code 會極度密集，相機難以掃描成功。我們使用 Deflate 演算法將其壓縮 75% 以上，讓 QR 碼細節變少，手持鏡頭在 0.5 秒內就能瞬間捕捉解析。
-                        </p>
-                    </div>
-
-                    <div>
-                        <h4 class="font-semibold text-white mb-1">2. 檔案分片保護機制</h4>
-                        <p class="text-xs text-slate-400">
-                            大檔案在傳輸時會被切為 16KB 小片。程式設有智慧緩衝保護，如果接收端的網速太慢或裝置記憶體快滿了，發送端會自適應暫停讀取檔案，直到排空後再繼續，保障傳輸數十 GB 檔案也絕不崩潰。
-                        </p>
-                    </div>
-
-                    <div class="p-3 bg-blue-950/30 rounded-xl border border-blue-500/20 text-xs">
-                        <span class="font-bold text-blue-300 block mb-1">💡 如何在單機上模擬測試？</span>
-                        在同一台電腦上，**開啟兩個不同的瀏覽器分頁**（一個是一般分頁，一個是無痕分頁）。一邊選「發起者」，另一邊選「接收者」。由於單機上無法用鏡頭互相對照，建議將本網頁保留在有相機的行動裝置（如手機）和電腦之間進行掃描。
-                    </div>
+                <div class="border border-slate-800 rounded-xl p-4 space-y-2 bg-slate-900/50">
+                    <h4 class="font-semibold text-white text-xs">🔒 隱私與安全性</h4>
+                    <p class="text-xs text-slate-400">
+                        信令伺服器僅暫存連線交涉憑證，不觸碰您傳輸的任何檔案內容。一經連線，雙方的檔案將在瀏覽器間透過加密通道（DTLS-SRTP）直接傳輸，安全且極速。
+                    </p>
                 </div>
             </div>
         </section>
@@ -258,21 +225,18 @@
             </h3>
             
             <div class="relative w-full aspect-square bg-black rounded-xl overflow-hidden border border-slate-700">
-                <!-- 掃描影像區域 -->
                 <video id="scan-video" class="w-full h-full object-cover"></video>
                 <canvas id="scan-canvas" class="hidden"></canvas>
-                <!-- 科技感掃描框框 overlay -->
                 <div class="absolute inset-8 border border-emerald-500/30 rounded-lg pointer-events-none">
                     <div class="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-emerald-400"></div>
                     <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-emerald-400"></div>
                     <div class="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-emerald-400"></div>
                     <div class="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-emerald-400"></div>
-                    <!-- 浮動綠色掃描線 -->
                     <div class="scan-line w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent absolute top-0 shadow-[0_0_10px_#10b981]"></div>
                 </div>
             </div>
 
-            <p class="text-xs text-slate-400 mt-3 text-center">請將對方的 QR Code 放入鏡頭框內</p>
+            <p class="text-xs text-slate-400 mt-3 text-center">請將對方的單向連結 QR Code 放入鏡頭內</p>
             <button onclick="stopScanner()" class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-2 rounded-xl transition">取消掃描</button>
         </div>
     </div>
@@ -282,23 +246,23 @@
         <p>© 2026 WebRTC P2P File Transfer Tool. 100% Client-Side Code.</p>
     </footer>
 
-    <!-- WebRTC JavaScript 邏輯實作 -->
+    <!-- WebRTC JavaScript 邏輯與 Cloudflare Worker 對接實作 -->
     <script>
-        // --- 全域變數定義 ---
         let peerConnection = null;
         let dataChannel = null;
         let selectedFile = null;
         let receiveBuffer = [];
         let receivedSize = 0;
         let incomingFileInfo = null;
-        let rtcRole = null; // 'host' or 'joiner'
+        
+        let roomId = null;
+        let isHost = false;
+        let answerCheckInterval = null;
 
-        // 相機與解碼相關變數
+        // 相機相關
         let videoStream = null;
-        let scanType = null; // 'offer' or 'answer'
         let scanAnimationId = null;
 
-        // 建立 WebRTC 連線配置 (使用免費公開的 STUN 伺服器來穿透 NAT 獲取外網 IP)
         const rtcConfig = {
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
@@ -306,32 +270,21 @@
             ]
         };
 
-        // --- SDP 壓縮與解壓縮函數 (Pako) ---
-        function compressSDP(sdpObj) {
-            const str = JSON.stringify(sdpObj);
-            const encoder = new TextEncoder();
-            const uint8 = encoder.encode(str);
-            const compressed = pako.deflate(uint8);
-            
-            // 轉化為 Base64 字串
-            let binary = '';
-            const len = compressed.byteLength;
-            for (let i = 0; i < len; i++) {
-                binary += String.fromCharCode(compressed[i]);
+        // --- 輔助：自動檢測 URL 是否為加入連結 ---
+        window.addEventListener('DOMContentLoaded', async () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const rId = urlParams.get('room');
+            if (rId) {
+                // 如果網址帶有房間 ID，將自動進入「接收者/加入者」模式並開始握手
+                roomId = rId;
+                isHost = false;
+                initJoinerWithRoom();
             }
-            return btoa(binary);
-        }
+        });
 
-        function decompressSDP(b64) {
-            const binary = atob(b64);
-            const len = binary.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) {
-                bytes[i] = binary.charCodeAt(i);
-            }
-            const decompressed = pako.inflate(bytes);
-            const decoder = new TextDecoder();
-            return JSON.parse(decoder.decode(decompressed));
+        // --- 輔助：取得與更新 Worker 網址（已寫死為使用者指定網址） ---
+        function getWorkerUrl() {
+            return "https://bobconnect.bobkao0527.workers.dev";
         }
 
         // --- 自訂 UI 互動與 Toast 通知 ---
@@ -357,154 +310,178 @@
             document.getElementById('alert-toast').classList.add('hidden');
         }
 
-        // --- 生成 QR Code 的輔助函數 ---
         function generateQRCode(canvasId, text) {
             new QRious({
                 element: document.getElementById(canvasId),
                 value: text,
                 size: 240,
-                level: 'L' // 降低糾錯級別，以讓 QR Code 的網點更稀疏易讀
+                level: 'M' // 因為網址非常短，所以網點會極其稀疏、好讀
             });
         }
 
-        // --- 初始化發起者 (Host) 流程 ---
+        // --- 發起者流程 (Host) ---
         async function initHost() {
-            rtcRole = 'host';
+            isHost = true;
+            roomId = Math.random().toString(36).substring(2, 10); // 隨機房間碼
+
+            document.getElementById('setup-view').classList.add('hidden');
             document.getElementById('signaling-box').classList.remove('hidden');
-            document.getElementById('host-step-1').classList.remove('hidden');
-            document.getElementById('host-step-2').classList.remove('hidden');
-            document.getElementById('joiner-step-1').classList.add('hidden');
-            document.getElementById('joiner-step-2').classList.add('hidden');
-            
+            document.getElementById('host-panel').classList.remove('hidden');
             updateRoleUI('host');
 
+            // 生成並繪製專屬對接網址 QR Code
+            // 該網址加上 ?room=xxx 後，對方掃描開啟就會自動完成 WebRTC 流程
+            const currentOrigin = window.location.origin + window.location.pathname;
+            const joinUrl = `${currentOrigin}?room=${roomId}`;
+            document.getElementById('room-url-display').innerText = joinUrl;
+            generateQRCode('qr-canvas', joinUrl);
+
             try {
-                // 1. 建立 RTCPeerConnection
                 peerConnection = new RTCPeerConnection(rtcConfig);
 
-                // 2. 主動創建 DataChannel
-                dataChannel = peerConnection.createDataChannel('fileTransfer', {
-                    ordered: true // 保證檔案分片按順序送達
-                });
+                dataChannel = peerConnection.createDataChannel('fileTransfer', { ordered: true });
                 setupDataChannelListeners();
 
-                // 3. 收集 ICE 候選地址
-                peerConnection.onicecandidate = (event) => {
+                // 當本地 ICE 收集完畢時，將完整的 Offer 送至 Cloudflare Worker 儲存
+                peerConnection.onicecandidate = async (event) => {
                     if (!event.candidate) {
-                        // 當所有 ICE 候選收集完畢，將 Offer 壓縮並渲染 QR Code
-                        const compressedOffer = compressSDP(peerConnection.localDescription);
-                        generateQRCode('qr-offer', compressedOffer);
-                        updateStatus('邀請 QR Code 已生成，請等待對方掃描...', 'yellow');
+                        const offer = peerConnection.localDescription;
+                        const workerUrl = getWorkerUrl();
+                        
+                        try {
+                            const res = await fetch(`${workerUrl}/room/${roomId}`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ offer })
+                            });
+                            if (res.ok) {
+                                updateStatus('已將邀請安全送至中轉，等待對方掃描連線...', 'yellow');
+                                // 開始自動輪詢檢查接收者是否已經產生回覆 (Answer)
+                                startCheckingForAnswer();
+                            } else {
+                                throw new Error('Worker 儲存失敗');
+                            }
+                        } catch (err) {
+                            showToast('無法上傳邀請至信令伺服器，請確認伺服器運作是否正常。', 'error');
+                        }
                     }
                 };
 
-                // 4. 創建 Offer 提議
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
 
-                updateStatus('正在生成邀請密鑰...', 'yellow');
+                updateStatus('正在與中轉伺服器同步...', 'yellow');
 
             } catch (e) {
                 console.error(e);
-                showToast('初始化發起者失敗: ' + e.message, 'error');
+                showToast('初始化發起失敗: ' + e.message, 'error');
             }
         }
 
-        // --- 初始化接收者 (Joiner) 流程 ---
-        function initJoiner() {
-            rtcRole = 'joiner';
-            document.getElementById('signaling-box').classList.remove('hidden');
-            document.getElementById('joiner-step-1').classList.remove('hidden');
-            document.getElementById('host-step-1').classList.add('hidden');
-            document.getElementById('host-step-2').classList.add('hidden');
-            
-            updateRoleUI('joiner');
-            updateStatus('等待開啟相機掃描邀請 QR Code...', 'yellow');
+        // --- 發起者背景輪詢，檢查對端 Answer ---
+        function startCheckingForAnswer() {
+            if (answerCheckInterval) clearInterval(answerCheckInterval);
+            const workerUrl = getWorkerUrl();
 
-            // 建立 RTCPeerConnection
-            peerConnection = new RTCPeerConnection(rtcConfig);
-
-            // 監聽對端建立的 Data Channel
-            peerConnection.ondatachannel = (event) => {
-                dataChannel = event.channel;
-                setupDataChannelListeners();
-            };
-
-            // 收集 ICE 候選
-            peerConnection.onicecandidate = (event) => {
-                if (!event.candidate) {
-                    // ICE 候選完成後，輸出 Answer 並生成 QR Code
-                    const compressedAnswer = compressSDP(peerConnection.localDescription);
-                    generateQRCode('qr-answer', compressedAnswer);
-                    
-                    // 掃描成功並生成 Answer 後，自動切換到第二步
-                    document.getElementById('joiner-step-1').classList.add('hidden');
-                    document.getElementById('joiner-step-2').classList.remove('hidden');
-                    updateStatus('已生成回覆，請讓發起者掃描您的 QR Code！', 'yellow');
+            answerCheckInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${workerUrl}/room/${roomId}`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        if (data && data.answer) {
+                            clearInterval(answerCheckInterval);
+                            answerCheckInterval = null;
+                            
+                            // 拿到 Answer 後直接設定
+                            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                            showToast('已偵測到對端回覆，正在接通中！', 'success');
+                        }
+                    }
+                } catch (e) {
+                    console.error('輪詢 Answer 失敗:', e);
                 }
-            };
+            }, 1500); // 每 1.5 秒輪詢一次
         }
 
-        // --- 接收者：解析 Offer 並建立 Answer (完全不透過輸入框) ---
-        async function createAnswer(scannedData) {
-            if (!scannedData) {
-                showToast('掃描到的邀請碼為空！', 'error');
-                return;
-            }
+        // --- 接收者：開啟相機直接掃描對接 (單向掃描) ---
+        function startJoinerScanner() {
+            startScanner();
+        }
+
+        // --- 接收者：自動對接流程 ---
+        async function initJoinerWithRoom() {
+            document.getElementById('setup-view').classList.add('hidden');
+            document.getElementById('signaling-box').classList.remove('hidden');
+            document.getElementById('joiner-panel').classList.remove('hidden');
+            updateRoleUI('joiner');
+            updateStatus('偵測到加入請求，正在進行一鍵自動握手...', 'yellow');
+
+            const workerUrl = getWorkerUrl();
 
             try {
-                const offerDesc = decompressSDP(scannedData);
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(offerDesc));
-                
+                // 1. 向 Worker 讀取發起者的 Offer
+                const res = await fetch(`${workerUrl}/room/${roomId}`);
+                if (!res.ok) throw new Error('無法從中轉伺服器載入此通道的連線資訊');
+                const data = await res.json();
+                if (!data || !data.offer) throw new Error('連線已被關閉或超時，請重新產生 QR 碼。');
+
+                // 2. 建立本地連接
+                peerConnection = new RTCPeerConnection(rtcConfig);
+
+                peerConnection.ondatachannel = (event) => {
+                    dataChannel = event.channel;
+                    setupDataChannelListeners();
+                };
+
+                // 當本地 ICE 收集完畢，將 Answer 上傳給 Worker
+                peerConnection.onicecandidate = async (event) => {
+                    if (!event.candidate) {
+                        const answer = peerConnection.localDescription;
+                        try {
+                            const postRes = await fetch(`${workerUrl}/room/${roomId}`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ answer })
+                            });
+                            if (postRes.ok) {
+                                updateStatus('已將對接金鑰同步，正在建立安全加密連結...', 'yellow');
+                            }
+                        } catch (err) {
+                            showToast('上傳連線密鑰失敗，請重試。', 'error');
+                        }
+                    }
+                };
+
+                // 3. 解析 Host 的 Offer，並建立 Answer
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer);
 
-                showToast('成功解析邀請！正在為您生成回覆 QR Code...', 'info');
             } catch (e) {
                 console.error(e);
-                showToast('解析邀請碼失敗，可能條碼不完整。', 'error');
+                showToast(e.message, 'error');
+                updateStatus('連線失敗: ' + e.message, 'red');
             }
         }
 
-        // --- 發起者：接受 Answer 建立最終連線 (完全不透過輸入框) ---
-        async function acceptAnswer(scannedData) {
-            if (!scannedData) {
-                showToast('掃描到的回覆碼為空！', 'error');
-                return;
-            }
-
-            try {
-                const answerDesc = decompressSDP(scannedData);
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(answerDesc));
-                showToast('成功讀取回覆！正在建立點對點管道...', 'info');
-            } catch (e) {
-                console.error(e);
-                showToast('解析回覆碼失敗。', 'error');
-            }
-        }
-
-        // --- 網頁相機 QR Code 掃描器控制 ---
-        async function startScanner(type) {
-            scanType = type;
+        // --- 相機掃描控制 ---
+        async function startScanner() {
             const modal = document.getElementById('scanner-modal');
             const video = document.getElementById('scan-video');
 
             try {
-                // 要求開啟後置相機
                 videoStream = await navigator.mediaDevices.getUserMedia({ 
                     video: { facingMode: 'environment' } 
                 });
                 video.srcObject = videoStream;
-                video.setAttribute('playsinline', true); // 防止 iOS 自動開啟全螢幕播放器
+                video.setAttribute('playsinline', true);
                 video.play();
                 
                 modal.classList.remove('hidden');
-                
-                // 開始幀率渲染與解碼
                 scanAnimationId = requestAnimationFrame(tickScanner);
             } catch (e) {
                 console.error(e);
-                showToast('無法存取相機，請確認已授予相機使用權限。', 'error');
+                showToast('無法啟動相機，請確認瀏覽器相機使用權限。', 'error');
             }
         }
 
@@ -533,48 +510,51 @@
                 context.drawImage(video, 0, 0, canvas.width, canvas.height);
                 
                 const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                
-                // 使用 jsQR 庫解碼
                 const code = jsQR(imageData.data, imageData.width, imageData.height, {
                     inversionAttempts: "dontInvert",
                 });
                 
                 if (code) {
-                    // 掃描成功！
                     stopScanner();
-                    showToast('QR Code 掃描成功！', 'success');
                     
-                    if (scanType === 'offer') {
-                        createAnswer(code.data);
-                    } else if (scanType === 'answer') {
-                        acceptAnswer(code.data);
+                    // 檢查掃描到的 QR Code 是否包含房間參數
+                    try {
+                        const url = new URL(code.data);
+                        const rId = url.searchParams.get('room');
+                        if (rId) {
+                            showToast('對接 QR Code 掃描成功！開始一鍵連線...', 'success');
+                            // 自動導入房間
+                            roomId = rId;
+                            isHost = false;
+                            initJoinerWithRoom();
+                        } else {
+                            showToast('此 QR Code 不是有效的大檔案傳輸邀請。', 'error');
+                        }
+                    } catch (e) {
+                        showToast('無效的網址格式。', 'error');
                     }
                     return;
                 }
             }
-            // 繼續下一幀檢測
             scanAnimationId = requestAnimationFrame(tickScanner);
         }
 
         // --- 設定 DataChannel 監聽器 ---
         function setupDataChannelListeners() {
-            // 連線開啟
             dataChannel.onopen = () => {
                 updateStatus('連線成功！已建立加密直連通道。', 'green');
                 showToast('P2P 連線成功！現在可以開始傳輸檔案。', 'success');
-                // 啟用傳輸控制面板
-                const panel = document.getElementById('transfer-panel');
-                panel.classList.remove('opacity-50', 'pointer-events-none');
+                // 隱藏信令握手盒，顯示檔案控制面板
+                document.getElementById('signaling-box').classList.add('hidden');
+                document.getElementById('transfer-panel').classList.remove('opacity-50', 'pointer-events-none');
             };
 
-            // 連線關閉
             dataChannel.onclose = () => {
                 updateStatus('連線已中斷。', 'red');
                 showToast('連線中斷，請重試。', 'error');
                 document.getElementById('transfer-panel').classList.add('opacity-50', 'pointer-events-none');
             };
 
-            // 接收到訊息/檔案碎片
             dataChannel.onmessage = (event) => {
                 handleIncomingData(event.data);
             };
@@ -763,7 +743,7 @@
             document.getElementById('transfer-time').innerText = `剩餘時間: --:--`;
         }
 
-        // --- UI 更新輔助函式 ---
+        // --- UI 更新輔助 ---
         function updateRoleUI(role) {
             const btnHost = document.getElementById('btn-role-host');
             const btnJoiner = document.getElementById('btn-role-joiner');
@@ -779,6 +759,7 @@
             }
         }
 
+        // 狀態更新
         function updateStatus(text, color) {
             const indicator = document.getElementById('status-indicator');
             const statusText = document.getElementById('status-text');
