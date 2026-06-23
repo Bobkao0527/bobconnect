@@ -50,7 +50,7 @@
             <h1 class="font-black text-2xl tracking-widest bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
                 Bob檔案高速傳輸系統
             </h1>
-            <p class="text-[10px] text-slate-600 tracking-widest uppercase">WebRTC Direct P2P Pipe</p>
+            <p class="text-[10px] text-slate-600 tracking-widest uppercase">掃描以進行WebRTC Direct P2P連線</p>
         </header>
 
         <!-- 第一步：建立連線控制面板 -->
@@ -63,7 +63,7 @@
                     <div class="p-3 bg-blue-500/10 text-blue-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 12h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                     </div>
-                    <span class="text-sm font-bold text-slate-300 tracking-wider">發起傳輸</span>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">產生QR Code</span>
                 </button>
                 
                 <!-- 接收者按鈕 -->
@@ -71,7 +71,7 @@
                     <div class="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
                     </div>
-                    <span class="text-sm font-bold text-slate-300 tracking-wider">接收檔案</span>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">掃描QR Code</span>
                 </button>
             </div>
 
@@ -81,7 +81,6 @@
                 <div id="host-panel" class="hidden flex flex-col items-center space-y-4">
                     <div class="bg-slate-950 p-4 rounded-2xl border border-slate-900 flex flex-col items-center shadow-2xl">
                         <canvas id="qr-canvas" class="bg-white p-2.5 rounded-xl"></canvas>
-                        <p id="room-url-display" class="text-[9px] text-slate-600 mt-3 font-mono break-all text-center max-w-[200px]">網址同步中...</p>
                     </div>
                     <p class="text-xs text-blue-400/80 animate-pulse tracking-wider">等待接收端掃描連線...</p>
                 </div>
@@ -233,6 +232,19 @@
             return "https://bobconnect.bobkao0527.workers.dev";
         }
 
+        // --- 核心優化：連線成功即銷毀雲端 KV 信令房間 ---
+        async function destroyCloudRoom() {
+            if (!roomId) return;
+            const workerUrl = getWorkerUrl();
+            try {
+                // 發送 DELETE 請求，通知 Worker 刪除該房間的 KV 或記憶體資料
+                await fetch(`${workerUrl}/room/${roomId}`, { method: 'DELETE' });
+                console.log(`[安全機制] 房間 ${roomId} 的雲端信令已成功手動銷毀。`);
+            } catch (e) {
+                console.error("手動銷毀房間失敗:", e);
+            }
+        }
+
         // --- 自訂 Toast 元件 ---
         function showToast(msg, type = 'info') {
             const toast = document.getElementById('alert-toast');
@@ -276,7 +288,6 @@
 
             const currentOrigin = window.location.origin + window.location.pathname;
             const joinUrl = `${currentOrigin}?room=${roomId}`;
-            document.getElementById('room-url-display').innerText = joinUrl;
             generateQRCode('qr-canvas', joinUrl);
 
             try {
@@ -473,6 +484,9 @@
                 updateStatus('P2P 直連已開通 (加密)', 'green');
                 showToast('通道對打洞成功！安全極速 P2P 連結就緒。', 'success');
                 
+                // 【觸發安全機制】通道一開，立刻向 Worker 發送 DELETE 請求銷毀雲端暫存
+                destroyCloudRoom();
+
                 // 巧妙淡出 Step 1 的所有按鈕與面板，直接展現檔案傳輸模組
                 document.getElementById('setup-view').classList.add('hidden');
                 document.getElementById('signaling-box').classList.add('hidden');
@@ -615,15 +629,12 @@
                 }
 
                 // 【極其重要：流控阻斷與調度保護】
-                // 如果當前佇列快取已超過 256KB，則強制阻塞下一次檔案讀取，直到緩衝下降至 128KB 觸發事件
                 if (dataChannel.bufferedAmount > 262144) {
                     dataChannel.onbufferedamountlow = () => {
                         dataChannel.onbufferedamountlow = null; // 即刻清空監聽，避免重複回呼
                         readNextChunk();
                     };
                 } else {
-                    // 若在安全水位下，則藉由微小的非同步延遲調度 readNextChunk()。
-                    // 這樣做能將線程歸還給瀏覽器的 UI 渲染引擎（Event Loop），防止 JS 連續阻塞，完全杜絕 10% 卡死問題
                     setTimeout(readNextChunk, 0);
                 }
             };
