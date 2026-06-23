@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebRTC P2P 免手動中轉大檔案直連傳輸工具</title>
-    <!-- 引入 Tailwind CSS 提供現代美觀的 UI -->
+    <title>Bob檔案高速傳輸系統</title>
+    <!-- 引入 Tailwind CSS 提供極簡現代化 UI -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- 引入 QRious 用於生成高品質 QR Code -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
@@ -15,238 +15,186 @@
             theme: {
                 extend: {
                     colors: {
-                        primary: '#3b82f6',
-                        secondary: '#10b981',
-                        darkBg: '#0f172a',
+                        brandBlue: '#3b82f6',
+                        brandGreen: '#10b981',
                     }
                 }
             }
         }
     </script>
     <style>
+        body {
+            background-color: #000000;
+            overflow-x: hidden;
+        }
         /* 掃描線動畫效果 */
         @keyframes scan {
             0%, 100% { transform: translateY(0); }
-            50% { transform: translateY(200px); }
+            50% { transform: translateY(220px); }
         }
         .scan-line {
             animation: scan 2s infinite ease-in-out;
         }
     </style>
 </head>
-<body class="bg-slate-900 text-slate-100 font-sans min-h-screen flex flex-col">
+<body class="text-slate-200 font-sans min-h-screen flex flex-col justify-between selection:bg-blue-500/30">
 
-    <!-- 頂部導航欄 -->
-    <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50 px-6 py-4">
-        <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
-            <div class="flex items-center gap-3">
-                <div class="bg-blue-500 text-white p-2 rounded-lg shadow-lg shadow-blue-500/30">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"></path></svg>
+    <!-- 頂部空白間距 -->
+    <div></div>
+
+    <!-- 主要內容區：集中於中心 -->
+    <main class="max-w-md w-full mx-auto px-6 py-8 flex flex-col items-center justify-center space-y-8">
+        
+        <!-- 標頭：Bob檔案高速傳輸系統 -->
+        <header class="text-center space-y-1">
+            <h1 class="font-black text-2xl tracking-widest bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
+                Bob檔案高速傳輸系統
+            </h1>
+            <p class="text-[10px] text-slate-600 tracking-widest uppercase">WebRTC Direct P2P Pipe</p>
+        </header>
+
+        <!-- 第一步：建立連線控制面板 -->
+        <div class="w-full flex flex-col items-center space-y-6">
+            
+            <!-- 角色選擇：雙圖標大按鈕 -->
+            <div id="setup-view" class="grid grid-cols-2 gap-4 w-full">
+                <!-- 發起者按鈕 -->
+                <button id="btn-role-host" onclick="initHost()" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-blue-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
+                    <div class="p-3 bg-blue-500/10 text-blue-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 12h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    </div>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">發起傳輸</span>
+                </button>
+                
+                <!-- 接收者按鈕 -->
+                <button id="btn-role-joiner" onclick="startJoinerScanner()" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-emerald-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
+                    <div class="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
+                    </div>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">接收檔案</span>
+                </button>
+            </div>
+
+            <!-- 信令交換流程 UI -->
+            <div id="signaling-box" class="hidden w-full transition-all duration-300">
+                <!-- 發起者展示極簡 QR Code -->
+                <div id="host-panel" class="hidden flex flex-col items-center space-y-4">
+                    <div class="bg-slate-950 p-4 rounded-2xl border border-slate-900 flex flex-col items-center shadow-2xl">
+                        <canvas id="qr-canvas" class="bg-white p-2.5 rounded-xl"></canvas>
+                        <p id="room-url-display" class="text-[9px] text-slate-600 mt-3 font-mono break-all text-center max-w-[200px]">網址同步中...</p>
+                    </div>
+                    <p class="text-xs text-blue-400/80 animate-pulse tracking-wider">等待接收端掃描連線...</p>
                 </div>
-                <div>
-                    <h1 class="font-bold text-xl tracking-tight bg-gradient-to-r bg-clip-text text-transparent from-blue-400 to-emerald-400">WebRTC P2P 瀏覽器大檔案直傳 (單向對接版)</h1>
-                    <p class="text-xs text-slate-400">專屬信令中轉 · 掃描一次即可連線 · 零文字輸入</p>
+
+                <!-- 接收者自動接通處理面板 -->
+                <div id="joiner-panel" class="hidden flex flex-col items-center space-y-4">
+                    <div class="w-10 h-10 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin"></div>
+                    <p class="text-xs text-emerald-400/80 animate-pulse tracking-wider">正在進行一鍵握手對接...</p>
                 </div>
             </div>
-            <div class="flex gap-2">
-                <a href="#tech-intro" class="text-sm bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-lg transition">技術說明</a>
+
+            <!-- 連線狀態指示器 -->
+            <div id="connection-status" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-950 border border-slate-900/60">
+                <span id="status-indicator" class="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
+                <span id="status-text" class="text-[10px] font-medium tracking-widest text-slate-500">系統未連線</span>
             </div>
         </div>
-    </header>
 
-    <!-- 主要內容區 -->
-    <main class="flex-grow max-w-6xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
-        
-        <!-- 左側：P2P 傳輸控制台 (12格中佔7格) -->
-        <section class="lg:col-span-7 space-y-6">
-            
-            <!-- 第一步：建立連線控制面板 -->
-            <div class="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-6 backdrop-blur">
-                <div class="flex items-center gap-2 mb-4">
-                    <span class="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold">1</span>
-                    <h2 class="text-lg font-semibold">建立 P2P 聯絡通道</h2>
+        <!-- 第二步：檔案選取與傳輸控制 (連線後自動亮起/淡入) -->
+        <div id="transfer-panel" class="hidden w-full transition-all duration-500">
+            <!-- 拖曳上傳區 -->
+            <div id="drop-zone" class="border border-dashed border-slate-800 hover:border-blue-500/50 rounded-2xl p-8 text-center cursor-pointer bg-slate-950/40 transition-all duration-300 group">
+                <input type="file" id="file-input" class="hidden" />
+                <svg class="w-8 h-8 text-slate-700 group-hover:text-blue-400 mx-auto mb-3 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                <p class="text-xs font-semibold text-slate-400 group-hover:text-slate-200 transition-colors">點擊或拖曳檔案至此</p>
+                <p class="text-[9px] text-slate-600 mt-1">本地加密傳輸，不限大小</p>
+            </div>
+
+            <!-- 檔案資訊與進度條 -->
+            <div id="file-info-container" class="hidden mt-4 space-y-4 bg-slate-950 p-4 rounded-xl border border-slate-900">
+                <div class="flex justify-between items-center">
+                    <div class="truncate pr-4">
+                        <p id="info-file-name" class="font-bold text-xs text-slate-200 truncate max-w-[200px]">檔案名稱.ext</p>
+                        <p id="info-file-size" class="text-[10px] text-slate-500">0 Bytes</p>
+                    </div>
+                    <button id="btn-send" onclick="sendFileChunks()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-4 py-1.5 rounded-lg transition-all shadow-md shadow-blue-600/10">開始發送</button>
                 </div>
 
-                <div id="setup-view" class="space-y-4">
-                    <p class="text-sm text-slate-300 leading-relaxed">
-                        本網頁已預設使用專屬信令伺服器進行對接。請選擇您的角色。發起者會產生一個極簡的專屬連結 QR Code，接收者<strong>僅需掃描一次</strong>即可自動雙向握手！
-                    </p>
-
-                    <!-- 角色選擇與初始化 -->
-                    <div class="grid grid-cols-2 gap-4">
-                        <button id="btn-role-host" onclick="initHost()" class="py-3 px-4 rounded-xl border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 font-medium transition text-center flex flex-col items-center gap-1">
-                            <span class="text-lg font-bold">我是「發起者」</span>
-                            <span class="text-xs text-blue-400/80">產生超簡單 QR 碼供掃描</span>
-                        </button>
-                        <button id="btn-role-joiner" onclick="startJoinerScanner()" class="py-3 px-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 font-medium transition text-center flex flex-col items-center gap-1">
-                            <span class="text-lg font-bold">我是「接收者」</span>
-                            <span class="text-xs text-emerald-400/80">開啟相機直接掃描對接</span>
-                        </button>
+                <!-- 進度條 -->
+                <div class="space-y-1.5">
+                    <div class="flex justify-between text-[10px]">
+                        <span id="progress-status" class="text-slate-500">準備傳輸</span>
+                        <span id="progress-percent" class="font-bold text-blue-400">0%</span>
                     </div>
-                </div>
-
-                <!-- 信令交換流程 UI (中轉版 - 極度乾淨) -->
-                <div id="signaling-box" class="hidden space-y-4 border-t border-slate-700/50 pt-4">
-                    
-                    <!-- 發起者展示極簡 QR Code -->
-                    <div id="host-panel" class="hidden space-y-3">
-                        <label class="block text-sm text-blue-300 font-semibold text-center">請「接收者」掃描下方的極簡 QR Code：</label>
-                        <div class="flex flex-col items-center bg-slate-900/60 p-6 rounded-xl border border-slate-800">
-                            <!-- QR Code 畫布 -->
-                            <canvas id="qr-canvas" class="bg-white p-3 rounded-xl shadow-lg"></canvas>
-                            <p id="room-url-display" class="text-xs text-slate-400 mt-3 font-mono break-all text-center">網址生成中...</p>
-                            <p class="text-xs text-blue-400 mt-2 animate-pulse">正在透過信令伺服器等待對方接入...</p>
-                        </div>
+                    <div class="w-full bg-slate-900 rounded-full h-1 overflow-hidden">
+                        <div id="progress-bar" class="bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75"></div>
                     </div>
-
-                    <!-- 接收者自動接通處理面板 -->
-                    <div id="joiner-panel" class="hidden space-y-3">
-                        <div class="flex flex-col items-center bg-slate-900/60 p-6 rounded-xl border border-slate-800 space-y-4">
-                            <div class="w-12 h-12 rounded-full border-4 border-emerald-400 border-t-transparent animate-spin"></div>
-                            <div class="text-center">
-                                <p class="text-sm text-emerald-300 font-semibold">已偵測到房間，正在自動對接...</p>
-                                <p class="text-xs text-slate-500 mt-1">取得邀請 Offer ➜ 產生回覆 Answer ➜ 背景上傳中</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 狀態指示器 -->
-                <div id="connection-status" class="mt-4 p-3 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between">
-                    <span class="text-xs text-slate-400">目前連線狀態：</span>
-                    <div class="flex items-center gap-2">
-                        <span id="status-indicator" class="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse"></span>
-                        <span id="status-text" class="text-xs font-semibold text-red-400">未連線</span>
+                    <div class="flex justify-between text-[9px] text-slate-600 pt-0.5 font-mono">
+                        <span id="transfer-speed">0.00 MB/s</span>
+                        <span id="transfer-time">--:--</span>
                     </div>
                 </div>
             </div>
 
-            <!-- 第二步：檔案選取與傳輸控制 -->
-            <div id="transfer-panel" class="opacity-50 pointer-events-none bg-slate-800/50 border border-slate-700/50 rounded-2xl p-6 backdrop-blur transition-opacity duration-300">
-                <div class="flex items-center gap-2 mb-4">
-                    <span class="bg-blue-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold">2</span>
-                    <h2 class="text-lg font-semibold">選擇大檔案並傳輸</h2>
-                </div>
-
-                <!-- 拖曳上傳區 -->
-                <div id="drop-zone" class="border-2 border-dashed border-slate-600 hover:border-blue-500 rounded-xl p-8 text-center cursor-pointer transition-colors group">
-                    <input type="file" id="file-input" class="hidden" />
-                    <svg class="w-12 h-12 text-slate-500 group-hover:text-blue-400 mx-auto mb-2 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                    <p class="text-sm font-medium text-slate-300 group-hover:text-white transition-colors">點擊選擇大檔案，或拖曳檔案到這裡</p>
-                    <p class="text-xs text-slate-500 mt-1">本地讀取，不限格式與容量大小</p>
-                </div>
-
-                <!-- 檔案資訊與進度條 -->
-                <div id="file-info-container" class="hidden mt-4 space-y-3 bg-slate-900/80 p-4 rounded-xl border border-slate-700">
-                    <div class="flex justify-between items-start">
-                        <div>
-                            <p id="info-file-name" class="font-semibold text-sm text-white truncate max-w-xs md:max-w-md">檔案名稱.ext</p>
-                            <p id="info-file-size" class="text-xs text-slate-400 mt-0.5">檔案大小: 0 Bytes</p>
-                        </div>
-                        <button id="btn-send" onclick="sendFileChunks()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow-md shadow-blue-600/20">開始發送</button>
+            <!-- 接收檔案提示區 -->
+            <div id="incoming-file-box" class="hidden mt-4 bg-slate-950 border border-slate-900 p-4 rounded-xl space-y-3">
+                <p class="text-xs text-emerald-400 font-semibold flex items-center gap-1.5">
+                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                    正在接收檔案...
+                </p>
+                <div class="space-y-1.5">
+                    <div class="flex justify-between text-[10px]">
+                        <span id="recv-file-name" class="text-slate-400 truncate max-w-[200px]">檔案中...</span>
+                        <span id="recv-percent" class="font-bold text-emerald-400">0%</span>
                     </div>
-
-                    <!-- 進度條 -->
-                    <div class="space-y-1">
-                        <div class="flex justify-between text-xs">
-                            <span id="progress-status" class="text-slate-400">準備傳輸...</span>
-                            <span id="progress-percent" class="font-bold text-blue-400">0%</span>
-                        </div>
-                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-                            <div id="progress-bar" class="bg-gradient-to-r from-blue-500 to-emerald-400 h-2 w-0 transition-all duration-100"></div>
-                        </div>
-                        <div class="flex justify-between text-[10px] text-slate-500 pt-0.5">
-                            <span id="transfer-speed">速度: 0 MB/s</span>
-                            <span id="transfer-time">剩餘時間: --:--</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 接收檔案提示區 -->
-                <div id="incoming-file-box" class="hidden mt-4 bg-emerald-950/40 border border-emerald-500/30 p-4 rounded-xl space-y-2">
-                    <p class="text-sm text-emerald-300 font-semibold flex items-center gap-2">
-                        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-                        正在接收來自對方的檔案...
-                    </p>
-                    <div class="space-y-1">
-                        <div class="flex justify-between text-xs">
-                            <span id="recv-file-name" class="text-slate-300 truncate max-w-xs">檔案中...</span>
-                            <span id="recv-percent" class="font-bold text-emerald-400">0%</span>
-                        </div>
-                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-                            <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-2 w-0"></div>
-                        </div>
+                    <div class="w-full bg-slate-900 rounded-full h-1 overflow-hidden">
+                        <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-1 w-0"></div>
                     </div>
                 </div>
             </div>
+        </div>
 
-            <!-- 自訂通知訊息元件 -->
-            <div id="alert-toast" class="hidden p-4 rounded-xl border bg-slate-800 text-slate-200 transition-all duration-300 shadow-xl flex items-center justify-between">
-                <span id="toast-msg">提示訊息</span>
-                <button onclick="hideToast()" class="text-slate-400 hover:text-white ml-4 text-xs font-bold">關閉</button>
-            </div>
-
-        </section>
-
-        <!-- 右側：大檔案傳輸原理與技術指南 (12格中佔5格) -->
-        <section id="tech-intro" class="lg:col-span-5 space-y-6">
-            <div class="bg-slate-800/30 border border-slate-800 rounded-2xl p-6 space-y-4 text-sm leading-relaxed text-slate-300">
-                <h3 class="text-lg font-bold text-blue-400 border-b border-slate-800 pb-2 flex items-center gap-2">
-                    <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
-                    技術說明：P2P 直傳優勢
-                </h3>
-
-                <div class="p-3 bg-blue-950/30 rounded-xl border border-blue-500/20 text-xs text-blue-300 space-y-2">
-                    <span class="font-bold text-blue-200 block">⚡️ 專屬中轉讓對接變得無比簡單！</span>
-                    <p>以往 WebRTC 需要手動交換複雜的金鑰憑證。現在透過預設的信令伺服器，發起端能暫時將加密 Offer 送至雲端，生成的 QR 碼中僅包含精簡的房間 ID。</p>
-                    <p><strong>掃描時：</strong>接收端手機掃描一次，就會自動至信令伺服器取得 Offer 並上傳 Answer，雙方在背景瞬間完成握手並改採純 P2P 直連，檔案傳輸完全不耗費伺服器流量！</p>
-                </div>
-
-                <div class="border border-slate-800 rounded-xl p-4 space-y-2 bg-slate-900/50">
-                    <h4 class="font-semibold text-white text-xs">🔒 隱私與安全性</h4>
-                    <p class="text-xs text-slate-400">
-                        信令伺服器僅暫存連線交涉憑證，不觸碰您傳輸的任何檔案內容。一經連線，雙方的檔案將在瀏覽器間透過加密通道（DTLS-SRTP）直接傳輸，安全且極速。
-                    </p>
-                </div>
-            </div>
-        </section>
+        <!-- 自訂通知訊息元件 (Toast) -->
+        <div id="alert-toast" class="hidden p-3.5 rounded-xl border bg-slate-950 shadow-2xl flex items-center justify-between text-xs transition-all duration-300">
+            <span id="toast-msg">提示訊息</span>
+            <button onclick="hideToast()" class="text-slate-500 hover:text-white ml-4 text-[10px] font-bold tracking-wider">關閉</button>
+        </div>
 
     </main>
 
     <!-- 相機掃描彈窗 (Modal) -->
-    <div id="scanner-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur z-[100] flex items-center justify-center p-4">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 max-w-sm w-full relative">
-            <h3 class="text-lg font-bold mb-3 text-white flex items-center gap-2">
-                <span class="relative flex h-2 w-2">
+    <div id="scanner-modal" class="hidden fixed inset-0 bg-black/90 backdrop-blur-md z-[100] flex items-center justify-center p-4">
+        <div class="bg-slate-950 border border-slate-900 rounded-2xl p-5 max-w-sm w-full relative">
+            <h3 class="text-sm font-bold mb-3 text-white flex items-center gap-2">
+                <span class="relative flex h-1.5 w-1.5">
                     <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                    <span class="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                    <span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
                 </span>
-                正在開啟相機掃描...
+                開啟相機對焦中...
             </h3>
             
-            <div class="relative w-full aspect-square bg-black rounded-xl overflow-hidden border border-slate-700">
+            <div class="relative w-full aspect-square bg-black rounded-xl overflow-hidden border border-slate-900">
                 <video id="scan-video" class="w-full h-full object-cover"></video>
                 <canvas id="scan-canvas" class="hidden"></canvas>
-                <div class="absolute inset-8 border border-emerald-500/30 rounded-lg pointer-events-none">
-                    <div class="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-emerald-400"></div>
-                    <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-emerald-400"></div>
-                    <div class="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-emerald-400"></div>
-                    <div class="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-emerald-400"></div>
-                    <div class="scan-line w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent absolute top-0 shadow-[0_0_10px_#10b981]"></div>
+                <div class="absolute inset-8 border border-emerald-500/20 rounded-lg pointer-events-none">
+                    <div class="absolute top-0 left-0 w-3 h-3 border-t border-l border-emerald-400"></div>
+                    <div class="absolute top-0 right-0 w-3 h-3 border-t border-r border-emerald-400"></div>
+                    <div class="absolute bottom-0 left-0 w-3 h-3 border-b border-l border-emerald-400"></div>
+                    <div class="absolute bottom-0 right-0 w-3 h-3 border-b border-r border-emerald-400"></div>
+                    <div class="scan-line w-full h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent absolute top-0 shadow-[0_0_8px_#10b981]"></div>
                 </div>
             </div>
 
-            <p class="text-xs text-slate-400 mt-3 text-center">請將對方的單向連結 QR Code 放入鏡頭內</p>
-            <button onclick="stopScanner()" class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-2 rounded-xl transition">取消掃描</button>
+            <button onclick="stopScanner()" class="mt-4 w-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 font-bold py-2 rounded-xl text-xs transition">取消</button>
         </div>
     </div>
 
-    <!-- 底部資訊 -->
-    <footer class="border-t border-slate-800 text-center py-6 text-xs text-slate-500 mt-auto bg-slate-950">
-        <p>© 2026 WebRTC P2P File Transfer Tool. 100% Client-Side Code.</p>
+    <!-- 底部極簡版權 -->
+    <footer class="text-center py-6 text-[9px] text-slate-800 tracking-wider font-mono">
+        <p>P2P FILE SYSTEM · SECURE DIRECT CONNECTION</p>
     </footer>
 
-    <!-- WebRTC JavaScript 邏輯與 Cloudflare Worker 對接實作 -->
+    <!-- WebRTC JavaScript 邏輯與修復後的流控實作 -->
     <script>
         let peerConnection = null;
         let dataChannel = null;
@@ -270,24 +218,22 @@
             ]
         };
 
-        // --- 輔助：自動檢測 URL 是否為加入連結 ---
+        // --- 自動檢測加入 URL ---
         window.addEventListener('DOMContentLoaded', async () => {
             const urlParams = new URLSearchParams(window.location.search);
             const rId = urlParams.get('room');
             if (rId) {
-                // 如果網址帶有房間 ID，將自動進入「接收者/加入者」模式並開始握手
                 roomId = rId;
                 isHost = false;
                 initJoinerWithRoom();
             }
         });
 
-        // --- 輔助：取得與更新 Worker 網址（已寫死為使用者指定網址） ---
         function getWorkerUrl() {
             return "https://bobconnect.bobkao0527.workers.dev";
         }
 
-        // --- 自訂 UI 互動與 Toast 通知 ---
+        // --- 自訂 Toast 元件 ---
         function showToast(msg, type = 'info') {
             const toast = document.getElementById('alert-toast');
             const toastMsg = document.getElementById('toast-msg');
@@ -295,15 +241,15 @@
             
             toast.className = `fixed bottom-6 right-6 z-50 p-4 rounded-xl border shadow-2xl flex items-center justify-between transition-all duration-300 max-w-sm w-full`;
             if (type === 'success') {
-                toast.classList.add('bg-emerald-900', 'border-emerald-500', 'text-emerald-100');
+                toast.classList.add('bg-emerald-950/90', 'border-emerald-500/40', 'text-emerald-300');
             } else if (type === 'error') {
-                toast.classList.add('bg-rose-950', 'border-rose-500', 'text-rose-100');
+                toast.classList.add('bg-rose-950/90', 'border-rose-500/40', 'text-rose-300');
             } else {
-                toast.classList.add('bg-slate-800', 'border-slate-600', 'text-slate-100');
+                toast.classList.add('bg-slate-900/90', 'border-slate-800', 'text-slate-300');
             }
             toast.classList.remove('hidden');
             
-            setTimeout(hideToast, 5000);
+            setTimeout(hideToast, 4000);
         }
 
         function hideToast() {
@@ -314,23 +260,20 @@
             new QRious({
                 element: document.getElementById(canvasId),
                 value: text,
-                size: 240,
-                level: 'M' // 因為網址非常短，所以網點會極其稀疏、好讀
+                size: 200,
+                level: 'M'
             });
         }
 
         // --- 發起者流程 (Host) ---
         async function initHost() {
             isHost = true;
-            roomId = Math.random().toString(36).substring(2, 10); // 隨機房間碼
+            roomId = Math.random().toString(36).substring(2, 10);
 
             document.getElementById('setup-view').classList.add('hidden');
             document.getElementById('signaling-box').classList.remove('hidden');
             document.getElementById('host-panel').classList.remove('hidden');
-            updateRoleUI('host');
 
-            // 生成並繪製專屬對接網址 QR Code
-            // 該網址加上 ?room=xxx 後，對方掃描開啟就會自動完成 WebRTC 流程
             const currentOrigin = window.location.origin + window.location.pathname;
             const joinUrl = `${currentOrigin}?room=${roomId}`;
             document.getElementById('room-url-display').innerText = joinUrl;
@@ -340,9 +283,9 @@
                 peerConnection = new RTCPeerConnection(rtcConfig);
 
                 dataChannel = peerConnection.createDataChannel('fileTransfer', { ordered: true });
+                dataChannel.bufferedAmountLowThreshold = 131072; // 初始化 128KB 低水位閥值
                 setupDataChannelListeners();
 
-                // 當本地 ICE 收集完畢時，將完整的 Offer 送至 Cloudflare Worker 儲存
                 peerConnection.onicecandidate = async (event) => {
                     if (!event.candidate) {
                         const offer = peerConnection.localDescription;
@@ -355,14 +298,13 @@
                                 body: JSON.stringify({ offer })
                             });
                             if (res.ok) {
-                                updateStatus('已將邀請安全送至中轉，等待對方掃描連線...', 'yellow');
-                                // 開始自動輪詢檢查接收者是否已經產生回覆 (Answer)
+                                updateStatus('信令伺服器就緒，等候接入', 'yellow');
                                 startCheckingForAnswer();
                             } else {
-                                throw new Error('Worker 儲存失敗');
+                                throw new Error();
                             }
                         } catch (err) {
-                            showToast('無法上傳邀請至信令伺服器，請確認伺服器運作是否正常。', 'error');
+                            showToast('無法與信令伺服器同步', 'error');
                         }
                     }
                 };
@@ -370,15 +312,15 @@
                 const offer = await peerConnection.createOffer();
                 await peerConnection.setLocalDescription(offer);
 
-                updateStatus('正在與中轉伺服器同步...', 'yellow');
+                updateStatus('正在同步中轉服務...', 'yellow');
 
             } catch (e) {
                 console.error(e);
-                showToast('初始化發起失敗: ' + e.message, 'error');
+                showToast('初始化失敗: ' + e.message, 'error');
             }
         }
 
-        // --- 發起者背景輪詢，檢查對端 Answer ---
+        // --- 輪詢檢查接收端 Answer ---
         function startCheckingForAnswer() {
             if (answerCheckInterval) clearInterval(answerCheckInterval);
             const workerUrl = getWorkerUrl();
@@ -392,48 +334,39 @@
                             clearInterval(answerCheckInterval);
                             answerCheckInterval = null;
                             
-                            // 拿到 Answer 後直接設定
                             await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-                            showToast('已偵測到對端回覆，正在接通中！', 'success');
+                            showToast('成功對齊傳輸描述，建立直連中！', 'success');
                         }
                     }
                 } catch (e) {
-                    console.error('輪詢 Answer 失敗:', e);
+                    console.error(e);
                 }
-            }, 1500); // 每 1.5 秒輪詢一次
+            }, 1500);
         }
 
-        // --- 接收者：開啟相機直接掃描對接 (單向掃描) ---
-        function startJoinerScanner() {
-            startScanner();
-        }
-
-        // --- 接收者：自動對接流程 ---
+        // --- 接收端：自動對接流程 ---
         async function initJoinerWithRoom() {
             document.getElementById('setup-view').classList.add('hidden');
             document.getElementById('signaling-box').classList.remove('hidden');
             document.getElementById('joiner-panel').classList.remove('hidden');
-            updateRoleUI('joiner');
-            updateStatus('偵測到加入請求，正在進行一鍵自動握手...', 'yellow');
+            updateStatus('正在提取信令鑰匙...', 'yellow');
 
             const workerUrl = getWorkerUrl();
 
             try {
-                // 1. 向 Worker 讀取發起者的 Offer
                 const res = await fetch(`${workerUrl}/room/${roomId}`);
-                if (!res.ok) throw new Error('無法從中轉伺服器載入此通道的連線資訊');
+                if (!res.ok) throw new Error('提取信令失敗');
                 const data = await res.json();
-                if (!data || !data.offer) throw new Error('連線已被關閉或超時，請重新產生 QR 碼。');
+                if (!data || !data.offer) throw new Error('連線可能超時或失效，請發起端重新產生');
 
-                // 2. 建立本地連接
                 peerConnection = new RTCPeerConnection(rtcConfig);
 
                 peerConnection.ondatachannel = (event) => {
                     dataChannel = event.channel;
+                    dataChannel.bufferedAmountLowThreshold = 131072; // 設定 128KB 低水位閥值
                     setupDataChannelListeners();
                 };
 
-                // 當本地 ICE 收集完畢，將 Answer 上傳給 Worker
                 peerConnection.onicecandidate = async (event) => {
                     if (!event.candidate) {
                         const answer = peerConnection.localDescription;
@@ -444,23 +377,21 @@
                                 body: JSON.stringify({ answer })
                             });
                             if (postRes.ok) {
-                                updateStatus('已將對接金鑰同步，正在建立安全加密連結...', 'yellow');
+                                updateStatus('密鑰交換完畢，等待通道開放', 'yellow');
                             }
                         } catch (err) {
-                            showToast('上傳連線密鑰失敗，請重試。', 'error');
+                            showToast('回應金鑰失敗', 'error');
                         }
                     }
                 };
 
-                // 3. 解析 Host 的 Offer，並建立 Answer
                 await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
                 const answer = await peerConnection.createAnswer();
                 await peerConnection.setLocalDescription(answer);
 
             } catch (e) {
-                console.error(e);
                 showToast(e.message, 'error');
-                updateStatus('連線失敗: ' + e.message, 'red');
+                updateStatus('連線建立中斷', 'red');
             }
         }
 
@@ -480,19 +411,14 @@
                 modal.classList.remove('hidden');
                 scanAnimationId = requestAnimationFrame(tickScanner);
             } catch (e) {
-                console.error(e);
-                showToast('無法啟動相機，請確認瀏覽器相機使用權限。', 'error');
+                showToast('無法開啟相機，請檢查權限設定', 'error');
             }
         }
 
         function stopScanner() {
             const modal = document.getElementById('scanner-modal');
             modal.classList.add('hidden');
-            
-            if (scanAnimationId) {
-                cancelAnimationFrame(scanAnimationId);
-            }
-            
+            if (scanAnimationId) cancelAnimationFrame(scanAnimationId);
             if (videoStream) {
                 videoStream.getTracks().forEach(track => track.stop());
                 videoStream = null;
@@ -516,22 +442,19 @@
                 
                 if (code) {
                     stopScanner();
-                    
-                    // 檢查掃描到的 QR Code 是否包含房間參數
                     try {
                         const url = new URL(code.data);
                         const rId = url.searchParams.get('room');
                         if (rId) {
-                            showToast('對接 QR Code 掃描成功！開始一鍵連線...', 'success');
-                            // 自動導入房間
+                            showToast('解鎖對齊成功！一鍵握手中...', 'success');
                             roomId = rId;
                             isHost = false;
                             initJoinerWithRoom();
                         } else {
-                            showToast('此 QR Code 不是有效的大檔案傳輸邀請。', 'error');
+                            showToast('無效的對接二維碼', 'error');
                         }
                     } catch (e) {
-                        showToast('無效的網址格式。', 'error');
+                        showToast('讀取失敗：無效格式', 'error');
                     }
                     return;
                 }
@@ -542,17 +465,23 @@
         // --- 設定 DataChannel 監聽器 ---
         function setupDataChannelListeners() {
             dataChannel.onopen = () => {
-                updateStatus('連線成功！已建立加密直連通道。', 'green');
-                showToast('P2P 連線成功！現在可以開始傳輸檔案。', 'success');
-                // 隱藏信令握手盒，顯示檔案控制面板
+                updateStatus('P2P 直連已開通 (加密)', 'green');
+                showToast('通道對打洞成功！安全極速 P2P 連結就緒。', 'success');
+                
+                // 巧妙淡出 Step 1 的所有按鈕與面板，直接展現檔案傳輸模組
+                document.getElementById('setup-view').classList.add('hidden');
                 document.getElementById('signaling-box').classList.add('hidden');
-                document.getElementById('transfer-panel').classList.remove('opacity-50', 'pointer-events-none');
+                
+                const tfPanel = document.getElementById('transfer-panel');
+                tfPanel.classList.remove('hidden');
+                tfPanel.style.opacity = '1';
             };
 
             dataChannel.onclose = () => {
-                updateStatus('連線已中斷。', 'red');
-                showToast('連線中斷，請重試。', 'error');
-                document.getElementById('transfer-panel').classList.add('opacity-50', 'pointer-events-none');
+                updateStatus('連線已被安全釋放', 'red');
+                showToast('連結已釋放斷開', 'error');
+                document.getElementById('transfer-panel').classList.add('hidden');
+                document.getElementById('setup-view').classList.remove('hidden');
             };
 
             dataChannel.onmessage = (event) => {
@@ -560,7 +489,7 @@
             };
         }
 
-        // --- 處理接收到的資料流 ---
+        // --- 接收端：處理接收資料流 ---
         function handleIncomingData(data) {
             if (typeof data === 'string') {
                 try {
@@ -575,7 +504,7 @@
                         receivedSize = 0;
 
                         document.getElementById('incoming-file-box').classList.remove('hidden');
-                        document.getElementById('recv-file-name').innerText = `接收中: ${incomingFileInfo.name}`;
+                        document.getElementById('recv-file-name').innerText = incomingFileInfo.name;
                         document.getElementById('recv-percent').innerText = '0%';
                         document.getElementById('recv-progress-bar').style.width = '0%';
                     } else if (message.type === 'file-end') {
@@ -590,13 +519,13 @@
                         document.body.removeChild(a);
                         URL.revokeObjectURL(url);
 
-                        document.getElementById('recv-percent').innerText = '100% (下載完成)';
+                        document.getElementById('recv-percent').innerText = '100% (已自動下載)';
                         document.getElementById('recv-progress-bar').style.width = '100%';
-                        document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-2 w-full";
-                        showToast(`檔案「${incomingFileInfo.name}」已成功接收並下載！`, 'success');
+                        document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
+                        showToast(`「${incomingFileInfo.name}」下載成功！`, 'success');
                     }
                 } catch (e) {
-                    console.error("解析指令錯誤", e);
+                    console.error(e);
                 }
             } else {
                 receiveBuffer.push(data);
@@ -610,17 +539,20 @@
             }
         }
 
-        // --- 檔案發送切片的核心邏輯 ---
+        // --- 發送端：黃金級流控非同步切片傳輸 (解決 10% 凍結死結) ---
         function sendFileChunks() {
             if (!selectedFile || !dataChannel || dataChannel.readyState !== 'open') {
-                showToast('連線未準備好，或未選擇檔案！', 'error');
+                showToast('通道尚未連線或未選擇檔案', 'error');
                 return;
             }
 
             const btnSend = document.getElementById('btn-send');
-            btnSend.disabled = true;
-            btnSend.classList.add('opacity-50', 'cursor-not-allowed');
+            if (btnSend) {
+                btnSend.disabled = true;
+                btnSend.classList.add('opacity-40', 'cursor-not-allowed');
+            }
 
+            // 發送 Meta 宣告
             const meta = {
                 type: 'file-meta',
                 name: selectedFile.name,
@@ -628,36 +560,38 @@
             };
             dataChannel.send(JSON.stringify(meta));
 
-            const chunkSize = 16384; 
+            const chunkSize = 16384; // 最穩定的 16KB 標準切片
             let offset = 0;
             const fileReader = new FileReader();
             const startTime = Date.now();
 
-            document.getElementById('progress-status').innerText = '正在發送檔案碎片...';
+            document.getElementById('progress-status').innerText = '發送中...';
 
-            const readSlice = (currentOffset) => {
-                const slice = selectedFile.slice(currentOffset, currentOffset + chunkSize);
+            // 強制設定低水位，確保當快取清空到 128KB 以下時，才會觸發 low 事件
+            dataChannel.bufferedAmountLowThreshold = 131072;
+
+            const readNextChunk = () => {
+                if (offset >= selectedFile.size) {
+                    dataChannel.send(JSON.stringify({ type: 'file-end' }));
+                    document.getElementById('progress-status').innerText = '傳送完畢';
+                    showToast('檔案已完全投遞給接收端！', 'success');
+                    if (btnSend) {
+                        btnSend.disabled = false;
+                        btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+                    }
+                    return;
+                }
+
+                const slice = selectedFile.slice(offset, offset + chunkSize);
                 fileReader.readAsArrayBuffer(slice);
             };
 
             fileReader.onload = (e) => {
                 const buffer = e.target.result;
-                
-                if (dataChannel.bufferedAmount > 1048576) {
-                    dataChannel.onbufferedamountlow = () => {
-                        dataChannel.onbufferedamountlow = null;
-                        dataChannel.send(buffer);
-                        continueSending();
-                    };
-                } else {
-                    dataChannel.send(buffer);
-                    continueSending();
-                }
-            };
+                dataChannel.send(buffer);
+                offset += buffer.byteLength;
 
-            const continueSending = () => {
-                offset += chunkSize;
-                
+                // 即時 UI 計算
                 const percent = Math.min(100, Math.round((offset / selectedFile.size) * 100));
                 document.getElementById('progress-percent').innerText = `${percent}%`;
                 document.getElementById('progress-bar').style.width = `${percent}%`;
@@ -665,30 +599,32 @@
                 const elapsedTime = (Date.now() - startTime) / 1000;
                 const speedBytes = offset / elapsedTime;
                 const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
-                document.getElementById('transfer-speed').innerText = `速度: ${speedMB} MB/s`;
+                document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
 
                 if (speedBytes > 0) {
                     const remainingBytes = selectedFile.size - offset;
                     const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
                     const mins = Math.floor(remainingSeconds / 60);
                     const secs = remainingSeconds % 60;
-                    document.getElementById('transfer-time').innerText = `剩餘時間: ${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                    document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
                 }
 
-                if (offset < selectedFile.size) {
-                    readSlice(offset);
+                // 【極其重要：流控阻斷與調度保護】
+                // 如果當前佇列快取已超過 256KB，則強制阻塞下一次檔案讀取，直到緩衝下降至 128KB 觸發事件
+                if (dataChannel.bufferedAmount > 262144) {
+                    dataChannel.onbufferedamountlow = () => {
+                        dataChannel.onbufferedamountlow = null; // 即刻清空監聽，避免重複回呼
+                        readNextChunk();
+                    };
                 } else {
-                    dataChannel.send(JSON.stringify({ type: 'file-end' }));
-                    document.getElementById('progress-status').innerText = '發送完成！';
-                    showToast('檔案發送成功！', 'success');
-                    
-                    btnSend.disabled = false;
-                    btnSend.classList.remove('opacity-50', 'cursor-not-allowed');
+                    // 若在安全水位下，則藉由微小的非同步延遲調度 readNextChunk()。
+                    // 這樣做能將線程歸還給瀏覽器的 UI 渲染引擎（Event Loop），防止 JS 連續阻塞，完全杜絕 10% 卡死問題
+                    setTimeout(readNextChunk, 0);
                 }
             };
 
-            dataChannel.bufferedAmountLowThreshold = 1048576;
-            readSlice(0);
+            // 開始安全讀取發送
+            readNextChunk();
         }
 
         // --- 拖曳與選擇檔案相關 UI 事件 ---
@@ -699,16 +635,16 @@
         
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
-            dropZone.classList.add('border-blue-500', 'bg-slate-800/80');
+            dropZone.classList.add('border-blue-500', 'bg-slate-950/90');
         });
 
         dropZone.addEventListener('dragleave', () => {
-            dropZone.classList.remove('border-blue-500', 'bg-slate-800/80');
+            dropZone.classList.remove('border-blue-500', 'bg-slate-950/90');
         });
 
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
-            dropZone.classList.remove('border-blue-500', 'bg-slate-800/80');
+            dropZone.classList.remove('border-blue-500', 'bg-slate-950/90');
             if (e.dataTransfer.files.length > 0) {
                 handleFileSelect(e.dataTransfer.files[0]);
             }
@@ -734,48 +670,32 @@
 
             document.getElementById('file-info-container').classList.remove('hidden');
             document.getElementById('info-file-name').innerText = file.name;
-            document.getElementById('info-file-size').innerText = `檔案大小: ${sizeStr}`;
+            document.getElementById('info-file-size').innerText = sizeStr;
             
-            document.getElementById('progress-status').innerText = '準備就緒。';
+            document.getElementById('progress-status').innerText = '隨時可以發送';
             document.getElementById('progress-percent').innerText = '0%';
             document.getElementById('progress-bar').style.width = '0%';
-            document.getElementById('transfer-speed').innerText = `速度: 0 MB/s`;
-            document.getElementById('transfer-time').innerText = `剩餘時間: --:--`;
+            document.getElementById('transfer-speed').innerText = `0.00 MB/s`;
+            document.getElementById('transfer-time').innerText = `--:--`;
         }
 
-        // --- UI 更新輔助 ---
-        function updateRoleUI(role) {
-            const btnHost = document.getElementById('btn-role-host');
-            const btnJoiner = document.getElementById('btn-role-joiner');
-            
-            if (role === 'host') {
-                btnHost.classList.add('bg-blue-500/30', 'border-blue-500', 'text-white');
-                btnJoiner.classList.add('opacity-40');
-                btnJoiner.disabled = true;
-            } else {
-                btnJoiner.classList.add('bg-emerald-500/30', 'border-emerald-500', 'text-white');
-                btnHost.classList.add('opacity-40');
-                btnHost.disabled = true;
-            }
-        }
-
-        // 狀態更新
+        // --- 狀態燈與文字更新 ---
         function updateStatus(text, color) {
             const indicator = document.getElementById('status-indicator');
             const statusText = document.getElementById('status-text');
 
             statusText.innerText = text;
             
-            indicator.className = "w-2.5 h-2.5 rounded-full";
+            indicator.className = "w-1.5 h-1.5 rounded-full";
             if (color === 'green') {
                 indicator.classList.add('bg-emerald-500', 'animate-pulse');
-                statusText.className = "text-xs font-semibold text-emerald-400";
+                statusText.className = "text-[10px] font-medium tracking-widest text-emerald-400";
             } else if (color === 'yellow') {
                 indicator.classList.add('bg-yellow-500', 'animate-pulse');
-                statusText.className = "text-xs font-semibold text-yellow-400";
+                statusText.className = "text-[10px] font-medium tracking-widest text-yellow-400";
             } else {
                 indicator.classList.add('bg-red-500');
-                statusText.className = "text-xs font-semibold text-red-400";
+                statusText.className = "text-[10px] font-medium tracking-widest text-red-400";
             }
         }
     </script>
