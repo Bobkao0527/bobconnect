@@ -860,7 +860,7 @@
             }
         }
 
-        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（含 100% 荷包防刷、併行鎖與限額解析） ---
+        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（已優化：支援 3 執行緒並行上傳，告別 2.8MB/s 限速） ---
         async function sendViaR2Multipart() {
             const btnSend = document.getElementById('btn-send');
             if (btnSend) {
@@ -878,7 +878,6 @@
                 const initRes = await fetch(`${workerUrl}/r2-multipart/init/${roomId}/${filenameEncoded}`, { method: 'POST' });
                 if (!initRes.ok) {
                     const errData = await initRes.json().catch(() => ({}));
-                    // 🌟 智慧捕捉併行鎖 (CONCURRENCY_LOCKED) 或額度爆滿 (R2_LIMIT_EXCEEDED) 警告
                     if (errData.error === "CONCURRENCY_LOCKED" || errData.error === "R2_LIMIT_EXCEEDED" || errData.message) {
                         throw new Error(errData.message);
                     }
@@ -893,63 +892,94 @@
                 const startTime = Date.now();
                 let lastUiUpdateTime = 0;
 
-                document.getElementById('progress-status').innerText = '正在將分塊流式寫入 R2 儲存區...';
+                document.getElementById('progress-status').innerText = '正在進行極速 R2 並行傳輸...';
 
-                // 2. 循環上傳每一個 10MB 的分片
-                for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
-                    const offset = (partNumber - 1) * partSize;
-                    const chunk = selectedFile.slice(offset, Math.min(offset + partSize, totalSize));
-                    const chunkData = await chunk.arrayBuffer();
+                // 追蹤各分塊上傳的進度（用於計算精準的整體進度）
+                const partLoadedBytes = {};
+                
+                const updateOverallProgress = () => {
+                    const currentLoaded = Object.values(partLoadedBytes).reduce((a, b) => a + b, 0);
+                    const now = Date.now();
+                    if (now - lastUiUpdateTime > 100 || currentLoaded === totalSize) {
+                        lastUiUpdateTime = now;
 
-                    // 使用 XHR 以實現精密的分塊內部上傳進度計算
-                    const uploadedPart = await new Promise((resolve, reject) => {
-                        const xhr = new XMLHttpRequest();
-                        xhr.open('PUT', `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${partNumber}`, true);
+                        const percent = Math.min(100, Math.round((currentLoaded / totalSize) * 100));
+                        document.getElementById('progress-percent').innerText = `${percent}%`;
+                        document.getElementById('progress-bar').style.width = `${percent}%`;
 
-                        xhr.upload.addEventListener('progress', (e) => {
-                            if (e.lengthComputable) {
-                                const currentLoaded = offset + e.loaded;
-                                const now = Date.now();
-                                if (now - lastUiUpdateTime > 100 || currentLoaded === totalSize) {
-                                    lastUiUpdateTime = now;
+                        const elapsedTime = (now - startTime) / 1000;
+                        const speedBytes = currentLoaded / elapsedTime;
+                        const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
+                        document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
 
-                                    const percent = Math.min(100, Math.round((currentLoaded / totalSize) * 100));
-                                    document.getElementById('progress-percent').innerText = `${percent}%`;
-                                    document.getElementById('progress-bar').style.width = `${percent}%`;
+                        if (speedBytes > 0) {
+                            const remainingBytes = totalSize - currentLoaded;
+                            const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
+                            const mins = Math.floor(remainingSeconds / 60);
+                            const secs = remainingSeconds % 60;
+                            document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                        }
+                    }
+                };
 
-                                    const elapsedTime = (now - startTime) / 1000;
-                                    const speedBytes = currentLoaded / elapsedTime;
-                                    const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
-                                    document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
+                // 2. 🚀【極速併發執行緒池設計】
+                const CONCURRENCY_LIMIT = 3; // 設定 3 路並行上傳，充分榨乾 R2 與本地上傳頻寬
+                let nextPartToUpload = 1;
+                const uploadErrors = [];
 
-                                    if (speedBytes > 0) {
-                                        const remainingBytes = totalSize - currentLoaded;
-                                        const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
-                                        const mins = Math.floor(remainingSeconds / 60);
-                                        const secs = remainingSeconds % 60;
-                                        document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                const uploadWorker = async () => {
+                    while (nextPartToUpload <= totalParts && uploadErrors.length === 0) {
+                        const currentPart = nextPartToUpload++;
+                        const offset = (currentPart - 1) * partSize;
+                        const chunk = selectedFile.slice(offset, Math.min(offset + partSize, totalSize));
+                        const chunkData = await chunk.arrayBuffer();
+
+                        try {
+                            const uploadedPart = await new Promise((resolve, reject) => {
+                                const xhr = new XMLHttpRequest();
+                                xhr.open('PUT', `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`, true);
+
+                                xhr.upload.addEventListener('progress', (e) => {
+                                    if (e.lengthComputable) {
+                                        partLoadedBytes[currentPart] = e.loaded;
+                                        updateOverallProgress();
                                     }
-                                }
-                            }
-                        });
+                                });
 
-                        xhr.onload = () => {
-                            if (xhr.status === 200) {
-                                resolve(JSON.parse(xhr.responseText));
-                            } else {
-                                const errData = JSON.parse(xhr.responseText || "{}");
-                                reject(new Error(errData.message || `分塊 ${partNumber} 上傳失敗`));
-                            }
-                        };
-                        xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
-                        xhr.send(chunkData);
-                    });
+                                xhr.onload = () => {
+                                    if (xhr.status === 200) {
+                                        resolve(JSON.parse(xhr.responseText));
+                                    } else {
+                                        const errData = JSON.parse(xhr.responseText || "{}");
+                                        reject(new Error(errData.message || `分塊 ${currentPart} 上傳失敗`));
+                                    }
+                                };
+                                xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
+                                xhr.send(chunkData);
+                            });
 
-                    // 將成功的 Etag 與編號記錄下來
-                    uploadedParts.push({
-                        partNumber: uploadedPart.partNumber,
-                        etag: uploadedPart.etag
-                    });
+                            uploadedParts.push({
+                                partNumber: uploadedPart.partNumber,
+                                etag: uploadedPart.etag
+                            });
+                        } catch (err) {
+                            uploadErrors.push(err);
+                            throw err;
+                        }
+                    }
+                };
+
+                // 啟動併行任務
+                const pool = [];
+                const threads = Math.min(CONCURRENCY_LIMIT, totalParts);
+                for (let i = 0; i < threads; i++) {
+                    pool.push(uploadWorker());
+                }
+
+                await Promise.all(pool);
+
+                if (uploadErrors.length > 0) {
+                    throw uploadErrors[0];
                 }
 
                 // 3. 完成所有分塊，通知 Worker 將分片合併成完整檔案
