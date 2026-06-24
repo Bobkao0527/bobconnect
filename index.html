@@ -912,7 +912,7 @@
             }
         }
 
-        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（已優化：支援 3 執行緒並行上傳，告別 2.8MB/s 限速） ---
+        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（含 100% 荷包防刷、併行鎖與直連失敗秒級降級防呆機制） ---
         async function sendViaR2Multipart() {
             const btnSend = document.getElementById('btn-send');
             if (btnSend) {
@@ -945,10 +945,11 @@
                 let lastUiUpdateTime = 0;
 
                 // 若為直連上傳 R2，將併發數調升至 5 以進一步榨乾網路頻寬！代理模式則維持安全上限 3
-                const CONCURRENCY_LIMIT = directUpload ? 5 : 3;
+                let currentConcurrencyLimit = directUpload ? 5 : 3;
+                let activeDirectUpload = directUpload; // 用於內部追蹤直連是否可用
                 
-                document.getElementById('progress-status').innerText = directUpload 
-                    ? `正在與 R2 建立極速直連通道 (${CONCURRENCY_LIMIT} 執行緒並行)...` 
+                document.getElementById('progress-status').innerText = activeDirectUpload 
+                    ? `正在與 R2 建立極速直連通道 (${currentConcurrencyLimit} 執行緒並行)...` 
                     : `正在進行極速 R2 並行傳輸 (代理優化模式)...`;
 
                 // 追蹤各分塊上傳的進度（用於計算精準的整體進度）
@@ -979,7 +980,7 @@
                     }
                 };
 
-                // 2. 🚀【並行執行緒池設計】
+                // 2. 🚀【並行執行緒池設計（含自動降級代理重試機制）】
                 let nextPartToUpload = 1;
                 const uploadErrors = [];
 
@@ -990,72 +991,87 @@
                         const chunk = selectedFile.slice(offset, Math.min(offset + partSize, totalSize));
                         const chunkData = await chunk.arrayBuffer();
 
-                        try {
+                        let attempts = 0;
+                        let success = false;
+                        let uploadedPart = null;
+
+                        // 允許最多 2 次嘗試（第一次嘗試直連預簽名，若因 CORS 或網路斷開則秒級降級為代理模式）
+                        while (attempts < 2 && !success && uploadErrors.length === 0) {
+                            attempts++;
+                            const attemptDirect = (activeDirectUpload && attempts === 1);
                             let targetUrl = "";
-                            
-                            // A. 🌟【直連 R2 預簽名模式】：向 Worker 索取一次性預簽名上傳連結
-                            if (directUpload) {
-                                const presignRes = await fetch(`${workerUrl}/r2-multipart/presign/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`);
-                                if (!presignRes.ok) throw new Error("直連認證失效");
-                                const presignData = await presignRes.json();
-                                targetUrl = presignData.uploadUrl;
-                            } else {
-                                // B.【代理模式】：上傳至 Worker 代理路徑
-                                targetUrl = `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`;
-                            }
 
-                            const uploadedPart = await new Promise((resolve, reject) => {
-                                const xhr = new XMLHttpRequest();
-                                xhr.open('PUT', targetUrl, true);
-
-                                // 直連模式不傳送任何自訂 Header，以保證預簽名 S3 驗證順利通過
-                                if (!directUpload) {
-                                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                            try {
+                                if (attemptDirect) {
+                                    const presignRes = await fetch(`${workerUrl}/r2-multipart/presign/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`);
+                                    if (!presignRes.ok) throw new Error("直連認證失效");
+                                    const presignData = await presignRes.json();
+                                    targetUrl = presignData.uploadUrl;
+                                } else {
+                                    targetUrl = `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`;
                                 }
 
-                                xhr.upload.addEventListener('progress', (e) => {
-                                    if (e.lengthComputable) {
-                                        partLoadedBytes[currentPart] = e.loaded;
-                                        updateOverallProgress();
+                                uploadedPart = await new Promise((resolve, reject) => {
+                                    const xhr = new XMLHttpRequest();
+                                    xhr.open('PUT', targetUrl, true);
+
+                                    // 直連模式不傳送自訂 Content-Type 避免毀損 S3 預簽名 Signature 結構
+                                    if (!attemptDirect) {
+                                        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
                                     }
+
+                                    xhr.upload.addEventListener('progress', (e) => {
+                                        if (e.lengthComputable) {
+                                            partLoadedBytes[currentPart] = e.loaded;
+                                            updateOverallProgress();
+                                        }
+                                    });
+
+                                    xhr.onload = () => {
+                                        if (xhr.status === 200) {
+                                            const etag = xhr.getResponseHeader('ETag') || "";
+                                            resolve({
+                                                partNumber: currentPart,
+                                                etag: etag.replace(/"/g, "") // 清理 ETag 引號
+                                            });
+                                        } else {
+                                            reject(new Error(`HTTP ${xhr.status}`));
+                                        }
+                                    };
+                                    xhr.onerror = () => {
+                                        reject(new Error("網路連線或 CORS 阻擋錯誤"));
+                                    };
+                                    xhr.send(chunkData);
                                 });
 
-                                xhr.onload = () => {
-                                    if (xhr.status === 200) {
-                                        // R2 直連會直接返回 200 與 ETag 標頭
-                                        const etag = xhr.getResponseHeader('ETag') || "";
-                                        resolve({
-                                            partNumber: currentPart,
-                                            etag: etag.replace(/"/g, "") // 去除引號，符合 S3 規範
-                                        });
-                                    } else {
-                                        reject(new Error(`分塊 ${currentPart} 上傳失敗`));
-                                    }
-                                };
-                                // 🚀【極速直連 CORS 專用友善報錯】：若直連上傳出現網路錯誤，高機率是 CORS 未配置
-                                xhr.onerror = () => {
-                                    const errMsg = directUpload 
-                                        ? `分塊 ${currentPart} 上傳失敗。這高機率是 Cloudflare R2 儲存桶未正確配置 CORS 策略，或未暴露 ETag 標頭！` 
-                                        : `分塊 ${currentPart} 上傳時發生網路錯誤。`;
-                                    reject(new Error(errMsg));
-                                };
-                                xhr.send(chunkData);
-                            });
+                                success = true;
+                            } catch (err) {
+                                if (attemptDirect) {
+                                    // 🌟 核心防呆：直連失敗！不阻斷傳輸，立即關閉直連標誌並降級重試
+                                    console.warn(`[自動防呆] 分塊 ${currentPart} 直連上傳失敗 (${err.message})。立即無感降級至代理模式重試...`);
+                                    activeDirectUpload = false; // 讓此分塊與後續所有尚未發送的分塊都自動切換為代理模式
+                                    document.getElementById('progress-status').innerText = `直連通道異常，已自動降級至代理通道傳輸中...`;
+                                    continue; // 進入 attempts = 2，改走代理模式
+                                } else {
+                                    // 代理模式依然失敗，視為真實網路故障
+                                    uploadErrors.push(err);
+                                    throw err;
+                                }
+                            }
+                        }
 
+                        if (success && uploadedPart) {
                             uploadedParts.push({
                                 partNumber: uploadedPart.partNumber,
                                 etag: uploadedPart.etag
                             });
-                        } catch (err) {
-                            uploadErrors.push(err);
-                            throw err;
                         }
                     }
                 };
 
                 // 啟動併行任務
                 const pool = [];
-                const threads = Math.min(CONCURRENCY_LIMIT, totalParts);
+                const threads = Math.min(currentConcurrencyLimit, totalParts);
                 for (let i = 0; i < threads; i++) {
                     pool.push(uploadWorker());
                 }
