@@ -1032,7 +1032,13 @@
                                         reject(new Error(`分塊 ${currentPart} 上傳失敗`));
                                     }
                                 };
-                                xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
+                                // 🚀【極速直連 CORS 專用友善報錯】：若直連上傳出現網路錯誤，高機率是 CORS 未配置
+                                xhr.onerror = () => {
+                                    const errMsg = directUpload 
+                                        ? `分塊 ${currentPart} 上傳失敗。這高機率是 Cloudflare R2 儲存桶未正確配置 CORS 策略，或未暴露 ETag 標頭！` 
+                                        : `分塊 ${currentPart} 上傳時發生網路錯誤。`;
+                                    reject(new Error(errMsg));
+                                };
                                 xhr.send(chunkData);
                             });
 
