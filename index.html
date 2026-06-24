@@ -39,6 +39,22 @@
 </head>
 <body class="text-slate-200 font-sans min-h-screen flex flex-col justify-between selection:bg-blue-500/30">
 
+    <!-- 內嵌瀏覽器 (LINE, FB, Google App) 警告遮罩 -->
+    <div id="inapp-warning-overlay" class="hidden fixed inset-0 bg-slate-950 z-[200] flex flex-col items-center justify-center p-6 text-center">
+        <div class="bg-yellow-500/10 border border-yellow-500/20 p-6 rounded-2xl max-w-sm space-y-4">
+            <div class="text-yellow-400 mx-auto w-12 h-12 flex items-center justify-center bg-yellow-500/10 rounded-full">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            </div>
+            <h2 class="text-lg font-bold text-white">請勿在 App 內直接開啟</h2>
+            <p class="text-xs text-slate-400 leading-relaxed">
+                偵測到您正使用 App 內建瀏覽器（如 LINE, FB, Google App）。<br><strong class="text-yellow-400">這將導致檔案傳輸完成後無法下載！</strong>
+            </p>
+            <div class="pt-2 text-xs text-slate-300 border-t border-slate-900">
+                請點擊右上角的 <strong class="text-white">「···」</strong> 或分享圖示，選擇 <strong class="text-emerald-400">「在瀏覽器中開啟」</strong> (Safari 或 Chrome).
+            </div>
+        </div>
+    </div>
+
     <!-- 頂部空白間距 -->
     <div></div>
 
@@ -50,7 +66,7 @@
             <h1 class="font-black text-2xl tracking-widest bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
                 Bob檔案高速傳輸系統
             </h1>
-            <p class="text-[10px] text-slate-600 tracking-widest uppercase">掃描以進行WebRTC Direct P2P連線</p>
+            <p class="text-[10px] text-slate-600 tracking-widest uppercase">WebRTC Direct P2P Pipe</p>
         </header>
 
         <!-- 第一步：建立連線控制面板 -->
@@ -63,7 +79,7 @@
                     <div class="p-3 bg-blue-500/10 text-blue-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 12h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                     </div>
-                    <span class="text-sm font-bold text-slate-300 tracking-wider">產生QR Code</span>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">發起傳輸</span>
                 </button>
                 
                 <!-- 接收者按鈕 -->
@@ -71,7 +87,7 @@
                     <div class="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
                     </div>
-                    <span class="text-sm font-bold text-slate-300 tracking-wider">掃描QR Code</span>
+                    <span class="text-sm font-bold text-slate-300 tracking-wider">接收檔案</span>
                 </button>
             </div>
 
@@ -136,12 +152,12 @@
             </div>
 
             <!-- 接收檔案提示區 -->
-            <div id="incoming-file-box" class="hidden mt-4 bg-slate-950 border border-slate-900 p-4 rounded-xl space-y-3">
-                <p class="text-xs text-emerald-400 font-semibold flex items-center gap-1.5">
+            <div id="incoming-file-box" class="hidden mt-4 bg-slate-950 border border-slate-900 p-4 rounded-xl space-y-3 text-center">
+                <p id="incoming-status-title" class="text-xs text-emerald-400 font-semibold flex items-center justify-center gap-1.5 mb-2">
                     <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
                     正在接收檔案...
                 </p>
-                <div class="space-y-1.5">
+                <div class="space-y-1.5 text-left">
                     <div class="flex justify-between text-[10px]">
                         <span id="recv-file-name" class="text-slate-400 truncate max-w-[200px]">檔案中...</span>
                         <span id="recv-percent" class="font-bold text-emerald-400">0%</span>
@@ -149,6 +165,13 @@
                     <div class="w-full bg-slate-900 rounded-full h-1 overflow-hidden">
                         <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-1 w-0"></div>
                     </div>
+                </div>
+                <!-- 備用手動下載按鈕 -->
+                <div id="manual-download-container" class="hidden pt-3 border-t border-slate-900 mt-2">
+                    <button id="btn-manual-download" class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition shadow-lg shadow-emerald-600/10">
+                        📥 手動下載檔案
+                    </button>
+                    <p class="text-[9px] text-slate-500 mt-1 font-sans">若自動下載未觸發，請點擊按鈕手動儲存</p>
                 </div>
             </div>
         </div>
@@ -193,7 +216,7 @@
         <p>P2P FILE SYSTEM · SECURE DIRECT CONNECTION</p>
     </footer>
 
-    <!-- WebRTC JavaScript 邏輯與修復後的流控實作 -->
+    <!-- WebRTC JavaScript 邏輯與 R2 極速串流下載自動銷毀實作 -->
     <script>
         let peerConnection = null;
         let dataChannel = null;
@@ -205,6 +228,11 @@
         let roomId = null;
         let isHost = false;
         let answerCheckInterval = null;
+
+        // 設備特徵識別 (智慧分流核心)
+        const localIsMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        let remoteIsMobile = false; 
+        let useR2 = false;
 
         // 相機與 UI 更新節流計時器
         let videoStream = null;
@@ -218,8 +246,25 @@
             ]
         };
 
+        // --- 核心優化：內嵌瀏覽器 (In-App Browser) 檢測與警告 ---
+        function checkInAppBrowser() {
+            const ua = navigator.userAgent || navigator.vendor || window.opera;
+            const isInApp = (ua.indexOf("FBAN") > -1) || 
+                            (ua.indexOf("FBAV") > -1) || 
+                            (ua.indexOf("Line") > -1) || 
+                            (ua.indexOf("GSA") > -1) || 
+                            (ua.indexOf("Messenger") > -1) ||
+                            (ua.indexOf("Instagram") > -1);
+            
+            if (isInApp) {
+                document.getElementById('inapp-warning-overlay').classList.remove('hidden');
+            }
+        }
+
         // --- 自動檢測加入 URL ---
         window.addEventListener('DOMContentLoaded', async () => {
+            checkInAppBrowser(); // 載入時立即檢查內嵌瀏覽器地雷
+            
             const urlParams = new URLSearchParams(window.location.search);
             const rId = urlParams.get('room');
             if (rId) {
@@ -238,11 +283,20 @@
             if (!roomId) return;
             const workerUrl = getWorkerUrl();
             try {
-                // 發送 DELETE 請求，通知 Worker 刪除該房間的 KV 或記憶體資料
                 await fetch(`${workerUrl}/room/${roomId}`, { method: 'DELETE' });
                 console.log(`[安全機制] 房間 ${roomId} 的雲端信令已成功手動銷毀。`);
             } catch (e) {
                 console.error("手動銷毀房間失敗:", e);
+            }
+        }
+
+        // --- R2優化：下載/上傳完成後銷毀 R2 的託管檔案 ---
+        async function destroyR2File(url) {
+            try {
+                await fetch(url, { method: 'DELETE' });
+                console.log("[安全機制] R2 暫存大檔案已成功手動清理銷毀。");
+            } catch (e) {
+                console.error("手動銷毀 R2 檔案失敗:", e);
             }
         }
 
@@ -262,7 +316,7 @@
             }
             toast.classList.remove('hidden');
             
-            setTimeout(hideToast, 4000);
+            setTimeout(hideToast, 5000); 
         }
 
         function hideToast() {
@@ -483,9 +537,15 @@
         function setupDataChannelListeners() {
             dataChannel.onopen = () => {
                 updateStatus('P2P 直連已開通 (加密)', 'green');
-                showToast('極速P2P連結就緒。', 'success');
+                showToast('通道對打洞成功！安全極速 P2P 連結就緒。', 'success');
                 
-                // 【觸發安全機制】通道一開，立刻向 Worker 發送 DELETE 請求銷毀雲端暫存
+                // 1. 對接成功後，雙方立刻在背景交換「本端設備是否為行動裝置」的特徵碼
+                dataChannel.send(JSON.stringify({
+                    type: 'device-info',
+                    isMobile: localIsMobile
+                }));
+
+                // 2. 【觸發安全機制】通道一開，立刻向 Worker 發送 DELETE 請求銷毀雲端暫存信令
                 destroyCloudRoom();
 
                 // 巧妙淡出 Step 1 的所有按鈕與面板，直接展現檔案傳輸模組
@@ -515,6 +575,17 @@
                 try {
                     const message = JSON.parse(data);
                     
+                    // 背景特徵交換：接收對方的設備資訊並即時評估檔案傳輸策略
+                    if (message.type === 'device-info') {
+                        remoteIsMobile = message.isMobile;
+                        console.log(`[設備對齊] 對方是否為行動裝置: ${remoteIsMobile}`);
+                        if (selectedFile) {
+                            evaluateFileRouting(selectedFile);
+                        }
+                        return;
+                    }
+
+                    // A. 標準 P2P WebRTC 傳輸 Meta
                     if (message.type === 'file-meta') {
                         incomingFileInfo = {
                             name: message.name,
@@ -525,35 +596,64 @@
                         lastRecvUiTime = 0;
 
                         document.getElementById('incoming-file-box').classList.remove('hidden');
+                        document.getElementById('incoming-status-title').innerHTML = `
+                            <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                            正在接收檔案...
+                        `;
                         document.getElementById('recv-file-name').innerText = incomingFileInfo.name;
                         document.getElementById('recv-percent').innerText = '0%';
                         document.getElementById('recv-progress-bar').style.width = '0%';
+                        document.getElementById('recv-progress-bar').className = "bg-gradient-to-r from-emerald-500 to-teal-400 h-1";
+                        document.getElementById('manual-download-container').classList.add('hidden');
+                    
+                    // B. 標準 P2P WebRTC 傳輸 結束
                     } else if (message.type === 'file-end') {
                         const blob = new Blob(receiveBuffer);
                         const url = URL.createObjectURL(blob);
                         
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = incomingFileInfo.name;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        URL.revokeObjectURL(url);
+                        triggerAutoDownload(url, incomingFileInfo.name);
 
-                        document.getElementById('recv-percent').innerText = '100% (已自動下載)';
+                        const btnManual = document.getElementById('btn-manual-download');
+                        btnManual.onclick = () => {
+                            triggerAutoDownload(url, incomingFileInfo.name);
+                        };
+                        document.getElementById('manual-download-container').classList.remove('hidden');
+
+                        document.getElementById('recv-percent').innerText = '100% (已完成)';
                         document.getElementById('recv-progress-bar').style.width = '100%';
                         document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
-                        showToast(`「${incomingFileInfo.name}」下載成功！`, 'success');
+                        showToast(`「${incomingFileInfo.name}」傳輸完成，若未下載請點點擊手動下載按鈕！`, 'success');
+                    
+                    // C. 🌟 R2 雲端託管下載模式 (大於512MB且非雙電腦模式下自動觸發)
+                    // 💥【極致優化】：改用 Stream 讀取機制，監聽下載完畢後「立即」刪除雲端暫存，完全避免過期殘留！
+                    } else if (message.type === 'file-r2') {
+                        incomingFileInfo = {
+                            name: message.name,
+                            size: message.size
+                        };
+
+                        document.getElementById('incoming-file-box').classList.remove('hidden');
+                        document.getElementById('incoming-status-title').innerHTML = `
+                            <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
+                            正在進行 R2 串流下載...
+                        `;
+                        document.getElementById('recv-file-name').innerText = `[R2 高速模式] ${incomingFileInfo.name}`;
+                        document.getElementById('recv-percent').innerText = '0%';
+                        document.getElementById('recv-progress-bar').style.width = '0%';
+                        document.getElementById('recv-progress-bar').className = "bg-blue-500 h-1";
+
+                        // 開始執行「真·下載完畢立即物理銷毀」串流任務
+                        downloadAndCleanR2(message.downloadUrl, incomingFileInfo.name, incomingFileInfo.size);
                     }
                 } catch (e) {
                     console.error(e);
                 }
             } else {
+                // 標準 WebRTC 切片寫入
                 receiveBuffer.push(data);
                 receivedSize += data.byteLength;
 
                 if (incomingFileInfo) {
-                    // 接收端 UI 同步引入 100 毫秒節流閥，防止接收超大檔案時瀏覽器重繪凍結
                     const now = Date.now();
                     if (now - lastRecvUiTime > 100 || receivedSize >= incomingFileInfo.size) {
                         lastRecvUiTime = now;
@@ -565,13 +665,124 @@
             }
         }
 
-        // --- 發送端：黃金級高效非同步流控傳輸 (完美支援 5GB+ 超大檔案而不卡頓) ---
+        // --- 🌟 R2 模式專用：串流下載監聽與秒級主動銷毀 R2 檔案實作 ---
+        async function downloadAndCleanR2(downloadUrl, filename, totalSize) {
+            try {
+                const response = await fetch(downloadUrl);
+                if (!response.ok) throw new Error("讀取雲端大檔案出錯");
+
+                const reader = response.body.getReader();
+                const chunks = [];
+                let loaded = 0;
+                let lastUiTime = 0;
+
+                // 循環讀取串流分塊
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    chunks.push(value);
+                    loaded += value.length;
+
+                    // 下載進度條高頻節流 (100ms)
+                    const now = Date.now();
+                    if (now - lastUiTime > 100 || loaded === totalSize) {
+                        lastUiTime = now;
+                        const percent = Math.min(100, Math.round((loaded / totalSize) * 100));
+                        document.getElementById('recv-percent').innerText = `${percent}%`;
+                        document.getElementById('recv-progress-bar').style.width = `${percent}%`;
+                    }
+                }
+
+                // 合併數據並彈出下載
+                const blob = new Blob(chunks, { type: "application/octet-stream" });
+                const localUrl = URL.createObjectURL(blob);
+                triggerAutoDownload(localUrl, filename);
+
+                // 更新介面
+                document.getElementById('recv-percent').innerText = '100% (下載完成，雲端檔案已同步銷毀)';
+                document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
+
+                // 設定備用下載按鈕
+                const btnManual = document.getElementById('btn-manual-download');
+                btnManual.onclick = () => {
+                    triggerAutoDownload(localUrl, filename);
+                };
+                document.getElementById('manual-download-container').classList.remove('hidden');
+
+                showToast(`「${filename}」下載成功！`, 'success');
+
+                // 💥【下載完成立即銷毀】：毫秒級清除雲端暫存檔，確保不留任何垃圾在 R2 儲存桶中！
+                await destroyR2File(downloadUrl);
+
+            } catch (err) {
+                console.error("R2 下載或銷毀大檔案時發生錯誤:", err);
+                showToast("下載失敗或該大檔案已被銷毀", "error");
+            }
+        }
+
+        // 觸發物理下載
+        function triggerAutoDownload(url, filename) {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.target = '_blank';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        // --- 🌟 核心智慧分流引擎 (判斷 P2P 與 R2 路由) ---
+        function evaluateFileRouting(file) {
+            const atLeastOneMobile = localIsMobile || remoteIsMobile;
+            const size512MB = 512 * 1024 * 1024;
+            const size9GB = 9 * 1024 * 1024 * 1024;
+            const btnSend = document.getElementById('btn-send');
+
+            btnSend.disabled = false;
+            btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+
+            if (atLeastOneMobile) {
+                // 規則 1：至少有一方是行動裝置
+                if (file.size > size9GB) {
+                    useR2 = false;
+                    document.getElementById('progress-status').innerText = '大於 9GB 限額，無法發送';
+                    document.getElementById('progress-bar').style.width = '0%';
+                    btnSend.disabled = true;
+                    btnSend.classList.add('opacity-40', 'cursor-not-allowed');
+                    showToast('檔案大於 9GB 限額！偵測到傳輸參與者有行動裝置，已自動封鎖傳輸以防崩潰。', 'error');
+                } else if (file.size > size512MB) {
+                    useR2 = true;
+                    document.getElementById('progress-status').innerText = '檔案超過512MB，已切換至 R2 發送模式';
+                    document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-indigo-500 h-1 w-0 transition-all duration-75";
+                    showToast('檔案超過512MB且有行動端參與，已啟用 R2 零內存下載防護！', 'success');
+                } else {
+                    useR2 = false;
+                    document.getElementById('progress-status').innerText = '隨時可以發送 (P2P 模式)';
+                    document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
+                }
+            } else {
+                // 規則 2：雙方都是電腦，不管多大都用 P2P
+                useR2 = false;
+                document.getElementById('progress-status').innerText = '雙端皆為電腦，啟用無限 P2P 高速傳輸';
+                document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
+            }
+        }
+
+        // --- 發送端：智慧決策檔案發送 (主動分流 P2P 與 R2 模式) ---
         async function sendFileChunks() {
             if (!selectedFile || !dataChannel || dataChannel.readyState !== 'open') {
                 showToast('通道尚未連線或未選擇檔案', 'error');
                 return;
             }
 
+            // A. R2 模式分塊上傳
+            if (useR2) {
+                sendViaR2Multipart();
+                return;
+            }
+
+            // B. P2P 模式常規傳輸
             const btnSend = document.getElementById('btn-send');
             if (btnSend) {
                 btnSend.disabled = true;
@@ -586,42 +797,32 @@
             };
             dataChannel.send(JSON.stringify(meta));
 
-            const chunkSize = 65536; // 調整為 64KB
+            const chunkSize = 65536; // 升級版 64KB 傳輸切片
             let offset = 0;
             const startTime = Date.now();
             let lastUiUpdateTime = 0;
 
             document.getElementById('progress-status').innerText = '發送中...';
-
-            // 強制設定 RTC DataChannel 的低水位閾值，確保當快取清空到 128KB 以下時會觸發 low 事件
-            dataChannel.bufferedAmountLowThreshold = 131072;
+            dataChannel.bufferedAmountLowThreshold = 131072; // 128KB 低水位閥值
 
             try {
-                // 使用現代高效率 async / await 迴圈，從根本上解決遞迴回呼與 FileReader 佇列凍結問題
                 while (offset < selectedFile.size) {
-                    
-                    // 【1. 流量控制：緩衝安全阻斷】
-                    // 如果當前發送佇列已超過 256KB，則非同步暫停，直至緩衝下降到 128KB 觸發事件解鎖
+                    // 流量控制：緩衝安全阻斷
                     if (dataChannel.bufferedAmount > 262144) {
                         await new Promise(resolve => {
                             dataChannel.onbufferedamountlow = () => {
-                                dataChannel.onbufferedamountlow = null; // 即刻清理防重複觸發
+                                dataChannel.onbufferedamountlow = null;
                                 resolve();
                             };
                         });
                     }
 
-                    // 【2. 現代高效非同步分片讀取】
-                    // 使用原生 Promise-based arrayBuffer API，不霸佔 JS 主要線程，垃圾回收（GC）能即時清除舊內存
                     const slice = selectedFile.slice(offset, offset + chunkSize);
                     const buffer = await slice.arrayBuffer();
 
-                    // 【3. 二進位傳輸與位移增量】
                     dataChannel.send(buffer);
                     offset += buffer.byteLength;
 
-                    // 【4. UI 更新節流機制 (Throttling)】
-                    // 限制每 100 毫秒（0.1 秒）最多只更新一次進度與速度 DOM，徹底消除大檔案時 30 萬次 Layout 造成的瀏覽器凍結
                     const now = Date.now();
                     if (now - lastUiUpdateTime > 100 || offset >= selectedFile.size) {
                         lastUiUpdateTime = now;
@@ -645,7 +846,6 @@
                     }
                 }
 
-                // 發送完畢宣告
                 dataChannel.send(JSON.stringify({ type: 'file-end' }));
                 document.getElementById('progress-status').innerText = '傳送完畢';
                 showToast('檔案已完全投遞給接收端！', 'success');
@@ -653,6 +853,127 @@
             } catch (e) {
                 console.error("傳輸發生嚴重錯誤:", e);
                 showToast('傳輸中斷，請重試。', 'error');
+            } finally {
+                if (btnSend) {
+                    btnSend.disabled = false;
+                    btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+                }
+            }
+        }
+
+        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（防止 100MB 阻斷與 OOM 崩潰） ---
+        async function sendViaR2Multipart() {
+            const btnSend = document.getElementById('btn-send');
+            if (btnSend) {
+                btnSend.disabled = true;
+                btnSend.classList.add('opacity-40', 'cursor-not-allowed');
+            }
+
+            document.getElementById('progress-status').innerText = '正在初始化雲端大檔案分塊上傳...';
+            
+            const workerUrl = getWorkerUrl();
+            const filenameEncoded = encodeURIComponent(selectedFile.name);
+
+            try {
+                // 1. 初始化分塊上傳任務，向 Worker 申請上傳特徵 ID (uploadId)
+                const initRes = await fetch(`${workerUrl}/r2-multipart/init/${roomId}/${filenameEncoded}`, { method: 'POST' });
+                if (!initRes.ok) throw new Error("無法初始化分塊上傳");
+                const { uploadId } = await initRes.json();
+
+                const totalSize = selectedFile.size;
+                const partSize = 10 * 1024 * 1024; // 穩健的 10MB 切片，100% 避開 100MB 限額
+                const totalParts = Math.ceil(totalSize / partSize);
+                const uploadedParts = [];
+                const startTime = Date.now();
+                let lastUiUpdateTime = 0;
+
+                document.getElementById('progress-status').innerText = '正在將分塊流式寫入 R2 儲存區...';
+
+                // 2. 循環上傳每一個 10MB 的分片
+                for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
+                    const offset = (partNumber - 1) * partSize;
+                    const chunk = selectedFile.slice(offset, Math.min(offset + partSize, totalSize));
+                    const chunkData = await chunk.arrayBuffer();
+
+                    // 使用 XHR 以實現精密的分塊內部上傳進度計算
+                    const uploadedPart = await new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('PUT', `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${partNumber}`, true);
+
+                        xhr.upload.addEventListener('progress', (e) => {
+                            if (e.lengthComputable) {
+                                const currentLoaded = offset + e.loaded;
+                                const now = Date.now();
+                                if (now - lastUiUpdateTime > 100 || currentLoaded === totalSize) {
+                                    lastUiUpdateTime = now;
+
+                                    const percent = Math.min(100, Math.round((currentLoaded / totalSize) * 100));
+                                    document.getElementById('progress-percent').innerText = `${percent}%`;
+                                    document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                                    const elapsedTime = (now - startTime) / 1000;
+                                    const speedBytes = currentLoaded / elapsedTime;
+                                    const speedMB = (speedBytes / (1024 * 1024)).toFixed(2);
+                                    document.getElementById('transfer-speed').innerText = `${speedMB} MB/s`;
+
+                                    if (speedBytes > 0) {
+                                        const remainingBytes = totalSize - currentLoaded;
+                                        const remainingSeconds = Math.max(0, Math.round(remainingBytes / speedBytes));
+                                        const mins = Math.floor(remainingSeconds / 60);
+                                        const secs = remainingSeconds % 60;
+                                        document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+                                    }
+                                }
+                            }
+                        });
+
+                        xhr.onload = () => {
+                            if (xhr.status === 200) {
+                                resolve(JSON.parse(xhr.responseText));
+                            } else {
+                                reject(new Error(`分塊 ${partNumber} 上傳失敗`));
+                            }
+                        };
+                        xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
+                        xhr.send(chunkData);
+                    });
+
+                    // 將成功的 Etag 與編號記錄下來，最後要提交合併
+                    uploadedParts.push({
+                        partNumber: uploadedPart.partNumber,
+                        etag: uploadedPart.etag
+                    });
+                }
+
+                // 3. 完成所有分塊，通知 Worker 將這幾十個分片合併成完整檔案
+                document.getElementById('progress-status').innerText = '正在拼裝合併大檔案中...';
+                const completeRes = await fetch(`${workerUrl}/r2-multipart/complete/${roomId}/${filenameEncoded}?uploadId=${uploadId}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(uploadedParts)
+                });
+
+                if (!completeRes.ok) throw new Error("雲端檔案合併失敗");
+
+                document.getElementById('progress-status').innerText = '託管成功，同步信令中...';
+
+                // 4. 同步給下載端下載連結
+                const downloadUrl = `${workerUrl}/r2/${roomId}/${filenameEncoded}`;
+                const r2Message = {
+                    type: 'file-r2',
+                    name: selectedFile.name,
+                    size: selectedFile.size,
+                    downloadUrl: downloadUrl
+                };
+                dataChannel.send(JSON.stringify(r2Message));
+
+                document.getElementById('progress-status').innerText = '傳送成功！對方已啟動高速 R2 串流下載';
+                showToast('大檔案託管完成，已同步對方啟動 R2 安全下載路徑！', 'success');
+
+            } catch (err) {
+                console.error("R2 分塊上傳失敗:", err);
+                document.getElementById('progress-status').innerText = '大檔案分塊上傳失敗';
+                showToast(`上傳失敗: ${err.message}`, 'error');
             } finally {
                 if (btnSend) {
                     btnSend.disabled = false;
@@ -706,11 +1027,12 @@
             document.getElementById('info-file-name').innerText = file.name;
             document.getElementById('info-file-size').innerText = sizeStr;
             
-            document.getElementById('progress-status').innerText = '隨時可以發送';
             document.getElementById('progress-percent').innerText = '0%';
             document.getElementById('progress-bar').style.width = '0%';
             document.getElementById('transfer-speed').innerText = `0.00 MB/s`;
             document.getElementById('transfer-time').innerText = `--:--`;
+
+            evaluateFileRouting(file);
         }
 
         // --- 狀態燈與文字更新 ---
