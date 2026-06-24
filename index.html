@@ -508,7 +508,7 @@
                 
                 const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
                 const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                    inversionAttempts: "dontInvert",
+                    versionAttempts: "dontInvert",
                 });
                 
                 if (code) {
@@ -877,7 +877,13 @@
             try {
                 // 1. 初始化分塊上傳任務，向 Worker 申請上傳特徵 ID (uploadId)
                 const initRes = await fetch(`${workerUrl}/r2-multipart/init/${roomId}/${filenameEncoded}`, { method: 'POST' });
-                if (!initRes.ok) throw new Error("無法初始化分塊上傳");
+                if (!initRes.ok) {
+                    const errData = await initRes.json().catch(() => ({}));
+                    if (errData.error === "R2_LIMIT_EXCEEDED" || errData.message) {
+                        throw new Error(errData.message);
+                    }
+                    throw new Error("無法初始化分塊上傳");
+                }
                 const { uploadId } = await initRes.json();
 
                 const totalSize = selectedFile.size;
@@ -931,7 +937,8 @@
                             if (xhr.status === 200) {
                                 resolve(JSON.parse(xhr.responseText));
                             } else {
-                                reject(new Error(`分塊 ${partNumber} 上傳失敗`));
+                                const errData = JSON.parse(xhr.responseText || "{}");
+                                reject(new Error(errData.message || `分塊 ${partNumber} 上傳失敗`));
                             }
                         };
                         xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
@@ -972,7 +979,7 @@
 
             } catch (err) {
                 console.error("R2 分塊上傳失敗:", err);
-                document.getElementById('progress-status').innerText = '大檔案分塊上傳失敗';
+                document.getElementById('progress-status').innerText = err.message || '大檔案分塊上傳失敗';
                 showToast(`上傳失敗: ${err.message}`, 'error');
             } finally {
                 if (btnSend) {
