@@ -179,7 +179,7 @@
         <!-- 自訂通知訊息元件 (Toast) -->
         <div id="alert-toast" class="hidden p-3.5 rounded-xl border bg-slate-950 shadow-2xl flex items-center justify-between text-xs transition-all duration-300">
             <span id="toast-msg">提示訊息</span>
-            <button onclick="hideToast()" class="text-slate-500 hover:text-white ml-4 text-[10px] font-bold tracking-wider">關閉</button>
+            <button onclick="hideToast()" class="text-slate-400 hover:text-white ml-4 text-[10px] font-bold tracking-wider">關閉</button>
         </div>
 
     </main>
@@ -537,7 +537,7 @@
         function setupDataChannelListeners() {
             dataChannel.onopen = () => {
                 updateStatus('P2P 直連已開通 (加密)', 'green');
-                showToast('通道對打洞成功！安全極速 P2P 連結就緒。', 'success');
+                showToast('極速 P2P 連結就緒', 'success');
                 
                 // 1. 對接成功後，雙方立刻在背景交換「本端設備是否為行動裝置」的特徵碼
                 dataChannel.send(JSON.stringify({
@@ -624,8 +624,7 @@
                         document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
                         showToast(`「${incomingFileInfo.name}」傳輸完成，若未下載請點點擊手動下載按鈕！`, 'success');
                     
-                    // C. 🌟 R2 雲端託管下載模式 (大於512MB且非雙電腦模式下自動觸發)
-                    // 💥【極致優化】：改用 Stream 讀取機制，監聽下載完畢後「立即」刪除雲端暫存，完全避免過期殘留！
+                    // C. 🌟 R2 雲端託管下載模式
                     } else if (message.type === 'file-r2') {
                         incomingFileInfo = {
                             name: message.name,
@@ -642,7 +641,7 @@
                         document.getElementById('recv-progress-bar').style.width = '0%';
                         document.getElementById('recv-progress-bar').className = "bg-blue-500 h-1";
 
-                        // 開始執行「真·下載完畢立即物理銷毀」串流任務
+                        // 開始執行「真·下載完畢立即物理銷毀」串流下載任務
                         downloadAndCleanR2(message.downloadUrl, incomingFileInfo.name, incomingFileInfo.size);
                     }
                 } catch (e) {
@@ -753,9 +752,9 @@
                     showToast('檔案大於 9GB 限額！偵測到傳輸參與者有行動裝置，已自動封鎖傳輸以防崩潰。', 'error');
                 } else if (file.size > size512MB) {
                     useR2 = true;
-                    document.getElementById('progress-status').innerText = '檔案超過512MB，已切換至 R2 發送模式';
+                    document.getElementById('progress-status').innerText = '檔案超過 512MB，已自動套用 R2 模式';
                     document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-indigo-500 h-1 w-0 transition-all duration-75";
-                    showToast('檔案超過512MB且有行動端參與，已啟用 R2 零內存下載防護！', 'success');
+                    showToast('檔案超過 512MB 且有行動端參與，已啟用 R2 零內存下載防護！', 'success');
                 } else {
                     useR2 = false;
                     document.getElementById('progress-status').innerText = '隨時可以發送 (P2P 模式)';
@@ -797,7 +796,7 @@
             };
             dataChannel.send(JSON.stringify(meta));
 
-            const chunkSize = 65536; // 升級版 64KB 傳輸切片
+            const chunkSize = 65536; // 64KB 傳輸切片
             let offset = 0;
             const startTime = Date.now();
             let lastUiUpdateTime = 0;
@@ -861,7 +860,7 @@
             }
         }
 
-        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（防止 100MB 阻斷與 OOM 崩潰） ---
+        // --- 🌟 R2 模式專用：分塊大檔案流式上傳（含 100% 荷包防刷、併行鎖與限額解析） ---
         async function sendViaR2Multipart() {
             const btnSend = document.getElementById('btn-send');
             if (btnSend) {
@@ -869,7 +868,7 @@
                 btnSend.classList.add('opacity-40', 'cursor-not-allowed');
             }
 
-            document.getElementById('progress-status').innerText = '正在初始化雲端大檔案分塊上傳...';
+            document.getElementById('progress-status').innerText = '正在向雲端要求建立 R2 通道...';
             
             const workerUrl = getWorkerUrl();
             const filenameEncoded = encodeURIComponent(selectedFile.name);
@@ -879,7 +878,8 @@
                 const initRes = await fetch(`${workerUrl}/r2-multipart/init/${roomId}/${filenameEncoded}`, { method: 'POST' });
                 if (!initRes.ok) {
                     const errData = await initRes.json().catch(() => ({}));
-                    if (errData.error === "R2_LIMIT_EXCEEDED" || errData.message) {
+                    // 🌟 智慧捕捉併行鎖 (CONCURRENCY_LOCKED) 或額度爆滿 (R2_LIMIT_EXCEEDED) 警告
+                    if (errData.error === "CONCURRENCY_LOCKED" || errData.error === "R2_LIMIT_EXCEEDED" || errData.message) {
                         throw new Error(errData.message);
                     }
                     throw new Error("無法初始化分塊上傳");
@@ -887,7 +887,7 @@
                 const { uploadId } = await initRes.json();
 
                 const totalSize = selectedFile.size;
-                const partSize = 10 * 1024 * 1024; // 穩健的 10MB 切片，100% 避開 100MB 限額
+                const partSize = 10 * 1024 * 1024; // 10MB 分塊切片
                 const totalParts = Math.ceil(totalSize / partSize);
                 const uploadedParts = [];
                 const startTime = Date.now();
@@ -945,14 +945,14 @@
                         xhr.send(chunkData);
                     });
 
-                    // 將成功的 Etag 與編號記錄下來，最後要提交合併
+                    // 將成功的 Etag 與編號記錄下來
                     uploadedParts.push({
                         partNumber: uploadedPart.partNumber,
                         etag: uploadedPart.etag
                     });
                 }
 
-                // 3. 完成所有分塊，通知 Worker 將這幾十個分片合併成完整檔案
+                // 3. 完成所有分塊，通知 Worker 將分片合併成完整檔案
                 document.getElementById('progress-status').innerText = '正在拼裝合併大檔案中...';
                 const completeRes = await fetch(`${workerUrl}/r2-multipart/complete/${roomId}/${filenameEncoded}?uploadId=${uploadId}`, {
                     method: 'POST',
@@ -980,7 +980,7 @@
             } catch (err) {
                 console.error("R2 分塊上傳失敗:", err);
                 document.getElementById('progress-status').innerText = err.message || '大檔案分塊上傳失敗';
-                showToast(`上傳失敗: ${err.message}`, 'error');
+                showToast(`傳送暫停: ${err.message}`, 'error');
             } finally {
                 if (btnSend) {
                     btnSend.disabled = false;
