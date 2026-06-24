@@ -279,11 +279,12 @@
         }
 
         // --- 核心優化：連線成功即銷毀雲端 KV 信令房間 ---
+        // 🚀【行動端優化】：加入 keepalive 保證掛起時刪除依然能送達
         async function destroyCloudRoom() {
             if (!roomId) return;
             const workerUrl = getWorkerUrl();
             try {
-                await fetch(`${workerUrl}/room/${roomId}`, { method: 'DELETE' });
+                await fetch(`${workerUrl}/room/${roomId}`, { method: 'DELETE', keepalive: true });
                 console.log(`[安全機制] 房間 ${roomId} 的雲端信令已成功手動銷毀。`);
             } catch (e) {
                 console.error("手動銷毀房間失敗:", e);
@@ -291,9 +292,10 @@
         }
 
         // --- R2優化：下載/上傳完成後銷毀 R2 的託管檔案 ---
+        // 🚀【行動端優化】：加入 keepalive 避免因喚起原生下載而導致發送被掛起取消
         async function destroyR2File(url) {
             try {
-                await fetch(url, { method: 'DELETE' });
+                await fetch(url, { method: 'DELETE', keepalive: true });
                 console.log("[安全機制] R2 暫存大檔案已成功手動清理銷毀。");
             } catch (e) {
                 console.error("手動銷毀 R2 檔案失敗:", e);
@@ -486,6 +488,7 @@
             }
         }
 
+        // 停止掃描
         function stopScanner() {
             const modal = document.getElementById('scanner-modal');
             modal.classList.add('hidden');
@@ -609,8 +612,9 @@
                     // B. 標準 P2P WebRTC 傳輸 結束
                     } else if (message.type === 'file-end') {
                         const blob = new Blob(receiveBuffer);
-                        const url = URL.createObjectURL(blob);
+                        receiveBuffer = []; // 🚀【行動端優化】：下載打包完立即清空，釋放 GC 記憶體防崩潰
                         
+                        const url = URL.createObjectURL(blob);
                         triggerAutoDownload(url, incomingFileInfo.name);
 
                         const btnManual = document.getElementById('btn-manual-download');
@@ -623,6 +627,11 @@
                         document.getElementById('recv-progress-bar').style.width = '100%';
                         document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
                         showToast(`「${incomingFileInfo.name}」傳輸完成，若未下載請點點擊手動下載按鈕！`, 'success');
+                        
+                        // 🚀【行動端優化】：30秒後自動釋放 Blob 快取記憶體
+                        setTimeout(() => {
+                            URL.revokeObjectURL(url);
+                        }, 30000);
                     
                     // C. 🌟 R2 雲端託管下載模式
                     } else if (message.type === 'file-r2') {
@@ -632,17 +641,48 @@
                         };
 
                         document.getElementById('incoming-file-box').classList.remove('hidden');
-                        document.getElementById('incoming-status-title').innerHTML = `
-                            <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
-                            正在進行 R2 串流下載...
-                        `;
-                        document.getElementById('recv-file-name').innerText = `[R2 高速模式] ${incomingFileInfo.name}`;
-                        document.getElementById('recv-percent').innerText = '0%';
-                        document.getElementById('recv-progress-bar').style.width = '0%';
-                        document.getElementById('recv-progress-bar').className = "bg-blue-500 h-1";
 
-                        // 開始執行「真·下載完畢立即物理銷毀」串流下載任務
-                        downloadAndCleanR2(message.downloadUrl, incomingFileInfo.name, incomingFileInfo.size);
+                        // 🚀【行動端終極優化】：行動端完全不走 JS 記憶體串流，100% 防 OOM 閃退，直接喚起原生高速下載！
+                        if (localIsMobile) {
+                            document.getElementById('incoming-status-title').innerHTML = `
+                                <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                                行動端直連下載就緒
+                            `;
+                            document.getElementById('recv-file-name').innerText = `[直連下載] ${incomingFileInfo.name}`;
+                            document.getElementById('recv-percent').innerText = '100% (已喚起瀏覽器原生下載)';
+                            document.getElementById('recv-progress-bar').style.width = '100%';
+                            document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1";
+
+                            // 直接喚起原生大檔案下載 (不經手 JS Memory)
+                            triggerAutoDownload(message.downloadUrl, incomingFileInfo.name);
+
+                            // 行動端直接下載時，設定 8 秒延遲防呆銷毀（利用 keepalive 即使切換 App 也能在背景順利執行）
+                            setTimeout(() => {
+                                destroyR2File(message.downloadUrl);
+                            }, 8000);
+
+                            // 手動按鈕防呆
+                            const btnManual = document.getElementById('btn-manual-download');
+                            btnManual.onclick = () => {
+                                triggerAutoDownload(message.downloadUrl, incomingFileInfo.name);
+                            };
+                            document.getElementById('manual-download-container').classList.remove('hidden');
+                            
+                            showToast(`已成功喚起原生下載，雲端檔案將自動安全銷毀。`, 'success');
+
+                        } else {
+                            // 🖥️ 電腦端記憶體充足，維持流暢高視覺感的「即時下載進度條」模式
+                            document.getElementById('incoming-status-title').innerHTML = `
+                                <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
+                                正在進行 R2 串流下載...
+                            `;
+                            document.getElementById('recv-file-name').innerText = `[R2 高速模式] ${incomingFileInfo.name}`;
+                            document.getElementById('recv-percent').innerText = '0%';
+                            document.getElementById('recv-progress-bar').style.width = '0%';
+                            document.getElementById('recv-progress-bar').className = "bg-blue-500 h-1";
+
+                            downloadAndCleanR2(message.downloadUrl, incomingFileInfo.name, incomingFileInfo.size);
+                        }
                     }
                 } catch (e) {
                     console.error(e);
@@ -698,6 +738,9 @@
                 const localUrl = URL.createObjectURL(blob);
                 triggerAutoDownload(localUrl, filename);
 
+                // 🚀【記憶體優化】：立即清空大陣列，幫助 GC 進行物理垃圾回收
+                chunks.length = 0;
+
                 // 更新介面
                 document.getElementById('recv-percent').innerText = '100% (下載完成，雲端檔案已同步銷毀)';
                 document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
@@ -711,8 +754,13 @@
 
                 showToast(`「${filename}」下載成功！`, 'success');
 
-                // 💥【下載完成立即銷毀】：毫秒級清除雲端暫存檔，確保不留任何垃圾在 R2 儲存桶中！
+                // 💥【下載完成立即銷毀】
                 await destroyR2File(downloadUrl);
+
+                // 🚀【行動端優化】：30秒後自動釋放 Blob 快取記憶體
+                setTimeout(() => {
+                    URL.revokeObjectURL(localUrl);
+                }, 30000);
 
             } catch (err) {
                 console.error("R2 下載或銷毀大檔案時發生錯誤:", err);
@@ -720,15 +768,19 @@
             }
         }
 
-        // 觸發物理下載
+        // 🚀【行動端優化】：改寫物理下載觸發器，移除 target="_blank" 行動端地雷
         function triggerAutoDownload(url, filename) {
             const a = document.createElement('a');
             a.href = url;
             a.download = filename;
-            a.target = '_blank';
+            // 行動裝置一律在 _self 當前頁面發起原生下載，避免開新分頁導致當前 WebRTC 分頁被系統強行掛起
+            a.target = localIsMobile ? '_self' : '_blank'; 
             document.body.appendChild(a);
             a.click();
-            document.body.removeChild(a);
+            // 延遲移除，確保行動端核心已捕獲點擊事件
+            setTimeout(() => {
+                document.body.removeChild(a);
+            }, 150);
         }
 
         // --- 🌟 核心智慧分流引擎 (判斷 P2P 與 R2 路由) ---
@@ -883,7 +935,7 @@
                     }
                     throw new Error("無法初始化分塊上傳");
                 }
-                const { uploadId } = await initRes.json();
+                const { uploadId, directUpload } = await initRes.json();
 
                 const totalSize = selectedFile.size;
                 const partSize = 10 * 1024 * 1024; // 10MB 分塊切片
@@ -892,7 +944,12 @@
                 const startTime = Date.now();
                 let lastUiUpdateTime = 0;
 
-                document.getElementById('progress-status').innerText = '正在進行極速 R2 並行傳輸...';
+                // 若為直連上傳 R2，將併發數調升至 5 以進一步榨乾網路頻寬！代理模式則維持安全上限 3
+                const CONCURRENCY_LIMIT = directUpload ? 5 : 3;
+                
+                document.getElementById('progress-status').innerText = directUpload 
+                    ? `正在與 R2 建立極速直連通道 (${CONCURRENCY_LIMIT} 執行緒並行)...` 
+                    : `正在進行極速 R2 並行傳輸 (代理優化模式)...`;
 
                 // 追蹤各分塊上傳的進度（用於計算精準的整體進度）
                 const partLoadedBytes = {};
@@ -922,8 +979,7 @@
                     }
                 };
 
-                // 2. 🚀【極速併發執行緒池設計】
-                const CONCURRENCY_LIMIT = 3; // 設定 3 路並行上傳，充分榨乾 R2 與本地上傳頻寬
+                // 2. 🚀【並行執行緒池設計】
                 let nextPartToUpload = 1;
                 const uploadErrors = [];
 
@@ -935,9 +991,27 @@
                         const chunkData = await chunk.arrayBuffer();
 
                         try {
+                            let targetUrl = "";
+                            
+                            // A. 🌟【直連 R2 預簽名模式】：向 Worker 索取一次性預簽名上傳連結
+                            if (directUpload) {
+                                const presignRes = await fetch(`${workerUrl}/r2-multipart/presign/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`);
+                                if (!presignRes.ok) throw new Error("直連認證失效");
+                                const presignData = await presignRes.json();
+                                targetUrl = presignData.uploadUrl;
+                            } else {
+                                // B.【代理模式】：上傳至 Worker 代理路徑
+                                targetUrl = `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`;
+                            }
+
                             const uploadedPart = await new Promise((resolve, reject) => {
                                 const xhr = new XMLHttpRequest();
-                                xhr.open('PUT', `${workerUrl}/r2-multipart/upload/${roomId}/${filenameEncoded}?uploadId=${uploadId}&partNumber=${currentPart}`, true);
+                                xhr.open('PUT', targetUrl, true);
+
+                                // 直連模式不傳送任何自訂 Header，以保證預簽名 S3 驗證順利通過
+                                if (!directUpload) {
+                                    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                                }
 
                                 xhr.upload.addEventListener('progress', (e) => {
                                     if (e.lengthComputable) {
@@ -948,10 +1022,14 @@
 
                                 xhr.onload = () => {
                                     if (xhr.status === 200) {
-                                        resolve(JSON.parse(xhr.responseText));
+                                        // R2 直連會直接返回 200 與 ETag 標頭
+                                        const etag = xhr.getResponseHeader('ETag') || "";
+                                        resolve({
+                                            partNumber: currentPart,
+                                            etag: etag.replace(/"/g, "") // 去除引號，符合 S3 規範
+                                        });
                                     } else {
-                                        const errData = JSON.parse(xhr.responseText || "{}");
-                                        reject(new Error(errData.message || `分塊 ${currentPart} 上傳失敗`));
+                                        reject(new Error(`分塊 ${currentPart} 上傳失敗`));
                                     }
                                 };
                                 xhr.onerror = () => reject(new Error("分塊上傳網路錯誤"));
