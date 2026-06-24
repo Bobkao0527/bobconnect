@@ -1084,13 +1084,17 @@
 
                 // 3. 完成所有分塊，通知 Worker 將分片合併成完整檔案
                 document.getElementById('progress-status').innerText = '正在拼裝合併大檔案中...';
+                const sortedParts = uploadedParts.slice().sort((a, b) => a.partNumber - b.partNumber);
                 const completeRes = await fetch(`${workerUrl}/r2-multipart/complete/${roomId}/${filenameEncoded}?uploadId=${uploadId}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(uploadedParts)
+                    body: JSON.stringify(sortedParts)
                 });
 
-                if (!completeRes.ok) throw new Error("雲端檔案合併失敗");
+                if (!completeRes.ok) {
+                    const errorText = await completeRes.text().catch(() => '無法讀取伺服器錯誤');
+                    throw new Error(`雲端檔案合併失敗: ${errorText}`);
+                }
 
                 document.getElementById('progress-status').innerText = '託管成功，同步信令中...';
 
