@@ -586,7 +586,7 @@
             };
             dataChannel.send(JSON.stringify(meta));
 
-            const chunkSize = 16384; // 最穩定的 16KB 標準傳輸切片
+            const chunkSize = 65536; // 調整為 64KB
             let offset = 0;
             const startTime = Date.now();
             let lastUiUpdateTime = 0;
