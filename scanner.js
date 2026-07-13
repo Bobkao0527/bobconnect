@@ -31,8 +31,12 @@ export async function startScanner() {
 
 // 停止相機掃描
 export function stopScanner() {
-    const modal = document.getElementById('scanner-modal');
-    if (modal) modal.classList.add('hidden');
+    const modal = document.getElementById('pairing-modal');
+    if (modal) {
+        // 僅當相機 modal 存在時關閉，不要誤關 pairing-modal
+    }
+    const scanModal = document.getElementById('scanner-modal');
+    if (scanModal) scanModal.classList.add('hidden');
     
     if (state.scanAnimationId) cancelAnimationFrame(state.scanAnimationId);
     if (state.videoStream) {
@@ -135,9 +139,22 @@ async function scanNearbyRooms() {
 
     try {
         const res = await fetch(`${workerUrl}/rooms-by-ip`);
-        if (!res.ok) throw new Error("Worker 尚未實現 /rooms-by-ip");
+        
+        // 🚀【防暴力崩潰安全優化】：先以純文字取出，避免 res.json() 在非 JSON 時直接噴 SyntaxError
+        const responseText = await res.text();
 
-        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(`信令伺服器拒絕請求 (${res.status}): ${responseText || '未知錯誤'}`);
+        }
+
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch (e) {
+            // 如果解析失敗，表示 Worker 回傳了錯誤頁面或 HTML 
+            throw new Error(`伺服器回傳了非 JSON 格式的內容：\n${responseText.slice(0, 150)}...`);
+        }
+
         const rooms = data.rooms || [];
 
         if (rooms.length === 0) {
@@ -165,10 +182,17 @@ async function scanNearbyRooms() {
 
     } catch (err) {
         console.error("LAN 自動偵測失敗:", err);
-        statusText.innerText = "此網路環境不支援自動偵測，請直接輸入 PIN 碼。";
+        // 🚀 這裡會直接渲染出錯誤原因，讓你在網頁畫面上就能一眼看出 Worker 到底回傳了什麼
+        statusText.innerText = err.message.includes("伺服器回傳了非 JSON") 
+            ? "伺服器回傳資料異常（請檢查 Worker 的 /rooms-by-ip 路由）"
+            : "自動偵測目前無法使用，請使用 PIN 碼連線。";
+            
         roomListContainer.innerHTML = `
+            <div class="text-[10px] text-rose-400 bg-rose-950/20 border border-rose-900/30 p-3 rounded-xl mb-3 text-left font-mono break-all whitespace-pre-wrap">
+                ${err.message}
+            </div>
             <button onclick="switchPairingTab('pin')" class="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold rounded-xl transition border border-slate-800">
-                👉 切換至輸入 PIN 配對碼
+                👉 直接輸入 PIN 配對碼
             </button>
         `;
     }
