@@ -2,6 +2,7 @@
  * r2.js - Cloudflare R2 傳輸模組
  * 處理高併發分塊上傳、自動降級、防呆重試及串流大檔案下載銷毀邏輯。
  * 🚀【進度同步優化】：在上傳過程中，透過 WebRTC dataChannel 即時同步進度與取消事件。
+ * 🚀【按鈕優化】：行動端手動下載按鈕自動轉換為「儲存 / 分享檔案」文字。
  */
 import { state } from './state.js';
 import { showToast, triggerAutoDownload } from './ui.js';
@@ -55,6 +56,8 @@ export async function downloadAndCleanR2(downloadUrl, filename, totalSize) {
 
         const btnManual = document.getElementById('btn-manual-download');
         if (btnManual) {
+            // 🚀【體驗優化】：行動端按鈕顯示為「儲存 / 分享檔案」
+            btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
             btnManual.onclick = () => triggerAutoDownload(localUrl, filename);
         }
         document.getElementById('manual-download-container').classList.remove('hidden');

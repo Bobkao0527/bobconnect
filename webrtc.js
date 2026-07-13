@@ -2,6 +2,7 @@
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
  * 🚀【進度同步優化】：接收端支援解析 'file-r2-upload-start', 'file-r2-upload-progress', 'file-r2-upload-cancel'。
+ * 🚀【按鈕優化】：行動端手動下載按鈕自動轉換為「儲存 / 分享檔案」文字。
  */
 import { state } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload } from './ui.js';
@@ -199,7 +200,6 @@ export function handleIncomingData(data) {
                 return;
             }
 
-            // 🚀【進度同步優化 - 開始雲端上傳通知】：對方正在把大檔案推送到 R2
             if (message.type === 'file-r2-upload-start') {
                 state.incomingFileInfo = {
                     name: message.name,
@@ -218,7 +218,6 @@ export function handleIncomingData(data) {
                 return;
             }
 
-            // 🚀【進度同步優化 - 上傳進度即時反饋】：更新發送端到 R2 的進度條
             if (message.type === 'file-r2-upload-progress') {
                 const percent = message.percent;
                 document.getElementById('recv-percent').innerText = `對方已上傳 ${percent}%`;
@@ -226,7 +225,6 @@ export function handleIncomingData(data) {
                 return;
             }
 
-            // 🚀【進度同步優化 - 雲端上傳異常取消】：如果對方上傳發生錯誤，隱藏等待框並警示
             if (message.type === 'file-r2-upload-cancel') {
                 document.getElementById('incoming-file-box').classList.add('hidden');
                 showToast('對方雲端上傳已中斷或取消。', 'error');
@@ -262,6 +260,8 @@ export function handleIncomingData(data) {
 
                 const btnManual = document.getElementById('btn-manual-download');
                 if (btnManual) {
+                    // 🚀【體驗優化】：行動端按鈕顯示為「儲存 / 分享檔案」
+                    btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
                     btnManual.onclick = () => triggerAutoDownload(url, state.incomingFileInfo.name);
                 }
                 document.getElementById('manual-download-container').classList.remove('hidden');
@@ -301,6 +301,7 @@ export function handleIncomingData(data) {
 
                     const btnManual = document.getElementById('btn-manual-download');
                     if (btnManual) {
+                        btnManual.innerText = '📤 儲存 / 分享檔案';
                         btnManual.onclick = () => triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name);
                     }
                     document.getElementById('manual-download-container').classList.remove('hidden');
