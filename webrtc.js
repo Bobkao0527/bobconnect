@@ -1,8 +1,7 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
- * 🚀【進度同步優化】：接收端支援解析 'file-r2-upload-start', 'file-r2-upload-progress', 'file-r2-upload-cancel'。
- * 🚀【按鈕優化】：行動端手動下載按鈕自動轉換為「儲存 / 分享檔案」文字。
+ * 🚀【體驗優化】：Room ID 自動轉化為 6 位數純數字 PIN 配對碼，方便電腦端手動輸入。
  */
 import { state } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload } from './ui.js';
@@ -27,11 +26,21 @@ export async function destroyCloudRoom() {
 // 發起者流程 (Host)
 export async function initHost() {
     state.isHost = true;
-    state.roomId = Math.random().toString(36).substring(2, 10);
+    
+    // 🚀【配對優化】：Room ID 升級為 6 位數純數字 PIN 碼！
+    const numPin = Math.floor(100000 + Math.random() * 900000).toString();
+    state.roomId = numPin;
 
     document.getElementById('setup-view').classList.add('hidden');
     document.getElementById('signaling-box').classList.remove('hidden');
     document.getElementById('host-panel').classList.remove('hidden');
+
+    // 顯示大大的 6 位數 PIN 碼在畫面上（加一個空格提昇易讀性）
+    const formattedPin = `${numPin.slice(0, 3)} ${numPin.slice(3)}`;
+    const pinDisplay = document.getElementById('host-pin-display');
+    if (pinDisplay) {
+        pinDisplay.innerText = formattedPin;
+    }
 
     const githubPagesOrigin = "https://bobkao0527.github.io/bobconnect/";
     const joinUrl = `${githubPagesOrigin}?room=${state.roomId}`;
@@ -260,7 +269,6 @@ export function handleIncomingData(data) {
 
                 const btnManual = document.getElementById('btn-manual-download');
                 if (btnManual) {
-                    // 🚀【體驗優化】：行動端按鈕顯示為「儲存 / 分享檔案」
                     btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
                     btnManual.onclick = () => triggerAutoDownload(url, state.incomingFileInfo.name);
                 }

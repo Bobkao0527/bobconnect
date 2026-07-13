@@ -5,15 +5,15 @@
  */
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
-// 🚀【修正】：evaluateFileRouting 原本在 webrtc.js 導出，已將其移至此處正確匯入
 import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting } from './webrtc.js';
-import { startScanner, stopScanner } from './scanner.js';
+import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs } from './scanner.js';
 
 // 🚀【全域暴露機制】
-// 由於 HTML 中含有許多 onclick="..." 行為，在此將模組內部函式安全暴露到 window 上，避免重構 HTML
 window.initHost = initHost;
 window.startJoinerScanner = startScanner;
 window.stopScanner = stopScanner;
+window.openPairingModal = openPairingModal;
+window.closePairingModal = closePairingModal;
 window.sendFileChunks = sendFileChunks;
 window.hideToast = hideToast;
 
@@ -32,6 +32,9 @@ window.addEventListener('DOMContentLoaded', () => {
 
     // 拖曳區事件註冊
     setupDragAndDrop();
+
+    // 🚀 初始化 PIN 碼多欄位輸入傾聽器
+    setupPinInputs();
 });
 
 function setupDragAndDrop() {

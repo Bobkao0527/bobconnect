@@ -22,6 +22,7 @@
             }
         }
     </script>
+    <link rel="icon" href="data:,">
     <!-- 引入外置樣式檔 -->
     <link rel="stylesheet" href="style.css">
 </head>
@@ -81,12 +82,17 @@
 
             <!-- 信令交換流程 UI -->
             <div id="signaling-box" class="hidden w-full transition-all duration-300">
-                <!-- 發起者展示極簡 QR Code -->
+                <!-- 發起者展示極簡 QR Code 與大大的 6 位數 PIN -->
                 <div id="host-panel" class="hidden flex flex-col items-center space-y-4">
-                    <div class="bg-slate-950 p-4 rounded-2xl border border-slate-900 flex flex-col items-center shadow-2xl">
+                    <div class="bg-slate-950 p-4 rounded-2xl border border-slate-900 flex flex-col items-center shadow-2xl space-y-3">
                         <canvas id="qr-canvas" class="bg-white p-2.5 rounded-xl"></canvas>
+                        <!-- PIN 碼顯示區 -->
+                        <div class="text-center pt-2">
+                            <p class="text-[9px] text-slate-500 tracking-widest uppercase">或手動輸入 PIN 配對碼</p>
+                            <h2 id="host-pin-display" class="text-2xl font-black font-mono tracking-widest text-blue-400 mt-1">--- ---</h2>
+                        </div>
                     </div>
-                    <p class="text-xs text-blue-400/80 animate-pulse tracking-wider">等待接收端掃描連線...</p>
+                    <p class="text-xs text-blue-400/80 animate-pulse tracking-wider">等待接收端連線中...</p>
                 </div>
 
                 <!-- 接收者自動接通處理面板 -->
@@ -94,6 +100,13 @@
                     <div class="w-10 h-10 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin"></div>
                     <p class="text-xs text-emerald-400/80 animate-pulse tracking-wider">正在進行一鍵握手對接...</p>
                 </div>
+            </div>
+
+            <!-- 輔助入口：手動配對 (方便無鏡頭電腦) -->
+            <div class="w-full text-center">
+                <button onclick="openPairingModal()" class="text-[10px] text-slate-500 hover:text-slate-300 underline underline-offset-4 tracking-wider transition-all">
+                    無相機？使用手動輸入或附近裝置配對
+                </button>
             </div>
 
             <!-- 連線狀態指示器 -->
@@ -195,7 +208,72 @@
                 </div>
             </div>
 
-            <button onclick="stopScanner()" class="mt-4 w-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 font-bold py-2 rounded-xl text-xs transition">取消</button>
+            <!-- 無鏡頭或權限出問題時的第二備用按鈕 -->
+            <button onclick="openPairingModal()" class="mt-3 w-full bg-emerald-950/40 hover:bg-emerald-900/40 border border-emerald-500/20 text-emerald-400 font-bold py-2 rounded-xl text-xs transition">
+                Keyboard 無相機手動輸入
+            </button>
+            <button onclick="stopScanner()" class="mt-2 w-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 font-bold py-2 rounded-xl text-xs transition">取消</button>
+        </div>
+    </div>
+
+    <!-- 🚀 新增：手動配對/同公網偵測高階彈窗 (Modal) -->
+    <div id="pairing-modal" class="hidden fixed inset-0 bg-black/95 backdrop-blur-md z-[100] flex items-center justify-center p-4">
+        <div class="bg-slate-950 border border-slate-900 rounded-2xl p-6 max-w-sm w-full relative space-y-5">
+            <!-- 彈窗頂部 -->
+            <div class="flex justify-between items-center pb-2 border-b border-slate-900">
+                <h3 class="text-sm font-black text-white flex items-center gap-1.5">
+                    ⚙️ 手動與附近配對
+                </h3>
+                <button onclick="closePairingModal()" class="text-xs text-slate-500 hover:text-slate-300">✕ 關閉</button>
+            </div>
+
+            <!-- 頁籤選擇區 (Tab Buttons) -->
+            <div class="flex border-b border-slate-900">
+                <button id="tab-lan-btn" onclick="switchPairingTab('lan')" class="flex-1 py-2 text-center text-xs font-bold border-b-2 border-emerald-500 text-emerald-400">
+                    附近裝置 (WiFi)
+                </button>
+                <button id="tab-pin-btn" onclick="switchPairingTab('pin')" class="flex-1 py-2 text-center text-xs font-bold border-b border-slate-900 text-slate-500 hover:text-slate-300">
+                    輸入 PIN 配對碼
+                </button>
+            </div>
+
+            <!-- 頁籤內容一：同 IP 局域網自動偵測 (Option A) -->
+            <div id="view-pairing-lan" class="space-y-4">
+                <div class="text-center py-2 space-y-2">
+                    <p id="lan-scan-status" class="text-xs text-slate-400 font-medium">正在搜尋同 WiFi 下的發起端...</p>
+                    
+                    <!-- 多裝置衝突驗證：2位數驗證碼輸入 -->
+                    <div id="lan-verification-box" class="hidden space-y-3 pt-2">
+                        <p class="text-[10px] text-yellow-500 font-sans">⚠️ 偵測到附近有多個傳輸，請輸入對方畫面 PIN 碼的最後 2 碼：</p>
+                        <div class="flex justify-center gap-3">
+                            <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="lan-verify-input w-12 h-14 bg-slate-900 border border-slate-800 text-center text-2xl font-black font-mono text-emerald-400 rounded-xl focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500">
+                            <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="lan-verify-input w-12 h-14 bg-slate-900 border border-slate-800 text-center text-2xl font-black font-mono text-emerald-400 rounded-xl focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500">
+                        </div>
+                    </div>
+
+                    <!-- 信令端列表 -->
+                    <div id="lan-room-list" class="pt-2"></div>
+                </div>
+                
+                <button onclick="scanNearbyRooms()" class="w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded-xl text-[10px] tracking-widest font-mono transition">
+                    🔄 重新掃描
+                </button>
+            </div>
+
+            <!-- 頁籤內容二：輸入 PIN 碼 (Option B) -->
+            <div id="view-pairing-pin" class="hidden space-y-4">
+                <p class="text-xs text-slate-400 text-center">請輸入對方畫面上顯示的 6 位數 PIN 配對碼</p>
+                
+                <!-- 六宮格極簡輸入框 -->
+                <div class="flex justify-between gap-1.5 pt-2">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                    <input type="text" maxlength="1" pattern="[0-9]*" inputmode="numeric" class="pin-input w-10 h-12 bg-slate-900 border border-slate-800 text-center text-xl font-bold font-mono text-blue-400 rounded-xl focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500">
+                </div>
+            </div>
         </div>
     </div>
 
