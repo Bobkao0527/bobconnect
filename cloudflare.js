@@ -1,5 +1,6 @@
 // 這是專為 WebRTC 握手與 R2 多分塊（Multipart）大檔案傳輸設計的信令/中轉伺服器
 // 支援 R2 直連 S3 預簽名金鑰 (Presigned URLs) 與高併發直連機制，並防呆降級至 ArrayBuffer 優化代理模式
+// 🚀【更新】：新增 /rooms-by-ip 自動偵測路由，並實作 IP 索引與智慧過濾
 
 export default {
   async fetch(request, env) {
@@ -271,15 +272,34 @@ export default {
       try {
         const body = await request.json();
         const now = Date.now();
+        // 🚀【自動偵測】：抓取發起端/連線端的公網 IP
+        const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
 
         if (kv) {
           const existingRaw = await kv.get(`room:${roomId}`);
           const currentData = existingRaw ? JSON.parse(existingRaw) : {};
-          const updatedData = { ...currentData, ...body, timestamp: now };
+          
+          // 如果是 Host 發起端 (帶有 offer)，寫入當前的 IP；連線端更新時不改寫 IP
+          const roomIp = currentData.ip || clientIp;
+
+          const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
           await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 600 });
+
+          // 🚀【局域網優化】：如果是發起端，同步將此房號追加註冊到該 IP 的待選索引列表中
+          if (body.offer) {
+            const ipKey = `room:ip:${roomIp}`;
+            const existingIpRaw = await kv.get(ipKey);
+            let roomList = existingIpRaw ? JSON.parse(existingIpRaw) : [];
+            if (!roomList.includes(roomId)) {
+              roomList.push(roomId);
+            }
+            await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 600 });
+          }
         } else {
           const currentData = globalThis.rooms.get(roomId) || {};
-          globalThis.rooms.set(roomId, { ...currentData, ...body, timestamp: now });
+          const roomIp = currentData.ip || clientIp;
+          const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
+          globalThis.rooms.set(roomId, updatedData);
         }
         return Response.json({ success: true }, { headers: corsHeaders });
       } catch (e) {
@@ -304,11 +324,79 @@ export default {
     if (request.method === "DELETE" && path.startsWith("/room/")) {
       const roomId = path.split("/")[2];
       if (kv) {
+        // 🚀【清理機制】：在銷毀房間時，同步將其從對應 IP 的索引中移除
+        const roomRaw = await kv.get(`room:${roomId}`);
+        if (roomRaw) {
+          const roomData = JSON.parse(roomRaw);
+          const ip = roomData.ip;
+          if (ip) {
+            const ipKey = `room:ip:${ip}`;
+            const rawList = await kv.get(ipKey);
+            if (rawList) {
+              let roomList = JSON.parse(rawList);
+              roomList = roomList.filter(id => id !== roomId);
+              if (roomList.length > 0) {
+                await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 600 });
+              } else {
+                await kv.delete(ipKey);
+              }
+            }
+          }
+        }
         await kv.delete(`room:${roomId}`);
       } else {
         globalThis.rooms.delete(roomId);
       }
       return Response.json({ success: true }, { headers: corsHeaders });
+    }
+
+    // --- 🚀 新增：WebRTC 4: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
+    if (request.method === "GET" && path === "/rooms-by-ip") {
+      const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+      const validRooms = [];
+      const now = Date.now();
+
+      if (kv) {
+        const ipKey = `room:ip:${clientIp}`;
+        const rawList = await kv.get(ipKey);
+        const candidateIds = rawList ? JSON.parse(rawList) : [];
+        
+        // 批次驗證索引中的房號是否依舊存活，且「未被接通 (沒有 answer)」
+        for (const rId of candidateIds) {
+          const roomRaw = await kv.get(`room:${rId}`);
+          if (roomRaw) {
+            const roomData = JSON.parse(roomRaw);
+            // 只保留：有發起 (offer)、尚未連線 (沒有 answer)、且未過期
+            if (roomData.offer && !roomData.answer && (now - roomData.timestamp < 600 * 1000)) {
+              validRooms.push(rId);
+            }
+          }
+        }
+
+        // 回寫更新後的精簡 IP 索引列表
+        if (validRooms.length !== candidateIds.length) {
+          if (validRooms.length > 0) {
+            await kv.put(ipKey, JSON.stringify(validRooms), { expirationTtl: 600 });
+          } else {
+            await kv.delete(ipKey);
+          }
+        }
+      } else {
+        // 記憶體備用模式下的智慧篩選
+        for (const [rId, roomData] of globalThis.rooms.entries()) {
+          // 清理記憶體中過期的房間
+          if (now - roomData.timestamp > 600 * 1000) {
+            globalThis.rooms.delete(rId);
+            continue;
+          }
+          // 比對 IP 且房號尚處在「等待中 (未被 answer)」
+          if (roomData.ip === clientIp && roomData.offer && !roomData.answer) {
+            validRooms.push(rId);
+          }
+        }
+      }
+
+      return Response.json({ rooms: validRooms }, { headers: corsHeaders });
     }
 
     return new Response(
@@ -367,7 +455,6 @@ async function generatePresignedUrl({
   
   const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
   
-  // 參數排序，S3 要求排序必須完全一致
   const queryParams = {
     "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
     "X-Amz-Credential": `${accessKeyId}/${credentialScope}`,
@@ -406,7 +493,6 @@ async function generatePresignedUrl({
     canonicalRequestHash
   ].join("\n");
   
-  // 簽名推導
   const kDate = await hmac("AWS4" + secretAccessKey, dateStamp);
   const kRegion = await hmac(kDate, region);
   const kService = await hmac(kRegion, "s3");
