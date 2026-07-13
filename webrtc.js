@@ -1,15 +1,11 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
- * 🚀【體驗優化】：Room ID 自動轉化為 6 位數純數字 PIN 配對碼，方便電腦端手動輸入。
+ * 🚀【優化】：改自 state.js 導入 getWorkerUrl，破除循環依賴。
  */
-import { state } from './state.js';
+import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload } from './ui.js';
 import { downloadAndCleanR2, destroyR2File, sendViaR2Multipart } from './r2.js';
-
-export function getWorkerUrl() {
-    return "https://bobconnect.bobkao0527.workers.dev";
-}
 
 // 連線成功即銷毀雲端信令房間
 export async function destroyCloudRoom() {
@@ -27,7 +23,7 @@ export async function destroyCloudRoom() {
 export async function initHost() {
     state.isHost = true;
     
-    // 🚀【配對優化】：Room ID 升級為 6 位數純數字 PIN 碼！
+    // Room ID 升級為 6 位數純數字 PIN 碼！
     const numPin = Math.floor(100000 + Math.random() * 900000).toString();
     state.roomId = numPin;
 
@@ -35,7 +31,6 @@ export async function initHost() {
     document.getElementById('signaling-box').classList.remove('hidden');
     document.getElementById('host-panel').classList.remove('hidden');
 
-    // 顯示大大的 6 位數 PIN 碼在畫面上（加一個空格提昇易讀性）
     const formattedPin = `${numPin.slice(0, 3)} ${numPin.slice(3)}`;
     const pinDisplay = document.getElementById('host-pin-display');
     if (pinDisplay) {

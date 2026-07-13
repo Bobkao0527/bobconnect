@@ -1,12 +1,10 @@
 /**
  * r2.js - Cloudflare R2 傳輸模組
  * 處理高併發分塊上傳、自動降級、防呆重試及串流大檔案下載銷毀邏輯。
- * 🚀【進度同步優化】：在上傳過程中，透過 WebRTC dataChannel 即時同步進度與取消事件。
- * 🚀【按鈕優化】：行動端手動下載按鈕自動轉換為「儲存 / 分享檔案」文字。
+ * 🚀【優化】：改由 state.js 引入 getWorkerUrl，避開與 webrtc.js 的循環依賴。
  */
-import { state } from './state.js';
+import { state, getWorkerUrl } from './state.js';
 import { showToast, triggerAutoDownload } from './ui.js';
-import { getWorkerUrl } from './webrtc.js';
 
 // 下載/上傳完成後銷毀 R2 的託管檔案
 export async function destroyR2File(url) {
@@ -56,7 +54,6 @@ export async function downloadAndCleanR2(downloadUrl, filename, totalSize) {
 
         const btnManual = document.getElementById('btn-manual-download');
         if (btnManual) {
-            // 🚀【體驗優化】：行動端按鈕顯示為「儲存 / 分享檔案」
             btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
             btnManual.onclick = () => triggerAutoDownload(localUrl, filename);
         }
@@ -86,7 +83,6 @@ export async function sendViaR2Multipart() {
 
     document.getElementById('progress-status').innerText = '正在向雲端要求建立 R2 通道...';
     
-    // 🚀【同步上傳進度】：通知接收端，大檔案準備上傳至 R2
     if (state.dataChannel && state.dataChannel.readyState === 'open') {
         state.dataChannel.send(JSON.stringify({
             type: 'file-r2-upload-start',
@@ -148,7 +144,6 @@ export async function sendViaR2Multipart() {
                     document.getElementById('transfer-time').innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
                 }
 
-                // 🚀【同步上傳進度】：即時發送最新進度給接收端
                 if (state.dataChannel && state.dataChannel.readyState === 'open') {
                     state.dataChannel.send(JSON.stringify({
                         type: 'file-r2-upload-progress',
@@ -283,7 +278,6 @@ export async function sendViaR2Multipart() {
         document.getElementById('progress-status').innerText = err.message || '大檔案分塊上傳失敗';
         showToast(`傳送暫停: ${err.message}`, 'error');
 
-        // 🚀【同步取消】：萬一上傳中斷或報錯，通知接收端收回等待狀態
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
             state.dataChannel.send(JSON.stringify({
                 type: 'file-r2-upload-cancel'

@@ -2,9 +2,9 @@
  * scanner.js - 相機與手動/同網域配對模組
  * 包裝 getUserMedia 權限，並提供「手動配對碼輸入」與「同網域自動偵測 (2位數驗證)」的降級替代方案。
  */
-import { state } from './state.js';
+import { state, getWorkerUrl } from './state.js';
 import { showToast } from './ui.js';
-import { initJoinerWithRoom, getWorkerUrl } from './webrtc.js';
+import { initJoinerWithRoom } from './webrtc.js';
 
 // 啟動相機掃描
 export async function startScanner() {
@@ -84,7 +84,7 @@ export function tickScanner() {
     state.scanAnimationId = requestAnimationFrame(tickScanner);
 }
 
-// --- 🚀 新增：開啟手動配對與局域網自動偵測 Modal ---
+// 開啟手動配對與局域網自動偵測 Modal
 export function openPairingModal() {
     stopScanner(); // 若相機開著先關閉
     const modal = document.getElementById('pairing-modal');
@@ -125,6 +125,8 @@ async function scanNearbyRooms() {
     const roomListContainer = document.getElementById('lan-room-list');
     const verificationBox = document.getElementById('lan-verification-box');
 
+    if (!statusText || !roomListContainer || !verificationBox) return;
+
     statusText.innerText = "正在搜尋附近 WiFi 的發起端...";
     roomListContainer.innerHTML = "";
     verificationBox.classList.add('hidden');
@@ -132,7 +134,6 @@ async function scanNearbyRooms() {
     const workerUrl = getWorkerUrl();
 
     try {
-        // 向 Worker 請求目前相同 IP 的所有 active rooms (若 Worker 暫不支援，會拋出異常)
         const res = await fetch(`${workerUrl}/rooms-by-ip`);
         if (!res.ok) throw new Error("Worker 尚未實現 /rooms-by-ip");
 
@@ -147,7 +148,6 @@ async function scanNearbyRooms() {
                 </div>
             `;
         } else if (rooms.length === 1) {
-            // 最完美情況：同個 IP 底下只有一台，免輸入驗證碼，直接接通！
             const targetRoom = rooms[0];
             statusText.innerText = "成功偵測到附近裝置！";
             roomListContainer.innerHTML = `
@@ -157,7 +157,6 @@ async function scanNearbyRooms() {
                 </button>
             `;
         } else {
-            // 複數情況（多台並行）：記錄房號，並亮出 2 位數驗證碼輸入框進行過濾
             state.nearbyRooms = rooms; 
             statusText.innerText = `偵測到 ${rooms.length} 個附近裝置，請輸入驗證碼：`;
             verificationBox.classList.remove('hidden');
@@ -184,7 +183,7 @@ window.connectNearbyRoom = function(roomId) {
     initJoinerWithRoom();
 }
 
-// 設定 2 位數驗證碼輸入框（Option A 的並行過濾）
+// 設定 2 位數驗證碼輸入框
 function setupVerificationInputs() {
     const inputs = document.querySelectorAll('.lan-verify-input');
     inputs.forEach((input, index) => {
@@ -195,7 +194,6 @@ function setupVerificationInputs() {
                 if (index < inputs.length - 1) {
                     inputs[index + 1].focus();
                 } else {
-                    // 輸入完第 2 碼，立即進行驗證對齊
                     verifyAndConnectNearby();
                 }
             }
@@ -209,13 +207,12 @@ function setupVerificationInputs() {
     inputs[0].focus();
 }
 
-// 比對 2 位數驗證碼，在多個 Room 中找出正確的連線
+// 比對 2 位數驗證碼
 function verifyAndConnectNearby() {
     const inputs = document.querySelectorAll('.lan-verify-input');
     const enteredCode = Array.from(inputs).map(i => i.value).join('');
     if (enteredCode.length < 2) return;
 
-    // 比對目前 IP 內所有 Room ID 的最後兩碼
     const matchedRoom = state.nearbyRooms.find(r => r.endsWith(enteredCode));
 
     if (matchedRoom) {
@@ -234,14 +231,12 @@ export function setupPinInputs() {
         input.value = "";
         input.addEventListener('input', (e) => {
             const val = e.target.value;
-            // 過濾非數字
             input.value = val.replace(/[^0-9]/g, '');
             
             if (input.value.length > 0) {
                 if (index < inputs.length - 1) {
                     inputs[index + 1].focus();
                 } else {
-                    // 輸入滿 6 碼，自動扣動扳機連線！
                     submitPinPairing();
                 }
             }
