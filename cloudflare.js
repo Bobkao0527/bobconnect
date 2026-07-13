@@ -1,6 +1,6 @@
-// 這是專為 WebRTC 握手與 R2 多分塊（Multipart）大檔案傳輸設計的信令/中轉伺服器
+// 專為 WebRTC 握手與 R2 多分塊（Multipart）大檔案傳輸設計的信令/中轉伺服器
 // 支援 R2 直連 S3 預簽名金鑰 (Presigned URLs) 與高併發直連機制，並防呆降級至 ArrayBuffer 優化代理模式
-// 🚀【更新】：新增 /rooms-by-ip 自動偵測路由，並實作 IP 索引與智慧過濾
+// 🚀【更新】：新增 /rooms-by-ip 自動偵測路由，實作 IP 索引與智慧過濾，並將預設 debug 降級頁面改為安全 JSON 格式
 
 export default {
   async fetch(request, env) {
@@ -242,11 +242,13 @@ export default {
 
     // --- R2.5: DELETE /r2/:roomId/:filename (銷毀 R2 託管大檔案) ---
     if (request.method === "DELETE" && path.startsWith("/r2/")) {
+      // 🚀【修正】：將 parts、roomId 和 key 的宣告移出 if (r2) 的作用域，確保後面的 KV 鎖清理和 globalThis 亦能讀取
+      const parts = path.split("/");
+      const roomId = parts[2];
+      const filename = decodeURIComponent(parts.slice(3).join("/"));
+      const key = `r2:${roomId}:${filename}`;
+
       if (r2) {
-        const parts = path.split("/");
-        const roomId = parts[2];
-        const filename = decodeURIComponent(parts.slice(3).join("/"));
-        const key = `r2:${roomId}:${filename}`;
         await r2.delete(key);
       }
 
@@ -399,10 +401,15 @@ export default {
       return Response.json({ rooms: validRooms }, { headers: corsHeaders });
     }
 
-    return new Response(
-      `Bob WebRTC & R2 Multi-part Server is active.\nKV: ${kv ? "ON" : "OFF"}\nR2: ${r2 ? "ON" : "OFF"}\nDirect Upload Support: ${isDirectUploadConfigured ? "ENABLED (Presigned)" : "DISABLED (Proxy-only)"}\nUpload Operations Checked: ${currentUploadCount} / ${UPLOAD_LIMIT}`, 
-      { headers: { ...corsHeaders, "Content-Type": "text/plain" } }
-    );
+    // 🚀【安全優化】：預設兜底頁面不再回傳純文字，而是回傳格式正確的 CORS JSON，完美相容前端的 fetch JSON 驗證
+    return Response.json({
+      status: "active",
+      message: "Bob WebRTC & R2 Multi-part Server is running smoothly.",
+      kv: kv ? "CONNECTED" : "OFFLINE",
+      r2: r2 ? "CONNECTED" : "OFFLINE",
+      directUpload: isDirectUploadConfigured,
+      uploadUsage: `${currentUploadCount} / ${UPLOAD_LIMIT}`
+    }, { headers: corsHeaders });
   }
 };
 
