@@ -1,7 +1,7 @@
 /**
  * ui.js - UI 輔助與環境警示模組
  * 負責 Toast 提示、內嵌瀏覽器攔截、QR Code 生成及自動下載調用。
- * 🚀【行動端優化】：下載器支援行動端自動轉換為 Web Share API 原生分享選單。
+ * 🚀【行動端 OOM 與跳轉優化】：避免大檔案擠爆 iOS 記憶體，並防止 Safari 導航遺失。
  */
 import { state } from './state.js';
 
@@ -81,36 +81,41 @@ export function updateStatus(text, color) {
     }
 }
 
-// 🚀【行動端終極優化】：自動判斷並呼叫 Web Share API 分享選單
-export async function triggerAutoDownload(url, filename) {
-    // 偵測是否為行動裝置，且瀏覽器支援完整的檔案分享 API (如 iOS Safari, Android Chrome)
-    if (state.localIsMobile && navigator.canShare && navigator.share) {
+// 🚀【行動端終極安全優化】：智慧過濾並喚起分享選單或原生背景下載
+export async function triggerAutoDownload(url, filename, fileSize = 0) {
+    // 🚀【iOS OOM 防閃退】：如果檔案大於 50MB，絕對不能使用 JS fetch 載入記憶體！
+    // 否則 iOS Safari 分頁會直接因為記憶體不足閃退，或者無法成功分享（iOS 分享檔案有嚴格大小限制）。
+    const sizeLimit = 50 * 1024 * 1024; // 50MB 限制
+    
+    if (state.localIsMobile && fileSize < sizeLimit && navigator.canShare && navigator.share) {
         try {
-            // 從 Local Blob URL 提取 Blob 二進位數據並包裝成 File 物件
             const response = await fetch(url);
             const blob = await response.blob();
             const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
 
-            // 確認該檔案格式在系統安全允許的分享範圍內 (iOS/Android 支援絕大多數影音、相片、PDF)
             if (navigator.canShare({ files: [file] })) {
                 await navigator.share({
                     files: [file],
                     title: filename,
                     text: `Bob 檔案傳輸系統成功接收：${filename}`
                 });
-                return; // 喚起分享成功，直接跳出不執行下方 traditional anchor 下載
+                return; // 分享成功後直接返回
             }
         } catch (err) {
-            // 如果是因為「非使用者手勢自動觸發」或「使用者手動按取消」，則優雅降級走 traditional 下載
-            console.warn("[系統提示] 原生分享未被手勢啟動或已被取消，改走瀏覽器預設存檔機制。", err);
+            console.warn("[系統提示] 原生分享未成功，將降級走瀏覽器預設下載機制。", err);
         }
     }
 
-    // 🖥️ 電腦端或降級方案：傳統的 a 標籤點擊下載
+    // 🖥️ 電腦端或大檔案（>50MB）的行動端原生下載路徑
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
-    a.target = state.localIsMobile ? '_self' : '_blank'; 
+    
+    // 🚀【Safari 跨網域跳轉防護】：
+    // iOS 跨網域下載不支援 a.download 屬性。如果設為 _self，Safari 會直接導航離開當前 App 網頁。
+    // 強制使用 _blank 會開啟一個新分頁。Safari 偵測到 Worker 回傳的 Content-Disposition 附件標頭後，
+    // 會彈出原生下載選單，並在背景下載檔案，同時「完美保留」原來的傳輸分頁與 WebRTC 連線！
+    a.target = '_blank'; 
     document.body.appendChild(a);
     a.click();
     

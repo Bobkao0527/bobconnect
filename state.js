@@ -16,6 +16,9 @@ export const state = {
 
     // 局域網多端偵測過濾儲存槽
     nearbyRooms: [],
+    
+    // 🚀 新增：前端探針取得之真實公網 IPv4
+    localIPv4: null,
 
     // 設備特徵識別 (智慧分流核心)
     localIsMobile: /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent),
@@ -35,7 +38,7 @@ export const state = {
     }
 };
 
-// 🚀【架構優化】：將此設定移至底層 state.js，徹底切斷 webrtc.js ↔ r2.js 的循環依賴鏈
+// 將此設定移至底層 state.js，徹底切斷 webrtc.js ↔ r2.js 的循環依賴鏈
 export function getWorkerUrl() {
     return "https://bobconnect.bobkao0527.workers.dev";
 }

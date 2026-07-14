@@ -134,9 +134,13 @@ async function scanNearbyRooms() {
     const workerUrl = getWorkerUrl();
 
     try {
-        const res = await fetch(`${workerUrl}/rooms-by-ip`);
-        
-        // 安全抓取純文字，防止非 JSON 回傳導致 SyntaxError
+        // 🚀【IPv4 優化】：發送請求時，如果已探測到 IPv4，手動帶上 X-Client-IPv4 標頭
+        const headers = {};
+        if (state.localIPv4) {
+            headers['X-Client-IPv4'] = state.localIPv4;
+        }
+
+        const res = await fetch(`${workerUrl}/rooms-by-ip`, { headers });
         const responseText = await res.text();
 
         if (!res.ok) {
@@ -176,9 +180,7 @@ async function scanNearbyRooms() {
         }
 
     } catch (err) {
-        // 🚀【體驗優化】：僅在主控台輸出 Debug 資訊，前端畫面維持極簡乾淨的導引
         console.error("[LAN 自動偵測失敗]:", err);
-        
         statusText.innerText = "自動偵測目前無法使用，請使用 PIN 碼連線。";
         roomListContainer.innerHTML = `
             <button onclick="switchPairingTab('pin')" class="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold rounded-xl transition border border-slate-800">

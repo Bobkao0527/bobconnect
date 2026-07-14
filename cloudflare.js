@@ -1,20 +1,24 @@
 // 專為 WebRTC 握手與 R2 多分塊（Multipart）大檔案傳輸設計的信令/中轉伺服器
 // 支援 R2 直連 S3 預簽名金鑰 (Presigned URLs) 與高併發直連機制，並防呆降級至 ArrayBuffer 優化代理模式
 // 🚀【更新】：新增 /rooms-by-ip 自動偵測路由，實作 IP 索引與智慧過濾，並將預設 debug 降級頁面改為安全 JSON 格式
-// 🚀【IPv6 局域網優化】：自動提取 IPv6 的 /64 子網路前綴，徹底解決同 WiFi 下因 SLAAC 導致 IPv6 位址不一致無法配對的問題！
+// 🚀【智慧 IPv4 強制機制】：優先讀取前端發送的 X-Client-IPv4，完美避開 IPv6 的變動與不穩定性！
 
-// 🚀 新增：智慧 IP 區段提取器（解決同 WiFi 不同 IPv6 的痛點）
-function getIpKey(ip) {
-  if (!ip) return "ipv4:127.0.0.1";
-  if (ip.includes(":")) {
-    // IPv6: 提取前 4 個區段 (即 /64 子網段)
-    // 同一個 WiFi 局域網下的所有設備，其 IPv6 的前 4 個區段必定完全相同
-    const segments = ip.split(":");
+// 智慧 IP 區段提取器（支援 X-Client-IPv4 優先原則）
+function getIpKey(request) {
+  // 🚀 優先採用前端探針回傳的 X-Client-IPv4
+  const clientIpv4 = request.headers.get("X-Client-IPv4");
+  if (clientIpv4) {
+    return `room:ip:ipv4:${clientIpv4}`;
+  }
+
+  // 備用：讀取 Cloudflare 原生網路 IP
+  const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+  if (clientIp.includes(":")) {
+    const segments = clientIp.split(":");
     const subnet64 = segments.slice(0, 4).join(":");
     return `room:ip:ipv6:${subnet64}`;
   }
-  // IPv4: 直接使用完整對外 IP
-  return `room:ip:ipv4:${ip}`;
+  return `room:ip:ipv4:${clientIp}`;
 }
 
 export default {
@@ -25,7 +29,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4", // 🚀 允許跨網域帶入自訂標頭
     };
 
     if (request.method === "OPTIONS") {
@@ -37,7 +41,6 @@ export default {
     const kv = env.BOB_CONNECT_KV;
     const r2 = env.BOB_CONNECT_R2;
 
-    // 取得 S3 預簽名所需之環境變數（若無配置則自動無縫降級至記憶體優化代理模式）
     const r2AccountId = env.R2_ACCOUNT_ID;
     const r2AccessKeyId = env.R2_ACCESS_KEY_ID;
     const r2SecretAccessKey = env.R2_SECRET_ACCESS_KEY;
@@ -45,7 +48,6 @@ export default {
 
     const isDirectUploadConfigured = !!(r2AccountId && r2AccessKeyId && r2SecretAccessKey && r2BucketName);
 
-    // 🛡️ 1. 荷包安全閥門
     const UPLOAD_LIMIT = 900000;
     let currentUploadCount = 0;
 
@@ -70,7 +72,6 @@ export default {
       );
     }
 
-    // --- R2.1: 初始化多分塊上傳 (POST /r2-multipart/init/:roomId/:filename) ---
     if (request.method === "POST" && path.startsWith("/r2-multipart/init/")) {
       if (!r2) {
         return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -80,7 +81,6 @@ export default {
       const filename = decodeURIComponent(parts.slice(4).join("/"));
       const key = `r2:${roomId}:${filename}`;
 
-      // 🛡️ 併行鎖機制
       if (kv) {
         const currentLock = await kv.get("system:current_uploading_room");
         if (currentLock && currentLock !== roomId) {
@@ -108,7 +108,6 @@ export default {
           httpMetadata: { contentType: "application/octet-stream" }
         });
         
-        // 告知前端目前是否支援「直連 R2」模式
         return Response.json({ 
           uploadId: multipart.uploadId,
           directUpload: isDirectUploadConfigured
@@ -123,7 +122,6 @@ export default {
       }
     }
 
-    // --- 🚀 R2.1.5: 產生分塊預簽名直連 URL (GET /r2-multipart/presign/:roomId/:filename) ---
     if (request.method === "GET" && path.startsWith("/r2-multipart/presign/")) {
       if (!isDirectUploadConfigured) {
         return Response.json({ error: "未設定 R2 S3 直連環境變數" }, { status: 400, headers: corsHeaders });
@@ -141,7 +139,6 @@ export default {
       }
 
       try {
-        // 純 JS 輕量化 S3 V4 簽名邏輯，實現 0 外部依賴生成直連連結
         const uploadUrl = await generatePresignedUrl({
           accountId: r2AccountId,
           accessKeyId: r2AccessKeyId,
@@ -158,8 +155,6 @@ export default {
       }
     }
 
-    // --- R2.2: 降級備用：接收單個分塊代理 (PUT /r2-multipart/upload/:roomId/:filename) ---
-    // 🚀【極速代理優化】：改用 ArrayBuffer 載入記憶體，徹底解決 Stream 造成 Edge V8 引擎調度阻塞的問題！
     if (request.method === "PUT" && path.startsWith("/r2-multipart/upload/")) {
       if (!r2) {
         return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -178,7 +173,6 @@ export default {
 
       try {
         const multipart = r2.resumeMultipartUpload(key, uploadId);
-        // 核心改動：將 request.body 轉為 ArrayBuffer 後寫入，效率飆升
         const buffer = await request.arrayBuffer();
         const part = await multipart.uploadPart(partNumber, buffer);
 
@@ -188,7 +182,6 @@ export default {
       }
     }
 
-    // --- R2.3: 完成多分塊上傳並合併 (POST /r2-multipart/complete/:roomId/:filename) ---
     if (request.method === "POST" && path.startsWith("/r2-multipart/complete/")) {
       if (!r2) {
         return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -229,7 +222,6 @@ export default {
       }
     }
 
-    // --- R2.4: 下載檔案 (GET /r2/:roomId/:filename) ---
     if (request.method === "GET" && path.startsWith("/r2/")) {
       if (!r2) {
         return new Response("R2 Storage is not configured", { status: 500, headers: corsHeaders });
@@ -255,7 +247,6 @@ export default {
       }
     }
 
-    // --- R2.5: DELETE /r2/:roomId/:filename (銷毀 R2 託管大檔案) ---
     if (request.method === "DELETE" && path.startsWith("/r2/")) {
       const parts = path.split("/");
       const roomId = parts[2];
@@ -280,7 +271,7 @@ export default {
       return Response.json({ success: true, message: "R2 檔案已抹除，併行鎖已釋放" }, { headers: corsHeaders });
     }
 
-    // --- WebRTC 1: POST /room/:roomId (交換 Offer/Answer) ---
+    // --- WebRTC 1: POST /room/:roomId ---
     if (request.method === "POST" && path.startsWith("/room/")) {
       const roomId = path.split("/")[2];
       if (!roomId) return Response.json({ error: "Missing Room ID" }, { status: 400, headers: corsHeaders });
@@ -289,14 +280,13 @@ export default {
         const body = await request.json();
         const now = Date.now();
         const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-        const ipKey = getIpKey(clientIp); // 🚀 智慧判定 IP Key
+        const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
 
         if (kv) {
           const existingRaw = await kv.get(`room:${roomId}`);
           const currentData = existingRaw ? JSON.parse(existingRaw) : {};
           
           const roomIp = currentData.ip || clientIp;
-
           const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
           await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 600 });
 
@@ -321,7 +311,7 @@ export default {
       }
     }
 
-    // --- WebRTC 2: GET /room/:roomId (取得信令資料) ---
+    // --- WebRTC 2: GET /room/:roomId ---
     if (request.method === "GET" && path.startsWith("/room/")) {
       const roomId = path.split("/")[2];
       let data = null;
@@ -334,7 +324,7 @@ export default {
       return Response.json(data, { headers: corsHeaders });
     }
 
-    // --- WebRTC 3: DELETE /room/:roomId (銷毀連線房間) ---
+    // --- WebRTC 3: DELETE /room/:roomId ---
     if (request.method === "DELETE" && path.startsWith("/room/")) {
       const roomId = path.split("/")[2];
       if (kv) {
@@ -343,7 +333,7 @@ export default {
           const roomData = JSON.parse(roomRaw);
           const ip = roomData.ip;
           if (ip) {
-            const ipKey = getIpKey(ip); // 🚀 智慧判定 IP Key
+            const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
             const rawList = await kv.get(ipKey);
             if (rawList) {
               let roomList = JSON.parse(rawList);
@@ -365,8 +355,7 @@ export default {
 
     // --- WebRTC 4: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
     if (request.method === "GET" && path === "/rooms-by-ip") {
-      const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-      const ipKey = getIpKey(clientIp); // 🚀 智慧判定 IP Key
+      const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
       const validRooms = [];
       const now = Date.now();
 
@@ -398,8 +387,7 @@ export default {
             globalThis.rooms.delete(rId);
             continue;
           }
-          // 比對 IP 前綴
-          const registeredIpKey = getIpKey(roomData.ip);
+          const registeredIpKey = getIpKey(request);
           if (registeredIpKey === ipKey && roomData.offer && !roomData.answer) {
             validRooms.push(rId);
           }

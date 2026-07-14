@@ -1,18 +1,36 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
- * 🚀【優化】：改自 state.js 導入 getWorkerUrl，破除循環依賴。
+ * 🚀【傳輸路由安全防護】：確保 512MB 以下檔案不論任何裝置，100% 穩定強制走 RTC 傳輸！
+ * 🚀【IPv4 強制防護】：發起請求時，自動將探針取得之 X-Client-IPv4 帶入 Header，強迫伺服器以 v4 匹配。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload } from './ui.js';
 import { downloadAndCleanR2, destroyR2File, sendViaR2Multipart } from './r2.js';
+
+// 🚀 新增：非阻塞式背景 IPv4 探針
+export async function probeIPv4() {
+    try {
+        // api4 僅解析 IPv4，強迫瀏覽器走 IPv4 管道連線取得真實公網 IP
+        const res = await fetch('https://api4.ipify.org?format=json');
+        const data = await res.json();
+        state.localIPv4 = data.ip;
+        console.log("[IPv4 探針] 成功強制取得真實公網 IPv4:", state.localIPv4);
+    } catch (e) {
+        console.warn("[IPv4 探針] 取得失敗（可能身處純 IPv6 網路環境）:", e);
+    }
+}
 
 // 連線成功即銷毀雲端信令房間
 export async function destroyCloudRoom() {
     if (!state.roomId) return;
     const workerUrl = getWorkerUrl();
     try {
-        await fetch(`${workerUrl}/room/${state.roomId}`, { method: 'DELETE', keepalive: true });
+        const headers = { 'keepalive': 'true' };
+        if (state.localIPv4) {
+            headers['X-Client-IPv4'] = state.localIPv4;
+        }
+        await fetch(`${workerUrl}/room/${state.roomId}`, { method: 'DELETE', headers, keepalive: true });
         console.log(`[安全機制] 房間 ${state.roomId} 的雲端信令已成功手動銷毀。`);
     } catch (e) {
         console.error("手動銷毀房間失敗:", e);
@@ -54,9 +72,14 @@ export async function initHost() {
                 const workerUrl = getWorkerUrl();
                 
                 try {
+                    const headers = { 'Content-Type': 'application/json' };
+                    if (state.localIPv4) {
+                        headers['X-Client-IPv4'] = state.localIPv4;
+                    }
+
                     const res = await fetch(`${workerUrl}/room/${state.roomId}`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: headers,
                         body: JSON.stringify({ offer })
                     });
                     if (res.ok) {
@@ -88,7 +111,12 @@ export function startCheckingForAnswer() {
 
     state.answerCheckInterval = setInterval(async () => {
         try {
-            const res = await fetch(`${workerUrl}/room/${state.roomId}`);
+            const headers = {};
+            if (state.localIPv4) {
+                headers['X-Client-IPv4'] = state.localIPv4;
+            }
+
+            const res = await fetch(`${workerUrl}/room/${state.roomId}`, { headers });
             if (res.ok) {
                 const data = await res.json();
                 if (data && data.answer) {
@@ -115,7 +143,12 @@ export async function initJoinerWithRoom() {
     const workerUrl = getWorkerUrl();
 
     try {
-        const res = await fetch(`${workerUrl}/room/${state.roomId}`);
+        const headers = {};
+        if (state.localIPv4) {
+            headers['X-Client-IPv4'] = state.localIPv4;
+        }
+
+        const res = await fetch(`${workerUrl}/room/${state.roomId}`, { headers });
         if (!res.ok) throw new Error('提取信令失敗');
         const data = await res.json();
         if (!data || !data.offer) throw new Error('連線可能超時或失效，請發起端重新產生');
@@ -132,9 +165,14 @@ export async function initJoinerWithRoom() {
             if (!event.candidate) {
                 const answer = state.peerConnection.localDescription;
                 try {
+                    const postHeaders = { 'Content-Type': 'application/json' };
+                    if (state.localIPv4) {
+                        postHeaders['X-Client-IPv4'] = state.localIPv4;
+                    }
+
                     const postRes = await fetch(`${workerUrl}/room/${state.roomId}`, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: postHeaders,
                         body: JSON.stringify({ answer })
                     });
                     if (postRes.ok) {
@@ -260,12 +298,12 @@ export function handleIncomingData(data) {
                 state.receiveBuffer = []; // 清空緩衝
                 
                 const url = URL.createObjectURL(blob);
-                triggerAutoDownload(url, state.incomingFileInfo.name);
+                triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
 
                 const btnManual = document.getElementById('btn-manual-download');
                 if (btnManual) {
                     btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
-                    btnManual.onclick = () => triggerAutoDownload(url, state.incomingFileInfo.name);
+                    btnManual.onclick = () => triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
                 }
                 document.getElementById('manual-download-container').classList.remove('hidden');
 
@@ -296,20 +334,20 @@ export function handleIncomingData(data) {
                     document.getElementById('recv-progress-bar').style.width = '100%';
                     document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1";
 
-                    triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name);
+                    triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
 
                     setTimeout(() => {
                         destroyR2File(message.downloadUrl);
-                    }, 8000);
+                    }, 900000);
 
                     const btnManual = document.getElementById('btn-manual-download');
                     if (btnManual) {
                         btnManual.innerText = '📤 儲存 / 分享檔案';
-                        btnManual.onclick = () => triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name);
+                        btnManual.onclick = () => triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
                     }
                     document.getElementById('manual-download-container').classList.remove('hidden');
                     
-                    showToast(`已成功喚起原生下載，檔案將自動銷毀。`, 'success');
+                    showToast(`已成功喚起原生下載，檔案將於 15 分鐘後自動自雲端抹除。`, 'success');
 
                 } else {
                     document.getElementById('incoming-status-title').innerHTML = `

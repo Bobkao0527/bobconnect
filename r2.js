@@ -1,7 +1,7 @@
 /**
  * r2.js - Cloudflare R2 傳輸模組
  * 處理高併發分塊上傳、自動降級、防呆重試及串流大檔案下載銷毀邏輯。
- * 🚀【優化】：改由 state.js 引入 getWorkerUrl，避開與 webrtc.js 的循環依賴。
+ * 🚀【更新】：在 triggerAutoDownload 中傳遞 fileSize 參數，確保行動端防崩潰機制生效。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, triggerAutoDownload } from './ui.js';
@@ -45,7 +45,7 @@ export async function downloadAndCleanR2(downloadUrl, filename, totalSize) {
 
         const blob = new Blob(chunks, { type: "application/octet-stream" });
         const localUrl = URL.createObjectURL(blob);
-        triggerAutoDownload(localUrl, filename);
+        triggerAutoDownload(localUrl, filename, totalSize);
 
         chunks.length = 0; // 釋放記憶體
 
@@ -55,7 +55,7 @@ export async function downloadAndCleanR2(downloadUrl, filename, totalSize) {
         const btnManual = document.getElementById('btn-manual-download');
         if (btnManual) {
             btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
-            btnManual.onclick = () => triggerAutoDownload(localUrl, filename);
+            btnManual.onclick = () => triggerAutoDownload(localUrl, filename, totalSize);
         }
         document.getElementById('manual-download-container').classList.remove('hidden');
 

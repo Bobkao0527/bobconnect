@@ -5,10 +5,10 @@
  */
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
-import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting } from './webrtc.js';
+import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4 } from './webrtc.js';
 import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs } from './scanner.js';
 
-// 🚀【全域暴露機制】
+// 全域暴露機制
 window.initHost = initHost;
 window.startJoinerScanner = startScanner;
 window.stopScanner = stopScanner;
@@ -18,9 +18,13 @@ window.sendFileChunks = sendFileChunks;
 window.hideToast = hideToast;
 
 // 頁面初始化
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
     checkInAppBrowser(); // 檢查內嵌瀏覽器防暴走
     
+    // 🚀【強製 IPv4 探針】：在背景默默執行探針，精準取得對外公網 IPv4
+    // 採用 async 非阻塞，確保前端 UI 在 0ms 延遲下立即可用！
+    probeIPv4();
+
     // 解析路徑自動加入
     const urlParams = new URLSearchParams(window.location.search);
     const rId = urlParams.get('room');
@@ -33,7 +37,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // 拖曳區事件註冊
     setupDragAndDrop();
 
-    // 🚀 初始化 PIN 碼多欄位輸入傾聽器
+    // 初始化 PIN 碼多欄位輸入傾聽器
     setupPinInputs();
 });
 
