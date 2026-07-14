@@ -1,17 +1,14 @@
 // 專為 WebRTC 握手與 R2 多分塊（Multipart）大檔案傳輸設計的信令/中轉伺服器
 // 支援 R2 直連 S3 預簽名金鑰 (Presigned URLs) 與高併發直連機制，並防呆降級至 ArrayBuffer 優化代理模式
-// 🚀【更新】：新增 /rooms-by-ip 自動偵測路由，實作 IP 索引與智慧過濾，並將預設 debug 降級頁面改為安全 JSON 格式
-// 🚀【智慧 IPv4 強制機制】：優先讀取前端發送的 X-Client-IPv4，完美避開 IPv6 的變動與不穩定性！
+// 🚀【更新】：將 WebRTC 房間與 IP 索引的快取生命周期縮短至 60 秒，超過 60 秒自動廢棄
 
 // 智慧 IP 區段提取器（支援 X-Client-IPv4 優先原則）
 function getIpKey(request) {
-  // 🚀 優先採用前端探針回傳的 X-Client-IPv4
   const clientIpv4 = request.headers.get("X-Client-IPv4");
   if (clientIpv4) {
     return `room:ip:ipv4:${clientIpv4}`;
   }
 
-  // 備用：讀取 Cloudflare 原生網路 IP
   const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
   if (clientIp.includes(":")) {
     const segments = clientIp.split(":");
@@ -29,7 +26,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4", // 🚀 允許跨網域帶入自訂標頭
+      "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4",
     };
 
     if (request.method === "OPTIONS") {
@@ -72,6 +69,7 @@ export default {
       );
     }
 
+    // --- R2.1: 初始化多分塊上傳 ---
     if (request.method === "POST" && path.startsWith("/r2-multipart/init/")) {
       if (!r2) {
         return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -271,7 +269,7 @@ export default {
       return Response.json({ success: true, message: "R2 檔案已抹除，併行鎖已釋放" }, { headers: corsHeaders });
     }
 
-    // --- WebRTC 1: POST /room/:roomId ---
+    // --- WebRTC 1: POST /room/:roomId (交換 Offer/Answer) ---
     if (request.method === "POST" && path.startsWith("/room/")) {
       const roomId = path.split("/")[2];
       if (!roomId) return Response.json({ error: "Missing Room ID" }, { status: 400, headers: corsHeaders });
@@ -280,7 +278,7 @@ export default {
         const body = await request.json();
         const now = Date.now();
         const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-        const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
+        const ipKey = getIpKey(request);
 
         if (kv) {
           const existingRaw = await kv.get(`room:${roomId}`);
@@ -288,7 +286,9 @@ export default {
           
           const roomIp = currentData.ip || clientIp;
           const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
-          await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 600 });
+          
+          // 🚀【60秒過期安全機制】：將 KV 生存期從 10 分鐘 (600s) 縮短至 60 秒！
+          await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 60 });
 
           // 如果是 Host 發起端，同步將此房號追加註冊到該 IP 的待選索引列表中
           if (body.offer) {
@@ -297,7 +297,8 @@ export default {
             if (!roomList.includes(roomId)) {
               roomList.push(roomId);
             }
-            await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 600 });
+            // 🚀【60秒過期安全機制】：IP 索引儲存也縮短至 60 秒
+            await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 60 });
           }
         } else {
           const currentData = globalThis.rooms.get(roomId) || {};
@@ -333,13 +334,13 @@ export default {
           const roomData = JSON.parse(roomRaw);
           const ip = roomData.ip;
           if (ip) {
-            const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
+            const ipKey = getIpKey(request);
             const rawList = await kv.get(ipKey);
             if (rawList) {
               let roomList = JSON.parse(rawList);
               roomList = roomList.filter(id => id !== roomId);
               if (roomList.length > 0) {
-                await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 600 });
+                await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 60 });
               } else {
                 await kv.delete(ipKey);
               }
@@ -355,7 +356,7 @@ export default {
 
     // --- WebRTC 4: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
     if (request.method === "GET" && path === "/rooms-by-ip") {
-      const ipKey = getIpKey(request); // 🚀 使用智慧 IP 區段提取器
+      const ipKey = getIpKey(request);
       const validRooms = [];
       const now = Date.now();
 
@@ -367,7 +368,8 @@ export default {
           const roomRaw = await kv.get(`room:${rId}`);
           if (roomRaw) {
             const roomData = JSON.parse(roomRaw);
-            if (roomData.offer && !roomData.answer && (now - roomData.timestamp < 600 * 1000)) {
+            // 🚀【60秒過期安全機制】：篩選時僅保留 60 秒內 (60,000 毫秒) 創立的房間
+            if (roomData.offer && !roomData.answer && (now - roomData.timestamp < 60 * 1000)) {
               validRooms.push(rId);
             }
           }
@@ -375,7 +377,7 @@ export default {
 
         if (validRooms.length !== candidateIds.length) {
           if (validRooms.length > 0) {
-            await kv.put(ipKey, JSON.stringify(validRooms), { expirationTtl: 600 });
+            await kv.put(ipKey, JSON.stringify(validRooms), { expirationTtl: 60 });
           } else {
             await kv.delete(ipKey);
           }
@@ -383,7 +385,8 @@ export default {
       } else {
         // 記憶體備用模式
         for (const [rId, roomData] of globalThis.rooms.entries()) {
-          if (now - roomData.timestamp > 600 * 1000) {
+          // 🚀【60秒過期安全機制】：清理記憶體中超過 60 秒的房間
+          if (now - roomData.timestamp > 60 * 1000) {
             globalThis.rooms.delete(rId);
             continue;
           }
@@ -454,7 +457,6 @@ async function generatePresignedUrl({
   
   const amzDate = new Date().toISOString().replace(/[:-]/g, "").split(".")[0] + "Z";
   const dateStamp = amzDate.substr(0, 8);
-  
   const credentialScope = `${dateStamp}/${region}/s3/aws4_request`;
   
   const queryParams = {

@@ -1,6 +1,7 @@
 /**
  * scanner.js - 相機與手動/同網域配對模組
  * 包裝 getUserMedia 權限，並提供「手動配對碼輸入」與「同網域自動偵測 (2位數驗證)」的降級替代方案。
+ * 🚀【智慧對接優化】：新增 autoCheckNearbyRooms 函式，用於在打開網站時自動背景秒級靜默對接。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast } from './ui.js';
@@ -119,6 +120,50 @@ export function switchPairingTab(tab) {
     }
 }
 
+// 🚀【智慧背景自動對齊核心】：打開網頁時自動尋找同 IP 的活躍房間 (時效 60s 內)
+export async function autoCheckNearbyRooms() {
+    const workerUrl = getWorkerUrl();
+    const headers = {};
+    if (state.localIPv4) {
+        headers['X-Client-IPv4'] = state.localIPv4;
+    }
+
+    try {
+        const res = await fetch(`${workerUrl}/rooms-by-ip`, { headers });
+        if (!res.ok) return;
+
+        const data = await res.json();
+        const rooms = data.rooms || [];
+
+        if (rooms.length === 1) {
+            // 🎯【完美魔幻對齊】：同網域只有 1 個房間，自動一鍵握手！
+            console.log("[自動對接] 偵測到唯一的附近傳輸，正在自動握手:", rooms[0]);
+            showToast('偵測到附近的傳輸發起，正在自動對接...', 'success');
+            
+            // 安全延遲半秒發起，保證 DataChannel 初始化順暢
+            setTimeout(() => {
+                connectNearbyRoom(rooms[0]);
+            }, 500);
+
+        } else if (rooms.length > 1) {
+            // 🎯【安全多端篩選】：有 2 個以上活躍房間，自動彈出配對 Modal 並要求輸入後 2 碼
+            console.log("[自動對接] 偵測到多個附近的傳輸，自動開啟驗證確認...");
+            state.nearbyRooms = rooms;
+            
+            openPairingModal();
+            switchPairingTab('lan');
+            
+            const statusText = document.getElementById('lan-scan-status');
+            const verificationBox = document.getElementById('lan-verification-box');
+            if (statusText) statusText.innerText = `偵測到 ${rooms.length} 個附近裝置，請輸入驗證碼：`;
+            if (verificationBox) verificationBox.classList.remove('hidden');
+            setupVerificationInputs();
+        }
+    } catch (err) {
+        console.warn("[自動對接] 靜默探測失敗或目前無連線:", err);
+    }
+}
+
 // 偵測附近同公網 IP 的 active rooms
 async function scanNearbyRooms() {
     const statusText = document.getElementById('lan-scan-status');
@@ -134,7 +179,6 @@ async function scanNearbyRooms() {
     const workerUrl = getWorkerUrl();
 
     try {
-        // 🚀【IPv4 優化】：發送請求時，如果已探測到 IPv4，手動帶上 X-Client-IPv4 標頭
         const headers = {};
         if (state.localIPv4) {
             headers['X-Client-IPv4'] = state.localIPv4;
