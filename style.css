@@ -1,21 +1,21 @@
 /* 基礎背景與溢出設定 */
 body {
-    background-color: #000000;
-    overflow-x: hidden;
+background-color: #000000;
+overflow-x: hidden;
 }
 
 /* 相機 QR Code 掃描線動畫效果 */
 @keyframes scan {
-    0%, 100% { 
-        transform: translateY(0); 
-    }
-    50% { 
-        transform: translateY(220px); 
-    }
+0%, 100% {
+transform: translateY(0);
+}
+50% {
+transform: translateY(220px);
+}
 }
 
 .scan-line {
-    animation: scan 2s infinite ease-in-out;
+animation: scan 2s infinite ease-in-out;
 }
 
 /* 🚀 ========================================== /
