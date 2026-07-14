@@ -92,10 +92,10 @@ export function triggerAppleGlow() {
 
     glow.classList.add('active');
 
-    // 流光持續 4 秒後，優雅淡出
+    // 流光持續 1 秒後，優雅淡出
     setTimeout(() => {
         glow.classList.remove('active');
-    }, 4000);
+    }, 1000);
 }
 
 // 行動端原生分享或背景傳統下載
