@@ -1,17 +1,15 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
- * 🚀【傳輸路由安全防護】：確保 512MB 以下檔案不論任何裝置，100% 穩定強制走 RTC 傳輸！
- * 🚀【IPv4 強制防護】：發起請求時，自動將探針取得之 X-Client-IPv4 帶入 Header，強迫伺服器以 v4 匹配。
+ * 🚀【更新】：在 dataChannel.onopen 時，完美導入並觸發 triggerAppleGlow 邊框流光。
  */
 import { state, getWorkerUrl } from './state.js';
-import { showToast, updateStatus, generateQRCode, triggerAutoDownload } from './ui.js';
+import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
 import { downloadAndCleanR2, destroyR2File, sendViaR2Multipart } from './r2.js';
 
-// 🚀 新增：非阻塞式背景 IPv4 探針
+// 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
     try {
-        // api4 僅解析 IPv4，強迫瀏覽器走 IPv4 管道連線取得真實公網 IP
         const res = await fetch('https://api4.ipify.org?format=json');
         const data = await res.json();
         state.localIPv4 = data.ip;
@@ -200,6 +198,9 @@ export function setupDataChannelListeners() {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
         
+        // 🚀【炫酷體驗】：在 WebRTC 通道正式連通的瞬間，在裝置螢幕邊緣亮起 Apple Intelligence 流光！
+        triggerAppleGlow();
+
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile

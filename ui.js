@@ -1,7 +1,7 @@
 /**
  * ui.js - UI 輔助與環境警示模組
  * 負責 Toast 提示、內嵌瀏覽器攔截、QR Code 生成及自動下載調用。
- * 🚀【行動端 OOM 與跳轉優化】：避免大檔案擠爆 iOS 記憶體，並防止 Safari 導航遺失。
+ * 🚀【更新】：新增 triggerAppleGlow 方法，用於在直連開通瞬間觸發全螢幕智慧霓虹流光。
  */
 import { state } from './state.js';
 
@@ -81,10 +81,25 @@ export function updateStatus(text, color) {
     }
 }
 
-// 🚀【行動端終極安全優化】：智慧過濾並喚起分享選單或原生背景下載
+// 🚀【彩色流光邊框控制器】：高階 Apple Intelligence 動態漸層淡入淡出
+export function triggerAppleGlow() {
+    const glow = document.getElementById('intel-glow');
+    if (!glow) return;
+
+    // 清除舊有的 active，重新觸發
+    glow.classList.remove('active');
+    void glow.offsetWidth; // 🚀 強制觸發重繪 (Reflow) 以確保動畫能重複被執行
+
+    glow.classList.add('active');
+
+    // 流光持續 4 秒後，優雅淡出
+    setTimeout(() => {
+        glow.classList.remove('active');
+    }, 4000);
+}
+
+// 行動端原生分享或背景傳統下載
 export async function triggerAutoDownload(url, filename, fileSize = 0) {
-    // 🚀【iOS OOM 防閃退】：如果檔案大於 50MB，絕對不能使用 JS fetch 載入記憶體！
-    // 否則 iOS Safari 分頁會直接因為記憶體不足閃退，或者無法成功分享（iOS 分享檔案有嚴格大小限制）。
     const sizeLimit = 50 * 1024 * 1024; // 50MB 限制
     
     if (state.localIsMobile && fileSize < sizeLimit && navigator.canShare && navigator.share) {
@@ -99,22 +114,16 @@ export async function triggerAutoDownload(url, filename, fileSize = 0) {
                     title: filename,
                     text: `Bob 檔案傳輸系統成功接收：${filename}`
                 });
-                return; // 分享成功後直接返回
+                return;
             }
         } catch (err) {
             console.warn("[系統提示] 原生分享未成功，將降級走瀏覽器預設下載機制。", err);
         }
     }
 
-    // 🖥️ 電腦端或大檔案（>50MB）的行動端原生下載路徑
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
-    
-    // 🚀【Safari 跨網域跳轉防護】：
-    // iOS 跨網域下載不支援 a.download 屬性。如果設為 _self，Safari 會直接導航離開當前 App 網頁。
-    // 強制使用 _blank 會開啟一個新分頁。Safari 偵測到 Worker 回傳的 Content-Disposition 附件標頭後，
-    // 會彈出原生下載選單，並在背景下載檔案，同時「完美保留」原來的傳輸分頁與 WebRTC 連線！
     a.target = '_blank'; 
     document.body.appendChild(a);
     a.click();

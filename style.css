@@ -17,3 +17,79 @@ body {
 .scan-line {
     animation: scan 2s infinite ease-in-out;
 }
+
+/* 🚀 ========================================== */
+/* Apple Intelligence 彩色全螢幕邊框流光動畫     */
+/* ========================================== */
+
+@keyframes intel-flow {
+    0% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+    100% {
+        background-position: 0% 50%;
+    }
+}
+
+/* 全螢幕遮罩容器 */
+.intel-glow-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 150; /* 確保在所有人上方 */
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 啟動時淡入 */
+.intel-glow-overlay.active {
+    opacity: 1;
+}
+
+/* 四邊的柔和霓虹流光條 */
+.intel-glow-bar {
+    position: absolute;
+    background: linear-gradient(
+        90deg,
+        #3b82f6, /* 科技藍 */
+        #8b5cf6, /* 幻境紫 */
+        #ec4899, /* 魅惑粉 */
+        #10b981, /* 翡翠綠 */
+        #f59e0b, /* 活力橙 */
+        #3b82f6
+    );
+    background-size: 300% 300%;
+    animation: intel-flow 4.5s linear infinite;
+    filter: blur(20px); /* 15px-25px 的高斯模糊能營造出極致的發光擴散感 */
+}
+
+/* 邊緣定位 */
+.intel-glow-top {
+    top: 0; left: 0; right: 0; height: 12px;
+}
+.intel-glow-bottom {
+    bottom: 0; left: 0; right: 0; height: 12px;
+}
+.intel-glow-left {
+    top: 0; bottom: 0; left: 0; width: 12px;
+}
+.intel-glow-right {
+    top: 0; bottom: 0; right: 0; width: 12px;
+}
+
+/* 螢幕四角的暗色與微光暈漸層（Apple 重現靈魂：讓螢幕微微內縮發光） */
+.intel-glow-ambient {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+        circle at 50% 50%,
+        transparent 35%,
+        rgba(139, 92, 246, 0.05) 65%,
+        rgba(236, 72, 153, 0.09) 100%
+    );
+    filter: blur(25px);
+    mix-blend-mode: screen; /* 螢幕混色模式 */
+}
