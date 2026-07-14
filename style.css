@@ -18,78 +18,113 @@ body {
     animation: scan 2s infinite ease-in-out;
 }
 
-/* 🚀 ========================================== */
-/* Apple Intelligence 彩色全螢幕邊框流光動畫     */
-/* ========================================== */
+/* 🚀 ========================================== /
+/ Apple Intelligence 彩色全螢幕邊框流光動畫     /
+/ ========================================== */
 
 @keyframes intel-flow {
-    0% {
-        background-position: 0% 50%;
-    }
-    50% {
-        background-position: 100% 50%;
-    }
-    100% {
-        background-position: 0% 50%;
-    }
+0% {
+background-position: 0% 50%;
+}
+50% {
+background-position: 100% 50%;
+}
+100% {
+background-position: 0% 50%;
+}
 }
 
 /* 全螢幕遮罩容器 */
 .intel-glow-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 150; /* 確保在所有人上方 */
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+position: fixed;
+inset: 0;
+z-index: 150; /* 確保在所有人上方 */
+pointer-events: none;
+opacity: 0;
+transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* 啟動時淡入 */
 .intel-glow-overlay.active {
-    opacity: 1;
+opacity: 1;
 }
 
-/* 四邊的柔和霓虹流光條 */
+/*
+霓虹流光條（底層發光 Bloom）：
+使用更高飽和度的霓虹色系，並開啟加色模式 (plus-lighter) 確保融合處亮白乾淨！
+*/
 .intel-glow-bar {
-    position: absolute;
-    background: linear-gradient(
-        90deg,
-        #3b82f6, /* 科技藍 */
-        #8b5cf6, /* 幻境紫 */
-        #ec4899, /* 魅惑粉 */
-        #10b981, /* 翡翠綠 */
-        #f59e0b, /* 活力橙 */
-        #3b82f6
-    );
-    background-size: 300% 300%;
-    animation: intel-flow 4.5s linear infinite;
-    filter: blur(20px); /* 15px-25px 的高斯模糊能營造出極致的發光擴散感 */
+position: absolute;
+background: linear-gradient(
+90deg,
+#00f3ff, /* 霓虹青藍 */
+#b026ff, /* 雷射幻紫 */
+#ff007f, /* 魅惑螢光粉 */
+#00ff87, /* 科技螢光綠 */
+#ff9f00, /* 亮金橙 */
+#00f3ff
+);
+background-size: 300% 300%;
+animation: intel-flow 3.5s linear infinite;
+mix-blend-mode: plus-lighter; /* 物理加色模式，交界處會發光，絕不發灰髒掉 */
+filter: blur(12px); /* 收緊模糊半徑，防止大範圍擴散顯得髒 */
 }
 
-/* 邊緣定位 */
+/*
+🚀 Apple 重現靈魂：雷射亮軌 (Sharp Core)
+利用偽元素 ::after 在發光條邊緣畫出一條極細、零模糊、100% 飽和度的亮線！
+這條線能為視覺定錨，讓光線看起來是「射出來的雷射」而非「螢幕髒污」。
+*/
+.intel-glow-bar::after {
+content: '';
+position: absolute;
+inset: 0;
+background: inherit; /* 直接繼承父層的漸層與動畫速度 */
+background-size: inherit;
+animation: inherit;
+filter: blur(1px); /* 極微幅虛化，使其融合但不失銳利 */
+opacity: 0.95;
+}
+
+/* 邊緣定位與亮軌對齊調整 */
 .intel-glow-top {
-    top: 0; left: 0; right: 0; height: 12px;
+top: 0; left: 0; right: 0; height: 8px;
 }
-.intel-glow-bottom {
-    bottom: 0; left: 0; right: 0; height: 12px;
-}
-.intel-glow-left {
-    top: 0; bottom: 0; left: 0; width: 12px;
-}
-.intel-glow-right {
-    top: 0; bottom: 0; right: 0; width: 12px;
+.intel-glow-top::after {
+top: 0; bottom: auto; height: 1.8px; /* 貼緊螢幕最邊緣的極細亮線 */
 }
 
-/* 螢幕四角的暗色與微光暈漸層（Apple 重現靈魂：讓螢幕微微內縮發光） */
+.intel-glow-bottom {
+bottom: 0; left: 0; right: 0; height: 8px;
+}
+.intel-glow-bottom::after {
+bottom: 0; top: auto; height: 1.8px;
+}
+
+.intel-glow-left {
+top: 0; bottom: 0; left: 0; width: 8px;
+}
+.intel-glow-left::after {
+left: 0; right: auto; width: 1.8px;
+}
+
+.intel-glow-right {
+top: 0; bottom: 0; right: 0; width: 8px;
+}
+.intel-glow-right::after {
+right: 0; left: auto; width: 1.8px;
+}
+
+/* 螢幕四角的暗色與微光暈漸層（更精緻的暗部縮放） */
 .intel-glow-ambient {
-    position: absolute;
-    inset: 0;
-    background: radial-gradient(
-        circle at 50% 50%,
-        transparent 35%,
-        rgba(139, 92, 246, 0.05) 65%,
-        rgba(236, 72, 153, 0.09) 100%
-    );
-    filter: blur(25px);
-    mix-blend-mode: screen; /* 螢幕混色模式 */
+position: absolute;
+inset: 0;
+background: radial-gradient(
+circle at 50% 50%,
+transparent 45%,
+rgba(176, 38, 255, 0.03) 75%,
+rgba(255, 0, 127, 0.06) 100%
+);
+filter: blur(30px);
+mix-blend-mode: plus-lighter;
 }
