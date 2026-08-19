@@ -1,6 +1,7 @@
 /**
  * ui.js - UI 輔助與環境警示模組
  * 負責 Toast 提示、內嵌瀏覽器攔截、QR Code 生成及自動下載調用。
+ * 🚀【更新】：新增 triggerAppleGlow 方法，用於在直連開通瞬間觸發全螢幕智慧霓虹流光。
  */
 import { state } from './state.js';
 
