@@ -40,7 +40,7 @@ export const state = {
 
 // 將此設定移至底層 state.js，徹底切斷 webrtc.js ↔ r2.js 的循環依賴鏈
 export function getWorkerUrl() {
-    return "https://bobconnect.bobkao0527.workers.dev";
+    return `${window.location.origin}/api`;
 }
 
 export default state;

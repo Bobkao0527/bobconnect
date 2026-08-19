@@ -53,7 +53,7 @@ export async function initHost() {
         pinDisplay.innerText = formattedPin;
     }
 
-    const githubPagesOrigin = "https://bobkao0527.github.io/bobconnect/";
+    const githubPagesOrigin = window.location.origin + window.location.pathname;
     const joinUrl = `${githubPagesOrigin}?room=${state.roomId}`;
     generateQRCode('qr-canvas', joinUrl);
 
