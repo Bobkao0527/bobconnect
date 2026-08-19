@@ -287,70 +287,87 @@ export async function handleIncomingData(data) {
             const message = JSON.parse(data);
 
             if (message.type === 'file-meta') {
-                useOpfsWorker = false; // 🚀 重置狀態，防止連續傳輸檔案時狀態錯亂
+                useOpfsWorker = false;
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
-                state.receiveBuffer = []; // 記憶體降級備用陣列
+                state.receiveBuffer = [];
 
-                // 重置 Worker 初始化 Promise
+                let resolved = false;
                 opfsWorkerInitPromise = new Promise((resolve) => {
-                    resolveOpfsWorkerInit = resolve;
+                    resolveOpfsWorkerInit = () => {
+                        if (!resolved) {
+                            resolved = true;
+                            resolve();
+                        }
+                    };
                 });
 
-                // 通知 Worker 初始化沙盒硬碟
+                // 🚨 iOS Safari OPFS 初始化最多等待 3 秒，避免永遠卡在 0%
+                const initTimeout = setTimeout(() => {
+                    if (!resolved) {
+                        console.warn('[OPFS] 初始化逾時，降級至記憶體模式');
+                        useOpfsWorker = false;
+                        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
+                    }
+                }, 3000);
+
+                const originalResolve = resolveOpfsWorkerInit;
+                resolveOpfsWorkerInit = () => {
+                    clearTimeout(initTimeout);
+                    originalResolve();
+                };
+
                 opfsWorker.postMessage({ type: 'init', filename: message.name });
 
-                // 更新 UI 介面
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
             } else if (message.type === 'file-end') {
-                // 等待 Worker 初始化結果確定（確保最後一塊分流正確）
                 if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
 
                 if (useOpfsWorker) {
-                    // 通知 Worker 關閉檔案並合成下載 URL
                     opfsWorker.postMessage({ type: 'close' });
                 } else {
-                    // 降級模式：從記憶體陣列合成 Blob
                     const blob = new Blob(state.receiveBuffer);
                     const downloadUrl = URL.createObjectURL(blob);
-                    state.receiveBuffer = []; // 釋放記憶體陣列
+                    state.receiveBuffer = [];
 
                     triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
                     document.getElementById('recv-percent').innerText = '100% (完成)';
                     showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
 
-                    // 🚀 記憶體降級模式同樣延遲釋放 URL
                     setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
                 }
             }
         } catch (e) {
-            console.error("解析控制訊息失敗:", e);
+            console.error('解析控制訊息失敗:', e);
         }
     } else {
-        // 確保收到第一個二進位 Chunk 前，Worker 的初始化狀態已確定
+        // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
         if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
 
         state.receivedSize += data.byteLength;
 
         if (useOpfsWorker) {
-            // 🚀 零拷貝 (Transferable) 直接將 ArrayBuffer 轉移給 Worker 寫入硬碟
-            opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
+            try {
+                opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
+            } catch (e) {
+                console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
+                useOpfsWorker = false;
+                state.receiveBuffer.push(data);
+            }
         } else {
-            // 降級模式：暫存於主線程記憶體
             state.receiveBuffer.push(data);
         }
 
-        // UI 節流渲染 (100ms 更新一次或傳輸完成時)
         if (state.incomingFileInfo) {
             const now = Date.now();
             if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
                 state.lastRecvUiTime = now;
                 const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-                
+
                 const recvPercent = document.getElementById('recv-percent');
                 const recvProgressBar = document.getElementById('recv-progress-bar');
                 if (recvPercent) recvPercent.innerText = `${percent}%`;
@@ -396,14 +413,14 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 16384; // 16KB
+    const chunkSize = 65536; // 64KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
 
     try {
         const reader = state.selectedFile.stream().getReader();
-        let leftover = null; // 🚀 用於暫存上一區塊未滿 16KB 的殘留部分 (固定 < 16KB)
+        let leftover = null; // 🚀 用於暫存上一區塊未滿 64KB 的殘留部分 (固定 < 64KB)
 
         while (true) {
             const { done, value } = await reader.read();
@@ -411,7 +428,7 @@ export async function sendFileChunks() {
             if (value) {
                 let currentData = value;
 
-                // 若前一次有不足 16KB 的殘留區塊，僅在此時做輕量拼接
+                // 若前一次有不足 64KB 的殘留區塊，僅在此時做輕量拼接
                 if (leftover && leftover.length > 0) {
                     const combined = new Uint8Array(leftover.length + value.length);
                     combined.set(leftover);
