@@ -399,6 +399,17 @@ export async function sendFileChunks() {
     let lastSpeedBytes = 0;
     let smoothSpeed = 0;
     const transferStartTime = performance.now();
+    const formatEta = (seconds) => {
+        if (!isFinite(seconds) || seconds <= 0) return '--:--';
+        seconds = Math.ceil(seconds);
+        if (seconds < 60) return `00:${String(seconds).padStart(2, '0')}`;
+        const minutes = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        if (minutes < 60) return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    };
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
@@ -470,14 +481,18 @@ export async function sendFileChunks() {
                             lastSpeedTime = now;
 
                             const speedText = document.getElementById('transfer-speed');
-                            if (speedText) speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-                        }
+                            if (speedText) {
+                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                            }
 
-                        const elapsedSeconds = Math.max(1, Math.floor((now - transferStartTime) / 1000));
-                        const minutes = Math.floor(elapsedSeconds / 60);
-                        const seconds = elapsedSeconds % 60;
-                        const timeText = document.getElementById('transfer-time');
-                        if (timeText) timeText.innerText = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+                            const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
+                            const etaSeconds = remainingBytes / smoothSpeed;
+
+                            const timeText = document.getElementById('transfer-time');
+                            if (timeText) {
+                                timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                            }
+                        }
                     }
                 }
                 if (offset < currentData.length) {
@@ -504,23 +519,18 @@ export async function sendFileChunks() {
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
 
-        const finalTime = performance.now();
-        const totalSeconds = Math.max(0.001, (finalTime - transferStartTime) / 1000);
-        const averageSpeed = totalSent / totalSeconds;
-
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
 
         const speedText = document.getElementById('transfer-speed');
-        if (speedText) speedText.innerText = `${(averageSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+        if (speedText && smoothSpeed > 0) {
+            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+        }
 
-        const elapsedSeconds = Math.max(1, Math.floor(totalSeconds));
-        const minutes = Math.floor(elapsedSeconds / 60);
-        const seconds = elapsedSeconds % 60;
         const timeText = document.getElementById('transfer-time');
-        
-        if (timeText) timeText.innerText = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        if (timeText) timeText.innerText = '00:00';
+
         showToast('檔案已完全投遞！', 'success');
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
