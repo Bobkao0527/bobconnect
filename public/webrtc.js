@@ -347,6 +347,7 @@ export async function handleIncomingData(data) {
     } else {
         // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
         if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+        console.log('[RECV]', data.byteLength, state.receivedSize, '/', state.incomingFileInfo?.size);
 
         state.receivedSize += data.byteLength;
 
@@ -496,6 +497,7 @@ export async function sendFileChunks() {
         }
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
+        console.log('[FILE-END]', state.receivedSize, '/', state.incomingFileInfo?.size);
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
