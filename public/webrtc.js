@@ -445,14 +445,17 @@ export async function sendFileChunks() {
                     }
 
                     // 🚀【純事件驅動背壓】：高於高水位時等待 bufferedamountlow，搭配 50ms 輪詢防止死亡鎖定
+                    console.log('[SEND]', totalSent, '/', state.selectedFile.size, 'buffered=', state.dataChannel.bufferedAmount);
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
                         await new Promise((resolve) => {
+                            console.log('[BACKPRESSURE] 等待 bufferedAmount 降低:', state.dataChannel.bufferedAmount);
                             let checkInterval = null;
                             
                             const cleanup = () => {
                                 if (checkInterval) clearInterval(checkInterval);
                                 if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
                                 resolve();
+                                console.log('[BACKPRESSURE] 解除:', state.dataChannel?.bufferedAmount);
                             };
 
                             state.dataChannel.onbufferedamountlow = cleanup;
