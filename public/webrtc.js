@@ -379,10 +379,26 @@ export async function sendFileChunks() {
         while (offset < state.selectedFile.size) {
             if (state.dataChannel.bufferedAmount > 262144) {
                 await new Promise(resolve => {
-                    state.dataChannel.onbufferedamountlow = () => {
-                        state.dataChannel.onbufferedamountlow = null;
-                        resolve();
+                    let resolved = false;
+                    
+                    const cleanup = () => {
+                        if (!resolved) {
+                            resolved = true;
+                            state.dataChannel.onbufferedamountlow = null;
+                            clearInterval(checkInterval);
+                            resolve();
+                        }
                     };
+
+                    // 1. 事件監聽
+                    state.dataChannel.onbufferedamountlow = cleanup;
+
+                    // 2. 防死鎖輪詢（每 50ms 檢查一次）
+                    const checkInterval = setInterval(() => {
+                        if (state.dataChannel.bufferedAmount <= 131072) {
+                            cleanup();
+                        }
+                    }, 50);
                 });
             }
 
