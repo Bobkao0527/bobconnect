@@ -224,147 +224,85 @@ export function setupDataChannelListeners() {
     };
 }
 
+// 🚀 初始化 OPFS 寫入串流
+async function initOPFSStream(filename) {
+    try {
+        const root = await navigator.storage.getDirectory();
+        // 在沙盒硬碟建立暫存檔
+        state.opfsFileHandle = await root.getFileHandle(`temp_${Date.now()}_${filename}`, { create: true });
+        state.opfsWritable = await state.opfsFileHandle.createWritable();
+        console.log("[OPFS] 本機硬碟串流寫入通道已建立");
+    } catch (err) {
+        console.warn("[OPFS] 不支援或建立失敗，降級為傳統記憶體模式:", err);
+        state.opfsWritable = null;
+    }
+}
+
 // 處理接收資料流
-export function handleIncomingData(data) {
+export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
-            
-            if (message.type === 'device-info') {
-                state.remoteIsMobile = message.isMobile;
-                console.log(`[設備對齊] 對方是否為行動裝置: ${state.remoteIsMobile}`);
-                if (state.selectedFile) {
-                    evaluateFileRouting(state.selectedFile);
-                }
-                return;
-            }
-
-            if (message.type === 'file-r2-upload-start') {
-                state.incomingFileInfo = {
-                    name: message.name,
-                    size: message.size
-                };
-                document.getElementById('incoming-file-box').classList.remove('hidden');
-                document.getElementById('incoming-status-title').innerHTML = `
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse"></span>
-                    對方正將大檔案上傳至雲端通道...
-                `;
-                document.getElementById('recv-file-name').innerText = `[上傳中] ${state.incomingFileInfo.name}`;
-                document.getElementById('recv-percent').innerText = '0%';
-                document.getElementById('recv-progress-bar').style.width = '0%';
-                document.getElementById('recv-progress-bar').className = "bg-gradient-to-r from-indigo-500 to-purple-500 h-1";
-                document.getElementById('manual-download-container').classList.add('hidden');
-                return;
-            }
-
-            if (message.type === 'file-r2-upload-progress') {
-                const percent = message.percent;
-                document.getElementById('recv-percent').innerText = `對方已上傳 ${percent}%`;
-                document.getElementById('recv-progress-bar').style.width = `${percent}%`;
-                return;
-            }
-
-            if (message.type === 'file-r2-upload-cancel') {
-                document.getElementById('incoming-file-box').classList.add('hidden');
-                showToast('對方雲端上傳已中斷或取消。', 'error');
-                return;
-            }
 
             if (message.type === 'file-meta') {
-                state.incomingFileInfo = {
-                    name: message.name,
-                    size: message.size
-                };
+                state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receiveBuffer = [];
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
 
+                // 🚀 1. 收到檔案元資料時，啟動 OPFS 硬碟串流寫入器
+                await initOPFSStream(message.name);
+
                 document.getElementById('incoming-file-box').classList.remove('hidden');
-                document.getElementById('incoming-status-title').innerHTML = `
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                    正在接收檔案...
-                `;
                 document.getElementById('recv-file-name').innerText = state.incomingFileInfo.name;
                 document.getElementById('recv-percent').innerText = '0%';
                 document.getElementById('recv-progress-bar').style.width = '0%';
-                document.getElementById('recv-progress-bar').className = "bg-gradient-to-r from-emerald-500 to-teal-400 h-1";
-                document.getElementById('manual-download-container').classList.add('hidden');
             
             } else if (message.type === 'file-end') {
-                const blob = new Blob(state.receiveBuffer);
-                state.receiveBuffer = []; // 清空緩衝
-                
-                const url = URL.createObjectURL(blob);
-                triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
+                let downloadUrl = "";
 
-                const btnManual = document.getElementById('btn-manual-download');
-                if (btnManual) {
-                    btnManual.innerText = state.localIsMobile ? '📤 儲存 / 分享檔案' : '📥 手動下載檔案';
-                    btnManual.onclick = () => triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                }
-                document.getElementById('manual-download-container').classList.remove('hidden');
-
-                document.getElementById('recv-percent').innerText = '100% (已完成)';
-                document.getElementById('recv-progress-bar').style.width = '100%';
-                document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1 w-full";
-                showToast(`「${state.incomingFileInfo.name}」傳輸完成！`, 'success');
-                
-                setTimeout(() => {
-                    URL.revokeObjectURL(url);
-                }, 30000);
-            
-            } else if (message.type === 'file-r2') {
-                state.incomingFileInfo = {
-                    name: message.name,
-                    size: message.size
-                };
-
-                document.getElementById('incoming-file-box').classList.remove('hidden');
-
-                if (state.localIsMobile) {
-                    document.getElementById('incoming-status-title').innerHTML = `
-                        <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                        行動端直連下載就緒
-                    `;
-                    document.getElementById('recv-file-name').innerText = `[直連下載] ${state.incomingFileInfo.name}`;
-                    document.getElementById('recv-percent').innerText = '100% (已喚起瀏覽器原生下載)';
-                    document.getElementById('recv-progress-bar').style.width = '100%';
-                    document.getElementById('recv-progress-bar').className = "bg-emerald-500 h-1";
-
-                    triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-
-                    setTimeout(() => {
-                        destroyR2File(message.downloadUrl);
-                    }, 900000);
-
-                    const btnManual = document.getElementById('btn-manual-download');
-                    if (btnManual) {
-                        btnManual.innerText = '📤 儲存 / 分享檔案';
-                        btnManual.onclick = () => triggerAutoDownload(message.downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                    }
-                    document.getElementById('manual-download-container').classList.remove('hidden');
+                // 🚀 3. 傳輸完成：關閉硬碟串流並取出 File 檔案
+                if (state.opfsWritable) {
+                    await state.opfsWritable.close();
+                    state.opfsWritable = null;
                     
-                    showToast(`已成功喚起原生下載，檔案將於 15 分鐘後自動自雲端抹除。`, 'success');
-
+                    const file = await state.opfsFileHandle.getFile();
+                    downloadUrl = URL.createObjectURL(file);
                 } else {
-                    document.getElementById('incoming-status-title').innerHTML = `
-                        <span class="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping"></span>
-                        正在進行 R2 串流下載...
-                    `;
-                    document.getElementById('recv-file-name').innerText = `[R2 高速模式] ${state.incomingFileInfo.name}`;
-                    document.getElementById('recv-percent').innerText = '0%';
-                    document.getElementById('recv-progress-bar').style.width = '0%';
-                    document.getElementById('recv-progress-bar').className = "bg-blue-500 h-1";
-
-                    downloadAndCleanR2(message.downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
+                    // 降級退路：傳統記憶體組合
+                    const blob = new Blob(state.receiveBuffer);
+                    state.receiveBuffer = [];
+                    downloadUrl = URL.createObjectURL(blob);
                 }
+
+                // 喚起下載
+                triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
+
+                document.getElementById('recv-percent').innerText = '100% (已寫入硬碟完成)';
+                document.getElementById('recv-progress-bar').style.width = '100%';
+                showToast(`「${state.incomingFileInfo.name}」直連寫入完成！`, 'success');
+
+                // 記憶體清理與沙盒暫存檔清理
+                setTimeout(async () => {
+                    URL.revokeObjectURL(downloadUrl);
+                    if (state.opfsFileHandle) {
+                        await state.opfsFileHandle.remove().catch(() => {});
+                        state.opfsFileHandle = null;
+                    }
+                }, 60000);
             }
         } catch (e) {
             console.error(e);
         }
     } else {
-        // 標準 WebRTC 寫入
-        state.receiveBuffer.push(data);
+        // 🚀 2. 接收 ArrayBuffer 切片：直接非同步寫入本機硬碟，完全不佔用 JS Heap 記憶體
+        if (state.opfsWritable) {
+            // write() 接受 ArrayBuffer / ArrayBufferView
+            await state.opfsWritable.write(data);
+        } else {
+            state.receiveBuffer.push(data); // 降級備用
+        }
+
         state.receivedSize += data.byteLength;
 
         if (state.incomingFileInfo) {
@@ -379,40 +317,24 @@ export function handleIncomingData(data) {
     }
 }
 
-// 智慧分流引擎評估
+// 智慧分流引擎評估（測試模式：強制鎖死走 WebRTC P2P）
 export function evaluateFileRouting(file) {
-    const atLeastOneMobile = state.localIsMobile || state.remoteIsMobile;
-    const size512MB = 512 * 1024 * 1024;
-    const size9GB = 9 * 1024 * 1024 * 1024;
     const btnSend = document.getElementById('btn-send');
 
     if (!btnSend) return;
+    
+    // 確保發送按鈕保持啟用狀態
     btnSend.disabled = false;
     btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
 
-    if (atLeastOneMobile) {
-        if (file.size > size9GB) {
-            state.useR2 = false;
-            document.getElementById('progress-status').innerText = '大於 9GB 限額，無法發送';
-            document.getElementById('progress-bar').style.width = '0%';
-            btnSend.disabled = true;
-            btnSend.classList.add('opacity-40', 'cursor-not-allowed');
-            showToast('檔案大於 9GB，已安全封鎖。', 'error');
-        } else if (file.size > size512MB) {
-            state.useR2 = true;
-            document.getElementById('progress-status').innerText = '檔案超過 512MB，已自動套用 R2 模式';
-            document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-indigo-500 h-1 w-0 transition-all duration-75";
-            showToast('已啟用 R2 零內存下載防護！', 'success');
-        } else {
-            state.useR2 = false;
-            document.getElementById('progress-status').innerText = '隨時可以發送 (P2P 模式)';
-            document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
-        }
-    } else {
-        state.useR2 = false;
-        document.getElementById('progress-status').innerText = '雙端皆為電腦，啟用無限 P2P 高速傳輸';
-        document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
-    }
+    // 🚀【測試模式】：強制關閉 R2 雲端中轉，100% 走 WebRTC 直連
+    state.useR2 = false;
+
+    // 更新 UI 提示文字與進度條樣式
+    document.getElementById('progress-status').innerText = '隨時可以發送 (強制 WebRTC P2P 測試模式)';
+    document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
+    
+    showToast('已強制啟用 WebRTC P2P 直連傳輸（測試模式）', 'success');
 }
 
 // 發送端：決定並執行傳輸

@@ -5,6 +5,9 @@ export const state = {
     receiveBuffer: [],
     receivedSize: 0,
     incomingFileInfo: null,
+
+    opfsWritable: null,
+    opfsFileHandle: null,
     
     roomId: null,
     isHost: false,
