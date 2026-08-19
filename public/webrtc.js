@@ -416,12 +416,13 @@ export async function sendFileChunks() {
 
     const chunkSize = 65536; // 64KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
+    const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
 
     try {
         const reader = state.selectedFile.stream().getReader();
-        let leftover = null; // 🚀 用於暫存上一區塊未滿 64KB 的殘留部分 (固定 < 64KB)
+        let leftover = null;
 
         while (true) {
             const { done, value } = await reader.read();
@@ -429,7 +430,6 @@ export async function sendFileChunks() {
             if (value) {
                 let currentData = value;
 
-                // 若前一次有不足 64KB 的殘留區塊，僅在此時做輕量拼接
                 if (leftover && leftover.length > 0) {
                     const combined = new Uint8Array(leftover.length + value.length);
                     combined.set(leftover);
@@ -441,31 +441,48 @@ export async function sendFileChunks() {
                 let offset = 0;
                 while (offset + chunkSize <= currentData.length) {
                     if (state.dataChannel.readyState !== 'open') {
-                        throw new Error("傳輸途中 DataChannel 已關閉");
+                        throw new Error('傳輸途中 DataChannel 已關閉');
                     }
 
-                    // 🚀【純事件驅動背壓】：高於高水位時等待 bufferedamountlow，搭配 50ms 輪詢防止死亡鎖定
-                    console.log('[SEND]', totalSent, '/', state.selectedFile.size, 'buffered=', state.dataChannel.bufferedAmount);
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise((resolve) => {
-                            console.log('[BACKPRESSURE] 等待 bufferedAmount 降低:', state.dataChannel.bufferedAmount);
-                            let checkInterval = null;
-                            
+                        console.log('[BACKPRESSURE] 等待 bufferedAmount 降低:', state.dataChannel.bufferedAmount);
+
+                        await new Promise((resolve, reject) => {
+                            let finished = false;
+
                             const cleanup = () => {
-                                if (checkInterval) clearInterval(checkInterval);
+                                if (finished) return;
+                                finished = true;
+                                clearInterval(checkInterval);
                                 if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
                                 resolve();
-                                console.log('[BACKPRESSURE] 解除:', state.dataChannel?.bufferedAmount);
                             };
 
-                            state.dataChannel.onbufferedamountlow = cleanup;
+                            const checkInterval = setInterval(() => {
+                                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                                    cleanup();
+                                    return;
+                                }
 
-                            checkInterval = setInterval(() => {
-                                if (!state.dataChannel || state.dataChannel.bufferedAmount <= state.dataChannel.bufferedAmountLowThreshold) {
+                                if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                                     cleanup();
                                 }
                             }, 50);
+
+                            if (state.dataChannel) {
+                                state.dataChannel.onbufferedamountlow = () => {
+                                    if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
+                                        cleanup();
+                                    }
+                                };
+                            }
+
+                            if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                                cleanup();
+                            }
                         });
+
+                        console.log('[BACKPRESSURE] 解除:', state.dataChannel?.bufferedAmount);
                     }
 
                     const chunk = currentData.subarray(offset, offset + chunkSize);
@@ -473,7 +490,6 @@ export async function sendFileChunks() {
                     offset += chunkSize;
                     totalSent += chunkSize;
 
-                    // UI 渲染節流（100ms 更新一次）
                     const now = Date.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
                         lastUiUpdateTime = now;
@@ -483,15 +499,22 @@ export async function sendFileChunks() {
                     }
                 }
 
-                // 記錄未滿一個完整 chunkSize 的剩餘區塊
                 if (offset < currentData.length) {
                     leftover = currentData.subarray(offset);
                 }
             }
 
             if (done) {
-                // 清空尾巴最後剩餘的位元組
                 if (leftover && leftover.length > 0) {
+                    if (state.dataChannel.readyState !== 'open') {
+                        throw new Error('傳輸途中 DataChannel 已關閉');
+                    }
+
+                    while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+                        console.log('[BACKPRESSURE] 最後區塊等待:', state.dataChannel.bufferedAmount);
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
+
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
                 }
@@ -499,15 +522,19 @@ export async function sendFileChunks() {
             }
         }
 
+        while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
-        console.log('[FILE-END]', state.receivedSize, '/', state.incomingFileInfo?.size);
+
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
         showToast('檔案已完全投遞！', 'success');
 
     } catch (e) {
-        console.error("傳輸發生錯誤:", e);
+        console.error('傳輸發生錯誤:', e);
         showToast('傳輸中斷：' + e.message, 'error');
     } finally {
         if (btnSend) {
