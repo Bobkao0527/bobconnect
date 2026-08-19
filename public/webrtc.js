@@ -1,10 +1,34 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心
  * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
- * 🚀【更新】：在 dataChannel.onopen 時，完美導入並觸發 triggerAppleGlow 邊框流光。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
+
+let useOpfsWorker = false;
+let opfsWorkerInitPromise = null;
+let resolveOpfsWorkerInit = null;
+const opfsWorker = new Worker(new URL('./opfs-worker.js', import.meta.url), { type: 'module' });
+
+opfsWorker.onmessage = (e) => {
+    const { type, url, error } = e.data;
+
+    if (type === 'init-success') {
+        useOpfsWorker = true;
+        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
+    } 
+    else if (type === 'init-error') {
+        console.warn("[OPFS Worker] 建立失敗，降級為記憶體模式:", error);
+        useOpfsWorker = false;
+        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
+    } 
+    else if (type === 'complete') {
+        // Worker 寫入完成，觸發下載
+        triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
+        document.getElementById('recv-percent').innerText = '100% (完成)';
+        showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+    }
+};
 
 let localCandidates = [];
 // 🚀 批次寫入緩衝桶（避免 I/O 佇列爆滿）
@@ -273,87 +297,72 @@ export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
+
             if (message.type === 'file-meta') {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
-                batchBuffer = [];
-                currentBatchSize = 0;
-                state.receiveBuffer = []; // 清空記憶體陣列備用
-                opfsWriteChain = Promise.resolve(); // 🚀 重置寫入鏈，避免受前次傳輸殘留影響
+                state.receiveBuffer = []; // 記憶體降級備用陣列
 
-                await initOPFSStream(message.name);
+                // 重置 Worker 初始化 Promise
+                opfsWorkerInitPromise = new Promise((resolve) => {
+                    resolveOpfsWorkerInit = resolve;
+                });
+
+                // 通知 Worker 初始化沙盒硬碟
+                opfsWorker.postMessage({ type: 'init', filename: message.name });
+
+                // 更新 UI 介面
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
-                document.getElementById('recv-file-name').innerText = state.incomingFileInfo.name;
+                const recvFileName = document.getElementById('recv-file-name');
+                if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
+
             } else if (message.type === 'file-end') {
-                if (opfsInitPromise) await opfsInitPromise; // 🚀 確保 OPFS 初始化已結束
+                // 等待 Worker 初始化結果確定（確保最後一塊分流正確）
+                if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
 
-                let downloadUrl = "";
-
-                // 🚀 分流處理 OPFS 與 非 OPFS（記憶體模式）的結算
-                if (state.opfsWritable) {
-                    await opfsWriteChain;
-                    
-                    if (batchBuffer.length > 0) {
-                        const finalBlob = new Blob(batchBuffer);
-                        await state.opfsWritable.write(finalBlob);
-                        batchBuffer = [];
-                        currentBatchSize = 0;
-                    }
-
-                    await state.opfsWritable.close();
-                    state.opfsWritable = null;
-                    const file = await state.opfsFileHandle.getFile();
-                    downloadUrl = URL.createObjectURL(file);
+                if (useOpfsWorker) {
+                    // 通知 Worker 關閉檔案並合成下載 URL
+                    opfsWorker.postMessage({ type: 'close' });
                 } else {
-                    // 無 OPFS 支援時，從 state.receiveBuffer 直接合成 Blob
+                    // 降級模式：從記憶體陣列合成 Blob
                     const blob = new Blob(state.receiveBuffer);
-                    downloadUrl = URL.createObjectURL(blob);
+                    const downloadUrl = URL.createObjectURL(blob);
                     state.receiveBuffer = []; // 釋放記憶體
-                }
 
-                triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                document.getElementById('recv-percent').innerText = '100% (完成)';
-                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+                    triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
+                    document.getElementById('recv-percent').innerText = '100% (完成)';
+                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+                }
             }
         } catch (e) {
-            console.error(e);
+            console.error("解析控制訊息失敗:", e);
         }
     } else {
-        // 🚀 關鍵修復：當 binary chunk 到達時，若 OPFS 仍在初始化，必須 await 等待完成
-        if (opfsInitPromise) await opfsInitPromise;
+        // 確保收到第一個二進位 Chunk 前，Worker 的初始化狀態已確定
+        if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
 
-        // 接收二進位檔案 chunk
-        if (state.opfsWritable) {
-            batchBuffer.push(data);
-            currentBatchSize += data.byteLength;
-            state.receivedSize += data.byteLength;
+        state.receivedSize += data.byteLength;
 
-            if (currentBatchSize >= BATCH_THRESHOLD) {
-                const chunksToWrite = [...batchBuffer];
-                batchBuffer = [];
-                currentBatchSize = 0;
-
-                opfsWriteChain = opfsWriteChain.then(async () => {
-                    if (state.opfsWritable) {
-                        const combinedBlob = new Blob(chunksToWrite);
-                        await state.opfsWritable.write(combinedBlob);
-                    }
-                }).catch(err => console.error("[OPFS Write Error]:", err));
-            }
+        if (useOpfsWorker) {
+            // 🚀 零拷貝 (Transferable) 直接將 ArrayBuffer 轉移給 Worker 寫入硬碟
+            opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
         } else {
-            // 不支援 OPFS 時，將 chunk 存入記憶體陣列
+            // 降級模式：暫存於主線程記憶體
             state.receiveBuffer.push(data);
-            state.receivedSize += data.byteLength;
         }
 
+        // 🚀 完整的 UI 節流渲染 (100ms 更新一次或傳輸完成時)
         if (state.incomingFileInfo) {
             const now = Date.now();
             if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
                 state.lastRecvUiTime = now;
                 const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-                document.getElementById('recv-percent').innerText = `${percent}%`;
-                document.getElementById('recv-progress-bar').style.width = `${percent}%`;
+                
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = `${percent}%`;
+                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
             }
         }
     }
