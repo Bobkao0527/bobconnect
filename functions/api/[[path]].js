@@ -35,7 +35,17 @@ export async function onRequest(context) {
     return new Response(null, { headers: corsHeaders });
   }
 
-  // WebSocket DO 信令路由 (`/api/ws/:roomId`)
+  // 🚀 1. WebRTC DO 記憶體註冊與同 IP 搜尋 (轉交給 GLOBAL_REGISTRY DO 記憶體處理，不經由 KV)
+  if (path.startsWith("/room/") || path === "/rooms-by-ip") {
+    if (!env.SIGNAL_ROOM) {
+      return Response.json({ error: "SIGNAL_ROOM Durable Object Binding Missing" }, { status: 500, headers: corsHeaders });
+    }
+    const registryId = env.SIGNAL_ROOM.idFromName("GLOBAL_REGISTRY");
+    const registryDO = env.SIGNAL_ROOM.get(registryId);
+    return registryDO.fetch(request);
+  }
+
+  // 🚀 2. WebSocket DO 信令路由 (`/api/ws/:roomId`)
   if (path.startsWith("/ws/")) {
     const roomId = path.split("/")[2];
     if (!roomId) {
@@ -54,9 +64,6 @@ export async function onRequest(context) {
     return roomDO.fetch(request);
   }
 
-  globalThis.rooms = globalThis.rooms || new Map();
-
-  const kv = env.BC_KV;
   const r2 = env.BC_R2;
 
   const r2AccountId = env.R2_ACCOUNT_ID;
@@ -67,12 +74,7 @@ export async function onRequest(context) {
   const isDirectUploadConfigured = !!(r2AccountId && r2AccessKeyId && r2SecretAccessKey && r2BucketName);
 
   const UPLOAD_LIMIT = 900000;
-  let currentUploadCount = 0;
-
-  if (kv) {
-    const countVal = await kv.get("system:upload_count");
-    currentUploadCount = countVal ? parseInt(countVal, 10) : 0;
-  }
+  globalThis.uploadCount = globalThis.uploadCount || 0;
 
   const isR2UploadRoute = path.startsWith("/r2-multipart/init/") || 
                            path.startsWith("/r2-multipart/upload/") || 
@@ -80,7 +82,7 @@ export async function onRequest(context) {
                            path.startsWith("/r2-multipart/complete/") ||
                            (request.method === "PUT" && path.startsWith("/r2/"));
 
-  if (currentUploadCount >= UPLOAD_LIMIT && isR2UploadRoute) {
+  if (globalThis.uploadCount >= UPLOAD_LIMIT && isR2UploadRoute) {
     return new Response(
       JSON.stringify({
         error: "R2_LIMIT_EXCEEDED",
@@ -90,7 +92,7 @@ export async function onRequest(context) {
     );
   }
 
-  // --- R2 相關路由（保持原樣） ---
+  // --- R2 相關路由 (改為記憶體鎖，完全移除非必要的 KV 呼叫) ---
   if (request.method === "POST" && path.startsWith("/r2-multipart/init/")) {
     if (!r2) {
       return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -100,27 +102,16 @@ export async function onRequest(context) {
     const filename = decodeURIComponent(parts.slice(4).join("/"));
     const key = `r2:${roomId}:${filename}`;
 
-    if (kv) {
-      const currentLock = await kv.get("system:current_uploading_room");
-      if (currentLock && currentLock !== roomId) {
+    const now = Date.now();
+    if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId !== roomId) {
+      if (now - globalThis.currentUploadingRoom.timestamp < 10 * 60 * 1000) {
         return Response.json({
           error: "CONCURRENCY_LOCKED",
           message: "系統忙碌中：目前已有其他大檔案正在寫入雲端，請稍候。"
         }, { status: 409, headers: corsHeaders });
       }
-      await kv.put("system:current_uploading_room", roomId, { expirationTtl: 600 });
-    } else {
-      const now = Date.now();
-      if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId !== roomId) {
-        if (now - globalThis.currentUploadingRoom.timestamp < 10 * 60 * 1000) {
-          return Response.json({
-            error: "CONCURRENCY_LOCKED",
-            message: "系統忙碌中：目前已有其他大檔案正在寫入雲端，請稍候。"
-          }, { status: 409, headers: corsHeaders });
-        }
-      }
-      globalThis.currentUploadingRoom = { roomId, timestamp: now };
     }
+    globalThis.currentUploadingRoom = { roomId, timestamp: now };
 
     try {
       const multipart = await r2.createMultipartUpload(key, {
@@ -132,11 +123,7 @@ export async function onRequest(context) {
         directUpload: isDirectUploadConfigured
       }, { headers: corsHeaders });
     } catch (e) {
-      if (kv) {
-        await kv.delete("system:current_uploading_room");
-      } else {
-        globalThis.currentUploadingRoom = null;
-      }
+      globalThis.currentUploadingRoom = null;
       return Response.json({ error: e.message }, { status: 500, headers: corsHeaders });
     }
   }
@@ -221,19 +208,10 @@ export async function onRequest(context) {
       
       await multipart.complete(uploadedParts);
 
-      if (kv) {
-        const currentLock = await kv.get("system:current_uploading_room");
-        if (currentLock === roomId) {
-          await kv.delete("system:current_uploading_room");
-        }
-        
-        const freshCount = (await kv.get("system:upload_count").then(v => v ? parseInt(v, 10) : 0)) + uploadedParts.length;
-        await kv.put("system:upload_count", freshCount.toString());
-      } else {
-        if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId === roomId) {
-          globalThis.currentUploadingRoom = null;
-        }
+      if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId === roomId) {
+        globalThis.currentUploadingRoom = null;
       }
+      globalThis.uploadCount = (globalThis.uploadCount || 0) + uploadedParts.length;
 
       return Response.json({ success: true, message: "檔案合併完成" }, { headers: corsHeaders });
     } catch (e) {
@@ -276,121 +254,20 @@ export async function onRequest(context) {
       await r2.delete(key);
     }
 
-    if (kv) {
-      const currentLock = await kv.get("system:current_uploading_room");
-      if (currentLock === roomId) {
-        await kv.delete("system:current_uploading_room");
-      }
-    } else {
-      if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId === roomId) {
-        globalThis.currentUploadingRoom = null;
-      }
+    if (globalThis.currentUploadingRoom && globalThis.currentUploadingRoom.roomId === roomId) {
+      globalThis.currentUploadingRoom = null;
     }
 
     return Response.json({ success: true, message: "R2 檔案已抹除，併行鎖已釋放" }, { headers: corsHeaders });
   }
 
-  // --- WebRTC KV 輔助 1: POST /room/:roomId (專用於局域網 LAN 同 IP 搜尋註冊) ---
-  if (request.method === "POST" && path.startsWith("/room/")) {
-    const roomId = path.split("/")[2];
-    if (!roomId) return Response.json({ error: "Missing Room ID" }, { status: 400, headers: corsHeaders });
-
-    try {
-      const body = await request.json();
-      const now = Date.now();
-      const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-      const ipKey = getIpKey(request);
-
-      if (kv) {
-        const existingRaw = await kv.get(`room:${roomId}`);
-        const currentData = existingRaw ? JSON.parse(existingRaw) : {};
-        
-        const roomIp = currentData.ip || clientIp;
-        const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
-        
-        await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 60 });
-
-        if (body.offer) {
-          const existingIpRaw = await kv.get(ipKey);
-          let roomList = existingIpRaw ? JSON.parse(existingIpRaw) : [];
-          if (!roomList.includes(roomId)) {
-            roomList.push(roomId);
-          }
-          await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 60 });
-        }
-      }
-      return Response.json({ success: true }, { headers: corsHeaders });
-    } catch (e) {
-      return Response.json({ error: "Invalid JSON" }, { status: 400, headers: corsHeaders });
-    }
-  }
-
-  // --- WebRTC KV 輔助 2: DELETE /room/:roomId ---
-  if (request.method === "DELETE" && path.startsWith("/room/")) {
-    const roomId = path.split("/")[2];
-    if (kv) {
-      const roomRaw = await kv.get(`room:${roomId}`);
-      if (roomRaw) {
-        const roomData = JSON.parse(roomRaw);
-        const ip = roomData.ip;
-        if (ip) {
-          const ipKey = getIpKey(request);
-          const rawList = await kv.get(ipKey);
-          if (rawList) {
-            let roomList = JSON.parse(rawList);
-            roomList = roomList.filter(id => id !== roomId);
-            if (roomList.length > 0) {
-              await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 60 });
-            } else {
-              await kv.delete(ipKey);
-            }
-          }
-        }
-      }
-      await kv.delete(`room:${roomId}`);
-    }
-    return Response.json({ success: true }, { headers: corsHeaders });
-  }
-
-  // --- WebRTC KV 輔助 3: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
-  if (request.method === "GET" && path === "/rooms-by-ip") {
-    const ipKey = getIpKey(request);
-    const validRooms = [];
-    const now = Date.now();
-
-    if (kv) {
-      const rawList = await kv.get(ipKey);
-      const candidateIds = rawList ? JSON.parse(rawList) : [];
-      
-      for (const rId of candidateIds) {
-        const roomRaw = await kv.get(`room:${rId}`);
-        if (roomRaw) {
-          const roomData = JSON.parse(roomRaw);
-          if (roomData.offer && !roomData.answer && (now - roomData.timestamp < 60 * 1000)) {
-            validRooms.push(rId);
-          }
-        }
-      }
-
-      if (validRooms.length !== candidateIds.length) {
-        if (validRooms.length > 0) {
-          await kv.put(ipKey, JSON.stringify(validRooms), { expirationTtl: 60 });
-        } else {
-          await kv.delete(ipKey);
-        }
-      }
-    }
-
-    return Response.json({ rooms: validRooms }, { headers: corsHeaders });
-  }
-
   return Response.json({
     status: "active",
     message: "Bob WebRTC (Durable Object) & R2 Multi-part Server is running smoothly.",
-    kv: kv ? "CONNECTED" : "OFFLINE",
+    kv: "REMOVED (In-Memory DO Storage Active)",
     r2: r2 ? "CONNECTED" : "OFFLINE",
     directUpload: isDirectUploadConfigured,
-    uploadUsage: `${currentUploadCount} / ${UPLOAD_LIMIT}`
+    uploadUsage: `${globalThis.uploadCount || 0} / ${UPLOAD_LIMIT}`
   }, { headers: corsHeaders });
 }
 
