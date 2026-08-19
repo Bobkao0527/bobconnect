@@ -395,6 +395,28 @@ export async function sendFileChunks() {
     const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
+
+    // 🚀 傳輸速度 / ETA 計算，不介入任何傳輸流程
+    let lastSpeedTime = Date.now();
+    let lastSpeedBytes = 0;
+    let smoothSpeed = 0;
+
+    const formatTransferTime = (seconds) => {
+        if (!isFinite(seconds) || seconds <= 0) return '--:--';
+        seconds = Math.ceil(seconds);
+        if (seconds < 60) {
+            return `00:${String(seconds).padStart(2, '0')}`;
+        }
+        const minutes = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        if (minutes < 60) {
+            return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        }
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    };
+
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
@@ -429,7 +451,6 @@ export async function sendFileChunks() {
                                     cleanup();
                                     return;
                                 }
-
                                 if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                                     cleanup();
                                 }
@@ -445,7 +466,6 @@ export async function sendFileChunks() {
                                 cleanup();
                             }
                         });
-
                     }
                     const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
@@ -457,6 +477,35 @@ export async function sendFileChunks() {
                         const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
                         document.getElementById('progress-percent').innerText = `${percent}%`;
                         document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                        // 🚀 只在這裡計算速度與 ETA，不影響傳輸
+                        const speedElapsed = (now - lastSpeedTime) / 1000;
+                        if (speedElapsed > 0) {
+                            const bytesSinceLastUpdate = totalSent - lastSpeedBytes;
+                            const instantSpeed = bytesSinceLastUpdate / speedElapsed;
+
+                            if (smoothSpeed === 0) {
+                                smoothSpeed = instantSpeed;
+                            } else {
+                                smoothSpeed = smoothSpeed * 0.7 + instantSpeed * 0.3;
+                            }
+
+                            lastSpeedBytes = totalSent;
+                            lastSpeedTime = now;
+
+                            const speedText = document.getElementById('transfer-speed');
+                            const timeText = document.getElementById('transfer-time');
+
+                            if (speedText) {
+                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                            }
+
+                            if (timeText) {
+                                const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
+                                const etaSeconds = smoothSpeed > 0 ? remainingBytes / smoothSpeed : 0;
+                                timeText.innerText = percent >= 100 ? '00:00' : formatTransferTime(etaSeconds);
+                            }
+                        }
                     }
                 }
                 if (offset < currentData.length) {
@@ -484,6 +533,16 @@ export async function sendFileChunks() {
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
+
+        const speedText = document.getElementById('transfer-speed');
+        const timeText = document.getElementById('transfer-time');
+        if (speedText && smoothSpeed > 0) {
+            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+        }
+        if (timeText) {
+            timeText.innerText = '00:00';
+        }
+
         showToast('檔案已完全投遞！', 'success');
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
