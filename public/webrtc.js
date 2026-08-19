@@ -61,7 +61,6 @@ export async function initHost() {
         state.dataChannel.bufferedAmountLowThreshold = 131072;
         setupDataChannelListeners();
 
-        // 🚀 修改：若 WS 尚未開啟，先暫存 Candidate
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 const payload = {
@@ -77,7 +76,6 @@ export async function initHost() {
             }
         };
 
-        // 建立 DO WebSocket 信令連線
         connectSignalingWS();
 
         const offer = await state.peerConnection.createOffer();
@@ -189,7 +187,6 @@ export async function initJoinerWithRoom(roomId) {
             setupDataChannelListeners();
         };
 
-        // 🚀 修改：Joiner 端搜集 Candidate 時也做非同步安全暫存
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 const payload = {
@@ -398,59 +395,75 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 262144;
-    let offset = 0;
-    const startTime = Date.now();
+    const chunkSize = 65536; // 64KB
+    const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
+    let totalSent = 0;
     let lastUiUpdateTime = 0;
 
     try {
-        while (offset < state.selectedFile.size) {
-            if (state.dataChannel.readyState !== 'open') {
-                throw new Error("傳輸途中 DataChannel 已關閉");
+        // 使用 ReadableStream 讀取檔案，減少 slice 開銷與記憶體複製
+        const reader = state.selectedFile.stream().getReader();
+        let pendingBuffer = new Uint8Array(0);
+
+        while (true) {
+            const { done, value } = await reader.read();
+
+            if (value) {
+                // 合併新讀取的數據塊
+                const newBuffer = new Uint8Array(pendingBuffer.length + value.length);
+                newBuffer.set(pendingBuffer);
+                newBuffer.set(value, pendingBuffer.length);
+                pendingBuffer = newBuffer;
+
+                let offset = 0;
+                while (offset + chunkSize <= pendingBuffer.length) {
+                    if (state.dataChannel.readyState !== 'open') {
+                        throw new Error("傳輸途中 DataChannel 已關閉");
+                    }
+
+                    // 🚀【純事件驅動背壓】：高於高水位時等待 LowEvent，完全摒除 50ms 輪詢延遲
+                    if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+                        await new Promise((resolve) => {
+                            state.dataChannel.onbufferedamountlow = () => {
+                                state.dataChannel.onbufferedamountlow = null;
+                                resolve();
+                            };
+                        });
+                    }
+
+                    const chunk = pendingBuffer.subarray(offset, offset + chunkSize);
+                    state.dataChannel.send(chunk);
+                    offset += chunkSize;
+                    totalSent += chunkSize;
+
+                    // UI 渲染節流（100ms 更新一次）
+                    const now = Date.now();
+                    if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
+                        lastUiUpdateTime = now;
+                        const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
+                        document.getElementById('progress-percent').innerText = `${percent}%`;
+                        document.getElementById('progress-bar').style.width = `${percent}%`;
+                    }
+                }
+
+                // 保留未滿一個 chunkSize 的剩餘位元組
+                pendingBuffer = pendingBuffer.subarray(offset);
             }
 
-            if (state.dataChannel.bufferedAmount > 262144) {
-                await new Promise((resolve, reject) => {
-                    let resolved = false;
-                    const cleanup = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            state.dataChannel.onbufferedamountlow = null;
-                            clearInterval(checkInterval);
-                            resolve();
-                        }
-                    };
-
-                    state.dataChannel.onbufferedamountlow = cleanup;
-
-                    const checkInterval = setInterval(() => {
-                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                            clearInterval(checkInterval);
-                            reject(new Error("DataChannel 中斷連線"));
-                        } else if (state.dataChannel.bufferedAmount <= 131072) {
-                            cleanup();
-                        }
-                    }, 50);
-                });
-            }
-
-            const slice = state.selectedFile.slice(offset, offset + chunkSize);
-            const buffer = await slice.arrayBuffer();
-
-            state.dataChannel.send(buffer);
-            offset += buffer.byteLength;
-
-            const now = Date.now();
-            if (now - lastUiUpdateTime > 100 || offset >= state.selectedFile.size) {
-                lastUiUpdateTime = now;
-                const percent = Math.min(100, Math.round((offset / state.selectedFile.size) * 100));
-                document.getElementById('progress-percent').innerText = `${percent}%`;
-                document.getElementById('progress-bar').style.width = `${percent}%`;
+            if (done) {
+                // 清空尾巴剩餘位元組
+                if (pendingBuffer.length > 0) {
+                    state.dataChannel.send(pendingBuffer);
+                    totalSent += pendingBuffer.length;
+                }
+                break;
             }
         }
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
         document.getElementById('progress-status').innerText = '傳送完畢';
+        document.getElementById('progress-percent').innerText = '100%';
+        document.getElementById('progress-bar').style.width = '100%';
         showToast('檔案已完全投遞！', 'success');
 
     } catch (e) {
