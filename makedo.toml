@@ -1,0 +1,11 @@
+name = "bobconnect-do"
+main = "do-worker.js"
+compatibility_date = "2024-01-01"
+
+[[durable_objects.bindings]]
+name = "SIGNAL_ROOM"
+class_name = "SignalRoom"
+
+[[migrations]]
+tag = "v2" # 🚀 將 tag 改為 v2，強制 Cloudflare 套用新的 SQLite 規則
+new_sqlite_classes = ["SignalRoom"]
