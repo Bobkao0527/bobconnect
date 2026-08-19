@@ -1,7 +1,3 @@
-/**
- * state.js - 全域狀態管理中心
- * 集中管理 WebRTC、R2 傳輸、相機掃描等所有共享狀態，並提供底層公用配置，避免模組間的循環引用。
- */
 export const state = {
     peerConnection: null,
     dataChannel: null,
@@ -12,12 +8,14 @@ export const state = {
     
     roomId: null,
     isHost: false,
-    answerCheckInterval: null,
+
+    ws: null,
+    pendingOffer: null,
 
     // 局域網多端偵測過濾儲存槽
     nearbyRooms: [],
     
-    // 🚀 新增：前端探針取得之真實公網 IPv4
+    // 前端探針取得之真實公網 IPv4
     localIPv4: null,
 
     // 設備特徵識別 (智慧分流核心)
@@ -38,7 +36,6 @@ export const state = {
     }
 };
 
-// 將此設定移至底層 state.js，徹底切斷 webrtc.js ↔ r2.js 的循環依賴鏈
 export function getWorkerUrl() {
     return `${window.location.origin}/api`;
 }

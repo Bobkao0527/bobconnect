@@ -39,7 +39,6 @@ export async function destroyCloudRoom() {
 export async function initHost() {
     state.isHost = true;
     
-    // Room ID 升級為 6 位數純數字 PIN 碼！
     const numPin = Math.floor(100000 + Math.random() * 900000).toString();
     state.roomId = numPin;
 
@@ -61,40 +60,32 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 131072; // 128KB Low threshold
+        state.dataChannel.bufferedAmountLowThreshold = 131072;
         setupDataChannelListeners();
+
+        // 1. 建立 DO WebSocket 信令連線
+        connectSignalingWS();
 
         state.peerConnection.onicecandidate = async (event) => {
             if (!event.candidate) {
                 const offer = state.peerConnection.localDescription;
-                const workerUrl = getWorkerUrl();
                 
-                try {
-                    const headers = { 'Content-Type': 'application/json' };
-                    if (state.localIPv4) {
-                        headers['X-Client-IPv4'] = state.localIPv4;
-                    }
+                // 2. 向 KV 註冊以支援局域網自動偵測
+                registerRoomInKV(offer);
 
-                    const res = await fetch(`${workerUrl}/room/${state.roomId}`, {
-                        method: 'POST',
-                        headers: headers,
-                        body: JSON.stringify({ offer })
-                    });
-                    if (res.ok) {
-                        updateStatus('信令伺服器就緒，等候接入', 'yellow');
-                        startCheckingForAnswer();
-                    } else {
-                        throw new Error();
-                    }
-                } catch (err) {
-                    showToast('無法與信令伺服器同步', 'error');
+                // 3. 通過 DO WebSocket 發送 Offer 信令
+                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify({ type: 'offer', offer }));
+                    updateStatus('信令通道已就緒，等待連線...', 'yellow');
+                } else {
+                    state.pendingOffer = offer;
                 }
             }
         };
 
         const offer = await state.peerConnection.createOffer();
         await state.peerConnection.setLocalDescription(offer);
-        updateStatus('正在同步中轉服務...', 'yellow');
+        updateStatus('正在連接 DO 中轉服務...', 'yellow');
 
     } catch (e) {
         console.error(e);
@@ -102,33 +93,74 @@ export async function initHost() {
     }
 }
 
-// 輪詢檢查接收端 Answer
-export function startCheckingForAnswer() {
-    if (state.answerCheckInterval) clearInterval(state.answerCheckInterval);
+//建立 Durable Object WebSocket 信令轉發通道
+function connectSignalingWS() {
     const workerUrl = getWorkerUrl();
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = workerUrl.replace(/^http/, 'ws') + `/ws/${state.roomId}`;
 
-    state.answerCheckInterval = setInterval(async () => {
-        try {
-            const headers = {};
-            if (state.localIPv4) {
-                headers['X-Client-IPv4'] = state.localIPv4;
-            }
+    state.ws = new WebSocket(wsUrl);
 
-            const res = await fetch(`${workerUrl}/room/${state.roomId}`, { headers });
-            if (res.ok) {
-                const data = await res.json();
-                if (data && data.answer) {
-                    clearInterval(state.answerCheckInterval);
-                    state.answerCheckInterval = null;
-                    
-                    await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-                    showToast('成功對齊傳輸描述，建立直連中！', 'success');
-                }
-            }
-        } catch (e) {
-            console.error(e);
+    state.ws.onopen = () => {
+        console.log("[DO 信令] WebSocket 已成功開通！");
+        if (state.pendingOffer) {
+            state.ws.send(JSON.stringify({ type: 'offer', offer: state.pendingOffer }));
+            state.pendingOffer = null;
+            updateStatus('信令通道已就緒，等待連線...', 'yellow');
         }
-    }, 1500);
+    };
+
+    state.ws.onmessage = async (event) => {
+        try {
+            const data = JSON.parse(event.data);
+
+            // Joiner 接收 Host 發送的 Offer
+            if (data.type === 'offer' && !state.isHost) {
+                updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
+                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await state.peerConnection.createAnswer();
+                await state.peerConnection.setLocalDescription(answer);
+
+                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify({ type: 'answer', answer }));
+                }
+            } 
+            // Host 接收 Joiner 發送的 Answer
+            else if (data.type === 'answer' && state.isHost) {
+                updateStatus('成功對齊傳輸描述，建立直連中！', 'yellow');
+                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                showToast('對齊成功，極速握手中...', 'success');
+            }
+        } catch (err) {
+            console.error("[DO WebSocket 訊息解析失敗]:", err);
+        }
+    };
+
+    state.ws.onerror = (err) => {
+        console.error("[DO WebSocket 錯誤]:", err);
+    };
+
+    state.ws.onclose = () => {
+        console.log("[DO WebSocket] 信令連線已關閉（已移交 P2P 直連）。");
+    };
+}
+
+//同步向 KV 註冊房間（供 WiFi 局域網同 IP 靜默自動掃描使用）
+async function registerRoomInKV(offer) {
+    const workerUrl = getWorkerUrl();
+    try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (state.localIPv4) {
+            headers['X-Client-IPv4'] = state.localIPv4;
+        }
+        await fetch(`${workerUrl}/room/${state.roomId}`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({ offer })
+        });
+    } catch (err) {
+        console.warn("KV 索引註冊失敗（不影響 DO 信令傳輸）:", err);
+    }
 }
 
 // 接收端：自動對接
@@ -136,21 +168,9 @@ export async function initJoinerWithRoom() {
     document.getElementById('setup-view').classList.add('hidden');
     document.getElementById('signaling-box').classList.remove('hidden');
     document.getElementById('joiner-panel').classList.remove('hidden');
-    updateStatus('正在提取信令鑰匙...', 'yellow');
-
-    const workerUrl = getWorkerUrl();
+    updateStatus('正在連接 DO 信令房間...', 'yellow');
 
     try {
-        const headers = {};
-        if (state.localIPv4) {
-            headers['X-Client-IPv4'] = state.localIPv4;
-        }
-
-        const res = await fetch(`${workerUrl}/room/${state.roomId}`, { headers });
-        if (!res.ok) throw new Error('提取信令失敗');
-        const data = await res.json();
-        if (!data || !data.offer) throw new Error('連線可能超時或失效，請發起端重新產生');
-
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.peerConnection.ondatachannel = (event) => {
@@ -159,32 +179,8 @@ export async function initJoinerWithRoom() {
             setupDataChannelListeners();
         };
 
-        state.peerConnection.onicecandidate = async (event) => {
-            if (!event.candidate) {
-                const answer = state.peerConnection.localDescription;
-                try {
-                    const postHeaders = { 'Content-Type': 'application/json' };
-                    if (state.localIPv4) {
-                        postHeaders['X-Client-IPv4'] = state.localIPv4;
-                    }
-
-                    const postRes = await fetch(`${workerUrl}/room/${state.roomId}`, {
-                        method: 'POST',
-                        headers: postHeaders,
-                        body: JSON.stringify({ answer })
-                    });
-                    if (postRes.ok) {
-                        updateStatus('密鑰交換完畢，等待通道開放', 'yellow');
-                    }
-                } catch (err) {
-                    showToast('回應金鑰失敗', 'error');
-                }
-            }
-        };
-
-        await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-        const answer = await state.peerConnection.createAnswer();
-        await state.peerConnection.setLocalDescription(answer);
+        // 直接連接 DO WebSocket，進入房間接收 Host 推播的 Offer
+        connectSignalingWS();
 
     } catch (e) {
         showToast(e.message, 'error');
@@ -198,7 +194,6 @@ export function setupDataChannelListeners() {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
         
-        // 🚀【炫酷體驗】：在 WebRTC 通道正式連通的瞬間，在裝置螢幕邊緣亮起 Apple Intelligence 流光！
         triggerAppleGlow();
 
         state.dataChannel.send(JSON.stringify({
@@ -206,6 +201,7 @@ export function setupDataChannelListeners() {
             isMobile: state.localIsMobile
         }));
 
+        // 🚀【關鍵】：P2P 建立完成後立即關閉 DO WebSocket 與雲端信令
         destroyCloudRoom();
 
         document.getElementById('setup-view').classList.add('hidden');

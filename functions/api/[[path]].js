@@ -2,7 +2,71 @@
 // 支援 R2 直連 S3 預簽名金鑰 (Presigned URLs) 與高併發直連機制，並防呆降級至 ArrayBuffer 優化代理模式
 // 檔名functions/api/[[path]].js
 
-// 智慧 IP 區段提取器（支援 X-Client-IPv4 優先原則）
+// Durable Object 信令房間類別 (SignalRoom)
+export class SignalRoom {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.sockets = new Set();
+    this.offer = null;
+  }
+
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("Expected WebSocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    server.accept();
+    this.sockets.add(server);
+
+    // 若 Host 先前已發送過 Offer，Joiner 剛連上線時立刻推播
+    if (this.offer) {
+      server.send(JSON.stringify({ type: "offer", offer: this.offer }));
+    }
+
+    server.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "offer") {
+          this.offer = data.offer;
+          this.broadcast(server, data);
+        } else if (data.type === "answer" || data.type === "candidate") {
+          this.broadcast(server, data);
+        }
+      } catch (e) {
+        console.error("[DO Message Error]", e);
+      }
+    });
+
+    const cleanup = () => {
+      this.sockets.delete(server);
+      // 當所有成員皆斷開連線（握手完成），自動清空暫存供垃圾回收
+      if (this.sockets.size === 0) {
+        this.offer = null;
+      }
+    };
+
+    server.addEventListener("close", cleanup);
+    server.addEventListener("error", cleanup);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // 廣播給房間內的其他成員
+  broadcast(sender, data) {
+    const msg = JSON.stringify(data);
+    for (const socket of this.sockets) {
+      if (socket !== sender && socket.readyState === 1) { // 1 = OPEN
+        socket.send(msg);
+      }
+    }
+  }
+}
+
+// 智慧 IP 區段提取器
 function getIpKey(request) {
   const clientIpv4 = request.headers.get("X-Client-IPv4");
   if (clientIpv4) {
@@ -33,6 +97,25 @@ export async function onRequest(context) {
 
   if (request.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
+  }
+
+  // WebSocket DO 信令路由 (`/api/ws/:roomId`)
+  if (path.startsWith("/ws/")) {
+    const roomId = path.split("/")[2];
+    if (!roomId) {
+      return new Response("Missing Room ID", { status: 400, headers: corsHeaders });
+    }
+
+    if (!env.SIGNAL_ROOM) {
+      return new Response(
+        JSON.stringify({ error: "SIGNAL_ROOM Durable Object Binding Missing" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    const id = env.SIGNAL_ROOM.idFromName(roomId);
+    const roomDO = env.SIGNAL_ROOM.get(id);
+    return roomDO.fetch(request);
   }
 
   globalThis.rooms = globalThis.rooms || new Map();
@@ -71,7 +154,7 @@ export async function onRequest(context) {
     );
   }
 
-  // --- R2.1: 初始化多分塊上傳 ---
+  // --- R2 相關路由（保持原樣） ---
   if (request.method === "POST" && path.startsWith("/r2-multipart/init/")) {
     if (!r2) {
       return Response.json({ error: "R2 綁定遺失" }, { status: 500, headers: corsHeaders });
@@ -271,7 +354,7 @@ export async function onRequest(context) {
     return Response.json({ success: true, message: "R2 檔案已抹除，併行鎖已釋放" }, { headers: corsHeaders });
   }
 
-  // --- WebRTC 1: POST /room/:roomId (交換 Offer/Answer) ---
+  // --- WebRTC KV 輔助 1: POST /room/:roomId (專用於局域網 LAN 同 IP 搜尋註冊) ---
   if (request.method === "POST" && path.startsWith("/room/")) {
     const roomId = path.split("/")[2];
     if (!roomId) return Response.json({ error: "Missing Room ID" }, { status: 400, headers: corsHeaders });
@@ -289,24 +372,16 @@ export async function onRequest(context) {
         const roomIp = currentData.ip || clientIp;
         const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
         
-        // 🚀【60秒過期安全機制】：將 KV 生存期從 10 分鐘 (600s) 縮短至 60 秒！
         await kv.put(`room:${roomId}`, JSON.stringify(updatedData), { expirationTtl: 60 });
 
-        // 如果是 Host 發起端，同步將此房號追加註冊到該 IP 的待選索引列表中
         if (body.offer) {
           const existingIpRaw = await kv.get(ipKey);
           let roomList = existingIpRaw ? JSON.parse(existingIpRaw) : [];
           if (!roomList.includes(roomId)) {
             roomList.push(roomId);
           }
-          // 🚀【60秒過期安全機制】：IP 索引儲存也縮短至 60 秒
           await kv.put(ipKey, JSON.stringify(roomList), { expirationTtl: 60 });
         }
-      } else {
-        const currentData = globalThis.rooms.get(roomId) || {};
-        const roomIp = currentData.ip || clientIp;
-        const updatedData = { ...currentData, ...body, ip: roomIp, timestamp: now };
-        globalThis.rooms.set(roomId, updatedData);
       }
       return Response.json({ success: true }, { headers: corsHeaders });
     } catch (e) {
@@ -314,20 +389,7 @@ export async function onRequest(context) {
     }
   }
 
-  // --- WebRTC 2: GET /room/:roomId ---
-  if (request.method === "GET" && path.startsWith("/room/")) {
-    const roomId = path.split("/")[2];
-    let data = null;
-    if (kv) {
-      const rawData = await kv.get(`room:${roomId}`);
-      data = rawData ? JSON.parse(rawData) : null;
-    } else {
-      data = globalThis.rooms.get(roomId) || null;
-    }
-    return Response.json(data, { headers: corsHeaders });
-  }
-
-  // --- WebRTC 3: DELETE /room/:roomId ---
+  // --- WebRTC KV 輔助 2: DELETE /room/:roomId ---
   if (request.method === "DELETE" && path.startsWith("/room/")) {
     const roomId = path.split("/")[2];
     if (kv) {
@@ -350,13 +412,11 @@ export async function onRequest(context) {
         }
       }
       await kv.delete(`room:${roomId}`);
-    } else {
-      globalThis.rooms.delete(roomId);
     }
     return Response.json({ success: true }, { headers: corsHeaders });
   }
 
-  // --- WebRTC 4: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
+  // --- WebRTC KV 輔助 3: GET /rooms-by-ip (局域網 WiFi 自動搜尋入口) ---
   if (request.method === "GET" && path === "/rooms-by-ip") {
     const ipKey = getIpKey(request);
     const validRooms = [];
@@ -370,7 +430,6 @@ export async function onRequest(context) {
         const roomRaw = await kv.get(`room:${rId}`);
         if (roomRaw) {
           const roomData = JSON.parse(roomRaw);
-          // 🚀【60秒過期安全機制】：篩選時僅保留 60 秒內 (60,000 毫秒) 創立的房間
           if (roomData.offer && !roomData.answer && (now - roomData.timestamp < 60 * 1000)) {
             validRooms.push(rId);
           }
@@ -384,19 +443,6 @@ export async function onRequest(context) {
           await kv.delete(ipKey);
         }
       }
-    } else {
-      // 記憶體備用模式
-      for (const [rId, roomData] of globalThis.rooms.entries()) {
-        // 🚀【60秒過期安全機制】：清理記憶體中超過 60 秒的房間
-        if (now - roomData.timestamp > 60 * 1000) {
-          globalThis.rooms.delete(rId);
-          continue;
-        }
-        const registeredIpKey = getIpKey(request);
-        if (registeredIpKey === ipKey && roomData.offer && !roomData.answer) {
-          validRooms.push(rId);
-        }
-      }
     }
 
     return Response.json({ rooms: validRooms }, { headers: corsHeaders });
@@ -404,7 +450,7 @@ export async function onRequest(context) {
 
   return Response.json({
     status: "active",
-    message: "Bob WebRTC & R2 Multi-part Server is running smoothly (Pages Functions).",
+    message: "Bob WebRTC (Durable Object) & R2 Multi-part Server is running smoothly.",
     kv: kv ? "CONNECTED" : "OFFLINE",
     r2: r2 ? "CONNECTED" : "OFFLINE",
     directUpload: isDirectUploadConfigured,
@@ -412,7 +458,7 @@ export async function onRequest(context) {
   }, { headers: corsHeaders });
 }
 
-// --- 🔒 Web Crypto API HMAC-SHA256 簽名輔助函式 ---
+// SHA-256 / HMAC 輔助函式與 R2 S3 預簽名 URL 生成器（保持原樣）
 async function hmac(key, data) {
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
@@ -434,7 +480,6 @@ async function sha256(data) {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
-// --- 🌐 R2 S3 預簽名 URL 生成器 ---
 function encodeCanonicalUri(path) {
   return path.split('/').map((segment, idx) => {
     if (idx === 0) return '';
