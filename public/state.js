@@ -21,10 +21,9 @@ export const state = {
     // 前端探針取得之真實公網 IPv4
     localIPv4: null,
 
-    // 設備特徵識別 (智慧分流核心)
+    // 設備特徵識別
     localIsMobile: /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent),
-    remoteIsMobile: false, 
-    useR2: false,
+    remoteIsMobile: false,
 
     // 相機與 UI 更新節流計時器
     videoStream: null,

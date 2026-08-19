@@ -1,45 +1,69 @@
-// do-worker.js
+// do-worker.js (免 Storage 費用，純 WebSocket Attachment 記憶體架構)
 export class SignalRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.offer = null;
-    // 🚀【DO 記憶體】用於 GLOBAL_REGISTRY 儲存活躍房間 { offer, ipKey, timestamp }
-    this.rooms = new Map();
   }
 
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/^\/api/, "") || "/";
 
-    // 🚀 1. 如果是區域網 IP 註冊與配對請求，直接由 DO 記憶體處理
-    if (path.startsWith("/room/") || path === "/rooms-by-ip") {
+    if (path === "/rooms-by-ip") {
       return this.handleRegistry(request, path);
     }
 
-    // 🚀 2. 原有 WebSocket 信令邏輯
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("Expected WebSocket", { status: 426 });
     }
 
+    const roomId = path.split("/")[2];
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // 改用休眠 API：當客戶端連線掛著時，DO 會自動休眠而不消耗 GB-sec
     this.state.acceptWebSocket(server);
 
-    if (this.offer) {
-      server.send(JSON.stringify({ type: "offer", offer: this.offer }));
+    if (roomId) {
+      server.serializeAttachment({ roomId });
+
+      // 🚀 Joiner 加入時，推播 Host 的 Offer + 所有備份的 Candidates
+      for (const socket of this.state.getWebSockets()) {
+        if (socket !== server && socket.readyState === 1) {
+          try {
+            const meta = socket.deserializeAttachment();
+            if (meta && meta.roomId === roomId && meta.offer) {
+              // 發送 Offer
+              server.send(JSON.stringify({
+                type: "offer",
+                offer: meta.offer,
+                roomId: roomId
+              }));
+
+              // 🚀 補發所有快取在 Attachment 裡的 Candidates
+              if (Array.isArray(meta.candidates)) {
+                for (const cand of meta.candidates) {
+                  server.send(JSON.stringify({
+                    type: "candidate",
+                    candidate: cand,
+                    roomId: roomId
+                  }));
+                }
+              }
+              break;
+            }
+          } catch (e) {}
+        }
+      }
     }
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // 🚀【新增】DO 記憶體區域網房間註冊/查詢處理器 (取代 KV)
+  // 🚀 核心：利用 WebSocket Attachment 在休眠喚醒時即時還原活躍房間列表
   async handleRegistry(request, path) {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4",
     };
 
@@ -59,63 +83,64 @@ export class SignalRoom {
     };
 
     const ipKey = getIpKey(request);
-    const now = Date.now();
-
-    // 自動清理超過 60 秒的舊房間（記憶體即時清掃）
-    for (const [id, room] of this.rooms.entries()) {
-      if (now - room.timestamp > 60000) {
-        this.rooms.delete(id);
-      }
-    }
-
-    // POST /room/:roomId (建立/更新房間)
-    if (request.method === "POST" && path.startsWith("/room/")) {
-      const roomId = path.split("/")[2];
-      if (!roomId) return Response.json({ error: "Missing Room ID" }, { status: 400, headers: corsHeaders });
-      try {
-        const body = await request.json();
-        this.rooms.set(roomId, {
-          offer: body.offer,
-          ipKey: ipKey,
-          timestamp: now
-        });
-        return Response.json({ success: true }, { headers: corsHeaders });
-      } catch (e) {
-        return Response.json({ error: "Invalid JSON" }, { status: 400, headers: corsHeaders });
-      }
-    }
-
-    // DELETE /room/:roomId (銷毀房間)
-    if (request.method === "DELETE" && path.startsWith("/room/")) {
-      const roomId = path.split("/")[2];
-      if (roomId) {
-        this.rooms.delete(roomId);
-      }
-      return Response.json({ success: true }, { headers: corsHeaders });
-    }
 
     // GET /rooms-by-ip (搜尋同 IP 房間)
     if (request.method === "GET" && path === "/rooms-by-ip") {
       const validRooms = [];
-      for (const [id, room] of this.rooms.entries()) {
-        if (room.ipKey === ipKey && room.offer && (now - room.timestamp < 60000)) {
-          validRooms.push(id);
+      
+      // 遍歷所有『目前仍活著』的 WebSocket 連線
+      for (const ws of this.state.getWebSockets()) {
+        try {
+          if (ws.readyState === 1) {
+            const roomMeta = ws.deserializeAttachment();
+            if (roomMeta && roomMeta.ipKey === ipKey && roomMeta.roomId) {
+              validRooms.push(roomMeta.roomId);
+            }
+          }
+        } catch (e) {
+          // 忽略未綁定 attachment 的普通連線
         }
       }
       return Response.json({ rooms: validRooms }, { headers: corsHeaders });
     }
-
     return new Response("Not Found", { status: 404, headers: corsHeaders });
   }
 
-  // 🚀 Hibernation API 專用訊息事件處理器
+  // 🚀 Hibernation API 訊息事件處理器
   async webSocketMessage(ws, message) {
     try {
       const data = JSON.parse(message);
+      
       if (data.type === "offer") {
-        this.offer = data.offer;
+        const ipKey = data.ipKey || "ipv4:127.0.0.1";
+        const roomId = data.roomId;
+        
+        if (roomId) {
+          const existingMeta = ws.deserializeAttachment() || {};
+          ws.serializeAttachment({
+            ...existingMeta,
+            roomId: roomId,
+            ipKey: ipKey,
+            offer: data.offer,
+            candidates: existingMeta.candidates || [], // 保留或初始化 candidates 陣列
+            timestamp: Date.now()
+          });
+        }
+
         this.broadcast(ws, data);
-      } else if (data.type === "answer" || data.type === "candidate") {
+      } else if (data.type === "candidate") {
+        // 🚀 將接收到的 Candidate 寫入該 WebSocket 的 Attachment 快取中
+        try {
+          const meta = ws.deserializeAttachment() || {};
+          if (meta.roomId) {
+            meta.candidates = meta.candidates || [];
+            meta.candidates.push(data.candidate);
+            ws.serializeAttachment(meta);
+          }
+        } catch (e) {}
+
+        this.broadcast(ws, data);
+      } else if (data.type === "answer") {
         this.broadcast(ws, data);
       }
     } catch (e) {
@@ -123,15 +148,27 @@ export class SignalRoom {
     }
   }
 
+  // 🚀 當客戶端斷線時，通知同房間對端
   async webSocketClose(ws, code, reason, wasClean) {
-    ws.close(code, "Closed");
+    try {
+      const meta = ws.deserializeAttachment();
+      if (meta && meta.roomId) {
+        this.broadcast(ws, { type: "peer-disconnected", roomId: meta.roomId });
+      }
+    } catch (e) {}
   }
 
   broadcast(sender, data) {
+    const senderMeta = sender.deserializeAttachment();
+    const targetRoomId = data.roomId || (senderMeta ? senderMeta.roomId : null);
     const msg = JSON.stringify(data);
+
     for (const socket of this.state.getWebSockets()) {
       if (socket !== sender && socket.readyState === 1) {
-        socket.send(msg);
+        const socketMeta = socket.deserializeAttachment();
+        if (targetRoomId && socketMeta && socketMeta.roomId === targetRoomId) {
+          socket.send(msg);
+        }
       }
     }
   }

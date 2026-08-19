@@ -11,6 +11,7 @@ import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPi
 
 // 全域暴露機制
 window.initHost = initHost;
+window.initJoinerWithRoom = initJoinerWithRoom;
 window.startJoinerScanner = startScanner;
 window.stopScanner = stopScanner;
 window.openPairingModal = openPairingModal;
@@ -22,7 +23,7 @@ window.hideToast = hideToast;
 window.addEventListener('DOMContentLoaded', async () => {
     checkInAppBrowser(); // 檢查內嵌瀏覽器防暴走
     
-    // 🚀【強製 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配
+    // 🚀【強制 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配
     // await 探針以確保下一步自動探測時能夾帶最穩定的 IP 金鑰
     await probeIPv4();
 
