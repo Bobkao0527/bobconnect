@@ -9,3 +9,5 @@ class_name = "SignalRoom"
 [[migrations]]
 tag = "v2" # 🚀 將 tag 改為 v2，強制 Cloudflare 套用新的 SQLite 規則
 new_sqlite_classes = ["SignalRoom"]
+
+#部署指令 npx wrangler deploy -c makedo.toml
