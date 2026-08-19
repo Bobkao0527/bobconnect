@@ -27,16 +27,21 @@ opfsWorker.onmessage = (e) => {
         triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
         document.getElementById('recv-percent').innerText = '100% (完成)';
         showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+
+        // 🚀 自動下載後延遲釋放 Blob URL，防止記憶體洩漏
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+    }
+    else if (type === 'error') {
+        console.error("[OPFS Worker 錯誤]:", error);
+        showToast(error, 'error');
     }
 };
 
 let localCandidates = [];
 // 🚀 批次寫入緩衝桶（避免 I/O 佇列爆滿）
-let batchBuffer = [];
 let currentBatchSize = 0;
 const BATCH_THRESHOLD = 4 * 1024 * 1024; // 累積滿 4MB 才寫一次硬碟
 let pendingCandidates = [];
-let opfsWriteChain = Promise.resolve();
 let opfsInitPromise = null;
 
 // 非阻塞式背景 IPv4 探針
@@ -275,23 +280,6 @@ export function setupDataChannelListeners() {
     };
 }
 
-// 🚀 初始化 OPFS 寫入串流
-async function initOPFSStream(filename) {
-    opfsInitPromise = (async () => {
-        try {
-            const root = await navigator.storage.getDirectory();
-            // 在沙盒硬碟建立暫存檔
-            state.opfsFileHandle = await root.getFileHandle(`temp_${Date.now()}_${filename}`, { create: true });
-            state.opfsWritable = await state.opfsFileHandle.createWritable();
-            console.log("[OPFS] 本機硬碟串流寫入通道已建立");
-        } catch (err) {
-            console.warn("[OPFS] 不支援或建立失敗，降級為傳統記憶體模式:", err);
-            state.opfsWritable = null;
-        }
-    })();
-    await opfsInitPromise;
-}
-
 // 處理接收資料流
 export async function handleIncomingData(data) {
     if (typeof data === 'string') {
@@ -299,6 +287,7 @@ export async function handleIncomingData(data) {
             const message = JSON.parse(data);
 
             if (message.type === 'file-meta') {
+                useOpfsWorker = false; // 🚀 重置狀態，防止連續傳輸檔案時狀態錯亂
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
@@ -328,11 +317,14 @@ export async function handleIncomingData(data) {
                     // 降級模式：從記憶體陣列合成 Blob
                     const blob = new Blob(state.receiveBuffer);
                     const downloadUrl = URL.createObjectURL(blob);
-                    state.receiveBuffer = []; // 釋放記憶體
+                    state.receiveBuffer = []; // 釋放記憶體陣列
 
                     triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
                     document.getElementById('recv-percent').innerText = '100% (完成)';
                     showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+
+                    // 🚀 記憶體降級模式同樣延遲釋放 URL
+                    setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
                 }
             }
         } catch (e) {
@@ -352,7 +344,7 @@ export async function handleIncomingData(data) {
             state.receiveBuffer.push(data);
         }
 
-        // 🚀 完整的 UI 節流渲染 (100ms 更新一次或傳輸完成時)
+        // UI 節流渲染 (100ms 更新一次或傳輸完成時)
         if (state.incomingFileInfo) {
             const now = Date.now();
             if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
@@ -410,27 +402,31 @@ export async function sendFileChunks() {
     let lastUiUpdateTime = 0;
 
     try {
-        // 使用 ReadableStream 讀取檔案，減少 slice 開銷與記憶體複製
         const reader = state.selectedFile.stream().getReader();
-        let pendingBuffer = new Uint8Array(0);
+        let leftover = null; // 🚀 用於暫存上一區塊未滿 64KB 的殘留部分 (固定 < 64KB)
 
         while (true) {
             const { done, value } = await reader.read();
 
             if (value) {
-                // 合併新讀取的數據塊
-                const newBuffer = new Uint8Array(pendingBuffer.length + value.length);
-                newBuffer.set(pendingBuffer);
-                newBuffer.set(value, pendingBuffer.length);
-                pendingBuffer = newBuffer;
+                let currentData = value;
+
+                // 若前一次有不足 64KB 的殘留區塊，僅在此時做輕量拼接
+                if (leftover && leftover.length > 0) {
+                    const combined = new Uint8Array(leftover.length + value.length);
+                    combined.set(leftover);
+                    combined.set(value, leftover.length);
+                    currentData = combined;
+                    leftover = null;
+                }
 
                 let offset = 0;
-                while (offset + chunkSize <= pendingBuffer.length) {
+                while (offset + chunkSize <= currentData.length) {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error("傳輸途中 DataChannel 已關閉");
                     }
 
-                    // 🚀【純事件驅動背壓】：高於高水位時等待 LowEvent，完全摒除 50ms 輪詢延遲
+                    // 🚀【純事件驅動背壓】：高於高水位時等待 bufferedamountlow，搭配 50ms 輪詢防止死亡鎖定
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
                         await new Promise((resolve) => {
                             let checkInterval = null;
@@ -441,10 +437,8 @@ export async function sendFileChunks() {
                                 resolve();
                             };
 
-                            // 事件監聽
                             state.dataChannel.onbufferedamountlow = cleanup;
 
-                            // 🚀 雙重保障：加上 50ms 輪詢檢查，防止 Safari 未觸發 onbufferedamountlow 造成死鎖
                             checkInterval = setInterval(() => {
                                 if (!state.dataChannel || state.dataChannel.bufferedAmount <= state.dataChannel.bufferedAmountLowThreshold) {
                                     cleanup();
@@ -453,7 +447,7 @@ export async function sendFileChunks() {
                         });
                     }
 
-                    const chunk = pendingBuffer.subarray(offset, offset + chunkSize);
+                    const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
@@ -468,15 +462,17 @@ export async function sendFileChunks() {
                     }
                 }
 
-                // 保留未滿一個 chunkSize 的剩餘位元組
-                pendingBuffer = pendingBuffer.subarray(offset);
+                // 記錄未滿一個完整 chunkSize 的剩餘區塊
+                if (offset < currentData.length) {
+                    leftover = currentData.subarray(offset);
+                }
             }
 
             if (done) {
-                // 清空尾巴剩餘位元組
-                if (pendingBuffer.length > 0) {
-                    state.dataChannel.send(pendingBuffer);
-                    totalSent += pendingBuffer.length;
+                // 清空尾巴最後剩餘的位元組
+                if (leftover && leftover.length > 0) {
+                    state.dataChannel.send(leftover);
+                    totalSent += leftover.length;
                 }
                 break;
             }
