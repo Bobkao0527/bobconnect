@@ -201,17 +201,21 @@ async function processPendingCandidates() {
 // 接收端：自動對接
 export async function initJoinerWithRoom(roomId) {
     if (roomId) state.roomId = roomId;
+
     document.getElementById('setup-view').classList.add('hidden');
     document.getElementById('signaling-box').classList.remove('hidden');
     document.getElementById('joiner-panel').classList.remove('hidden');
     updateStatus('正在連接 DO 信令房間...', 'yellow');
+
     try {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
+
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
             state.dataChannel.bufferedAmountLowThreshold = 131072;
             setupDataChannelListeners();
         };
+
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 const payload = {
@@ -226,7 +230,9 @@ export async function initJoinerWithRoom(roomId) {
                 }
             }
         };
+
         connectSignalingWS();
+
     } catch (e) {
         showToast(e.message, 'error');
         updateStatus('連線建立中斷', 'red');
@@ -236,19 +242,24 @@ export async function initJoinerWithRoom(roomId) {
 // 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
+
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
+        
         triggerAppleGlow();
+
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile
         }));
+
         if (state.ws) {
             state.ws.close();
             state.ws = null;
             console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
+
         document.getElementById('setup-view').classList.add('hidden');
         document.getElementById('signaling-box').classList.add('hidden');
         
@@ -256,12 +267,14 @@ export function setupDataChannelListeners() {
         tfPanel.classList.remove('hidden');
         tfPanel.style.opacity = '1';
     };
+
     state.dataChannel.onclose = () => {
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
         document.getElementById('transfer-panel').classList.add('hidden');
         document.getElementById('setup-view').classList.remove('hidden');
     };
+
     state.dataChannel.onmessage = (event) => {
         handleIncomingData(event.data);
     };
@@ -272,12 +285,14 @@ export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
+
             if (message.type === 'file-meta') {
                 useOpfsWorker = false;
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
                 state.receiveBuffer = [];
+
                 let resolved = false;
                 opfsWorkerInitPromise = new Promise((resolve) => {
                     resolveOpfsWorkerInit = () => {
@@ -287,6 +302,7 @@ export async function handleIncomingData(data) {
                         }
                     };
                 });
+
                 // 🚨 iOS Safari OPFS 初始化最多等待 3 秒，避免永遠卡在 0%
                 const initTimeout = setTimeout(() => {
                     if (!resolved) {
@@ -295,18 +311,22 @@ export async function handleIncomingData(data) {
                         if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
                     }
                 }, 3000);
+
                 const originalResolve = resolveOpfsWorkerInit;
                 resolveOpfsWorkerInit = () => {
                     clearTimeout(initTimeout);
                     originalResolve();
                 };
+
                 opfsWorker.postMessage({ type: 'init', filename: message.name });
+
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
             } else if (message.type === 'file-end') {
                 if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+
                 if (useOpfsWorker) {
                     opfsWorker.postMessage({ type: 'close' });
                 } else {
@@ -327,6 +347,7 @@ export async function handleIncomingData(data) {
     } else {
         // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
         if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+        console.log('[RECV]', data.byteLength, state.receivedSize, '/', state.incomingFileInfo?.size);
 
         state.receivedSize += data.byteLength;
 
@@ -380,50 +401,35 @@ export async function sendFileChunks() {
         showToast('通道尚未連線或未選擇檔案', 'error');
         return;
     }
+
     const btnSend = document.getElementById('btn-send');
     if (btnSend) {
         btnSend.disabled = true;
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
+
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
+
     const chunkSize = 65536; // 64KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
     const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
 
-    // 🚀 傳輸速度 / ETA 計算，不介入任何傳輸流程
-    let lastSpeedTime = Date.now();
-    let lastSpeedBytes = 0;
-    let smoothSpeed = 0;
-
-    const formatTransferTime = (seconds) => {
-        if (!isFinite(seconds) || seconds <= 0) return '--:--';
-        seconds = Math.ceil(seconds);
-        if (seconds < 60) {
-            return `00:${String(seconds).padStart(2, '0')}`;
-        }
-        const minutes = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        if (minutes < 60) {
-            return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-        }
-        const hours = Math.floor(minutes / 60);
-        const mins = minutes % 60;
-        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-    };
-
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
+
         while (true) {
             const { done, value } = await reader.read();
+
             if (value) {
                 let currentData = value;
+
                 if (leftover && leftover.length > 0) {
                     const combined = new Uint8Array(leftover.length + value.length);
                     combined.set(leftover);
@@ -431,14 +437,19 @@ export async function sendFileChunks() {
                     currentData = combined;
                     leftover = null;
                 }
+
                 let offset = 0;
                 while (offset + chunkSize <= currentData.length) {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
+
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+                        console.log('[BACKPRESSURE] 等待 bufferedAmount 降低:', state.dataChannel.bufferedAmount);
+
                         await new Promise((resolve, reject) => {
                             let finished = false;
+
                             const cleanup = () => {
                                 if (finished) return;
                                 finished = true;
@@ -446,15 +457,18 @@ export async function sendFileChunks() {
                                 if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
                                 resolve();
                             };
+
                             const checkInterval = setInterval(() => {
                                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                                     cleanup();
                                     return;
                                 }
+
                                 if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                                     cleanup();
                                 }
                             }, 50);
+
                             if (state.dataChannel) {
                                 state.dataChannel.onbufferedamountlow = () => {
                                     if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
@@ -462,88 +476,63 @@ export async function sendFileChunks() {
                                     }
                                 };
                             }
+
                             if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                                 cleanup();
                             }
                         });
+
+                        console.log('[BACKPRESSURE] 解除:', state.dataChannel?.bufferedAmount);
                     }
+
                     const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
+
                     const now = Date.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
                         lastUiUpdateTime = now;
                         const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
                         document.getElementById('progress-percent').innerText = `${percent}%`;
                         document.getElementById('progress-bar').style.width = `${percent}%`;
-
-                        // 🚀 只在這裡計算速度與 ETA，不影響傳輸
-                        const speedElapsed = (now - lastSpeedTime) / 1000;
-                        if (speedElapsed > 0) {
-                            const bytesSinceLastUpdate = totalSent - lastSpeedBytes;
-                            const instantSpeed = bytesSinceLastUpdate / speedElapsed;
-
-                            if (smoothSpeed === 0) {
-                                smoothSpeed = instantSpeed;
-                            } else {
-                                smoothSpeed = smoothSpeed * 0.7 + instantSpeed * 0.3;
-                            }
-
-                            lastSpeedBytes = totalSent;
-                            lastSpeedTime = now;
-
-                            const speedText = document.getElementById('transfer-speed');
-                            const timeText = document.getElementById('transfer-time');
-
-                            if (speedText) {
-                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-                            }
-
-                            if (timeText) {
-                                const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
-                                const etaSeconds = smoothSpeed > 0 ? remainingBytes / smoothSpeed : 0;
-                                timeText.innerText = percent >= 100 ? '00:00' : formatTransferTime(etaSeconds);
-                            }
-                        }
                     }
                 }
+
                 if (offset < currentData.length) {
                     leftover = currentData.subarray(offset);
                 }
             }
+
             if (done) {
                 if (leftover && leftover.length > 0) {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
+
                     while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+                        console.log('[BACKPRESSURE] 最後區塊等待:', state.dataChannel.bufferedAmount);
                         await new Promise(resolve => setTimeout(resolve, 50));
                     }
+
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
                 }
                 break;
             }
         }
+
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
+
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
+
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
-
-        const speedText = document.getElementById('transfer-speed');
-        const timeText = document.getElementById('transfer-time');
-        if (speedText && smoothSpeed > 0) {
-            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-        }
-        if (timeText) {
-            timeText.innerText = '00:00';
-        }
-
         showToast('檔案已完全投遞！', 'success');
+
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
         showToast('傳輸中斷：' + e.message, 'error');
