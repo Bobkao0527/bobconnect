@@ -396,14 +396,14 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 64KB
+    const chunkSize = 16384; // 16KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
 
     try {
         const reader = state.selectedFile.stream().getReader();
-        let leftover = null; // 🚀 用於暫存上一區塊未滿 64KB 的殘留部分 (固定 < 64KB)
+        let leftover = null; // 🚀 用於暫存上一區塊未滿 16KB 的殘留部分 (固定 < 16KB)
 
         while (true) {
             const { done, value } = await reader.read();
@@ -411,7 +411,7 @@ export async function sendFileChunks() {
             if (value) {
                 let currentData = value;
 
-                // 若前一次有不足 64KB 的殘留區塊，僅在此時做輕量拼接
+                // 若前一次有不足 16KB 的殘留區塊，僅在此時做輕量拼接
                 if (leftover && leftover.length > 0) {
                     const combined = new Uint8Array(leftover.length + value.length);
                     combined.set(leftover);
