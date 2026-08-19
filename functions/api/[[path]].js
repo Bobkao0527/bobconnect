@@ -37,8 +37,8 @@ export async function onRequest(context) {
 
   globalThis.rooms = globalThis.rooms || new Map();
 
-  const kv = env.BOB_CONNECT_KV;
-  const r2 = env.BOB_CONNECT_R2;
+  const kv = env.BC_KV;
+  const r2 = env.BC_R2;
 
   const r2AccountId = env.R2_ACCOUNT_ID;
   const r2AccessKeyId = env.R2_ACCESS_KEY_ID;
