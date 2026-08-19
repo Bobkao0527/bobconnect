@@ -243,6 +243,11 @@ async function initOPFSStream(filename) {
     }
 }
 
+// 🚀 批次寫入緩衝桶（避免 I/O 佇列爆滿）
+let batchBuffer = [];
+let currentBatchSize = 0;
+const BATCH_THRESHOLD = 4 * 1024 * 1024; // 累積滿 4MB 才寫一次硬碟
+
 // 處理接收資料流
 export async function handleIncomingData(data) {
     if (typeof data === 'string') {
@@ -251,65 +256,58 @@ export async function handleIncomingData(data) {
 
             if (message.type === 'file-meta') {
                 state.incomingFileInfo = { name: message.name, size: message.size };
-                state.receiveBuffer = [];
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
+                batchBuffer = [];
+                currentBatchSize = 0;
 
-                // 🚀 1. 收到檔案元資料時，啟動 OPFS 硬碟串流寫入器
                 await initOPFSStream(message.name);
 
                 document.getElementById('incoming-file-box').classList.remove('hidden');
                 document.getElementById('recv-file-name').innerText = state.incomingFileInfo.name;
-                document.getElementById('recv-percent').innerText = '0%';
-                document.getElementById('recv-progress-bar').style.width = '0%';
             
             } else if (message.type === 'file-end') {
-                let downloadUrl = "";
+                // 🚀 1. 傳輸結束：將剩餘不足 4MB 的尾巴一次性 Flush 進硬碟
+                if (batchBuffer.length > 0 && state.opfsWritable) {
+                    const finalBlob = new Blob(batchBuffer);
+                    await state.opfsWritable.write(finalBlob);
+                    batchBuffer = [];
+                    currentBatchSize = 0;
+                }
 
-                // 🚀 3. 傳輸完成：關閉硬碟串流並取出 File 檔案
+                let downloadUrl = "";
                 if (state.opfsWritable) {
                     await state.opfsWritable.close();
                     state.opfsWritable = null;
                     
                     const file = await state.opfsFileHandle.getFile();
                     downloadUrl = URL.createObjectURL(file);
-                } else {
-                    // 降級退路：傳統記憶體組合
-                    const blob = new Blob(state.receiveBuffer);
-                    state.receiveBuffer = [];
-                    downloadUrl = URL.createObjectURL(blob);
                 }
 
-                // 喚起下載
                 triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-
-                document.getElementById('recv-percent').innerText = '100% (已寫入硬碟完成)';
-                document.getElementById('recv-progress-bar').style.width = '100%';
-                showToast(`「${state.incomingFileInfo.name}」直連寫入完成！`, 'success');
-
-                // 記憶體清理與沙盒暫存檔清理
-                setTimeout(async () => {
-                    URL.revokeObjectURL(downloadUrl);
-                    if (state.opfsFileHandle) {
-                        await state.opfsFileHandle.remove().catch(() => {});
-                        state.opfsFileHandle = null;
-                    }
-                }, 60000);
+                document.getElementById('recv-percent').innerText = '100% (已直寫硬碟完成)';
+                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
             }
         } catch (e) {
             console.error(e);
         }
     } else {
-        // 🚀 2. 接收 ArrayBuffer 切片：直接非同步寫入本機硬碟，完全不佔用 JS Heap 記憶體
-        if (state.opfsWritable) {
-            // write() 接受 ArrayBuffer / ArrayBufferView
-            await state.opfsWritable.write(data);
-        } else {
-            state.receiveBuffer.push(data); // 降級備用
-        }
-
+        // 🚀 2. 接收切片：存入批次桶中
+        batchBuffer.push(data);
+        currentBatchSize += data.byteLength;
         state.receivedSize += data.byteLength;
 
+        // 🚀 3. 滿 4MB 進行一次性硬碟批次寫入，大幅降低 I/O 頻率 98%
+        if (currentBatchSize >= BATCH_THRESHOLD) {
+            if (state.opfsWritable) {
+                const combinedBlob = new Blob(batchBuffer);
+                await state.opfsWritable.write(combinedBlob);
+            }
+            batchBuffer = []; // 立即清空，釋放 RAM
+            currentBatchSize = 0;
+        }
+
+        // 更新進度條
         if (state.incomingFileInfo) {
             const now = Date.now();
             if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
@@ -367,7 +365,7 @@ export async function sendFileChunks() {
     };
     state.dataChannel.send(JSON.stringify(meta));
 
-    const chunkSize = 65536; // 64KB 切片
+    const chunkSize = 262144; // 256kB 切片
     let offset = 0;
     const startTime = Date.now();
     let lastUiUpdateTime = 0;
