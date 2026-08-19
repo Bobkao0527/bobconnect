@@ -203,6 +203,11 @@ export function setupDataChannelListeners() {
 
         // 🚀【關鍵】：P2P 建立完成後立即關閉 DO WebSocket 與雲端信令
         destroyCloudRoom();
+        if (state.ws) {
+            state.ws.close();
+            state.ws = null;
+            console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
+        }
 
         document.getElementById('setup-view').classList.add('hidden');
         document.getElementById('signaling-box').classList.add('hidden');

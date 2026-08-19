@@ -3,7 +3,6 @@ export class SignalRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.sockets = new Set();
     this.offer = null;
   }
 
@@ -15,45 +14,39 @@ export class SignalRoom {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    server.accept();
-    this.sockets.add(server);
+    // 🚀 改用休眠 API：當客戶端連線掛著時，DO 會自動休眠而不消耗 GB-sec
+    this.state.acceptWebSocket(server);
 
-    // 若先前已發送過 Offer，Joiner 連上線時立刻推播
     if (this.offer) {
       server.send(JSON.stringify({ type: "offer", offer: this.offer }));
     }
 
-    server.addEventListener("message", (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === "offer") {
-          this.offer = data.offer;
-          this.broadcast(server, data);
-        } else if (data.type === "answer" || data.type === "candidate") {
-          this.broadcast(server, data);
-        }
-      } catch (e) {
-        console.error("[DO Message Error]", e);
-      }
-    });
-
-    const cleanup = () => {
-      this.sockets.delete(server);
-      if (this.sockets.size === 0) {
-        this.offer = null;
-      }
-    };
-
-    server.addEventListener("close", cleanup);
-    server.addEventListener("error", cleanup);
-
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // 🚀 Hibernation API 專用訊息事件處理器
+  async webSocketMessage(ws, message) {
+    try {
+      const data = JSON.parse(message);
+      if (data.type === "offer") {
+        this.offer = data.offer;
+        this.broadcast(ws, data);
+      } else if (data.type === "answer" || data.type === "candidate") {
+        this.broadcast(ws, data);
+      }
+    } catch (e) {
+      console.error("[DO Message Error]", e);
+    }
+  }
+
+  async webSocketClose(ws, code, reason, wasClean) {
+    ws.close(code, "Closed");
   }
 
   broadcast(sender, data) {
     const msg = JSON.stringify(data);
-    for (const socket of this.sockets) {
-      if (socket !== sender && socket.readyState === 1) { // 1 = OPEN
+    for (const socket of this.state.getWebSockets()) {
+      if (socket !== sender && socket.readyState === 1) {
         socket.send(msg);
       }
     }
