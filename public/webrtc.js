@@ -190,6 +190,8 @@ export async function initJoinerWithRoom() {
 
 // 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
+    state.dataChannel.binaryType = 'arraybuffer';
+
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
@@ -201,7 +203,6 @@ export function setupDataChannelListeners() {
             isMobile: state.localIsMobile
         }));
 
-        // 🚀【關鍵】：P2P 建立完成後立即關閉 DO WebSocket 與雲端信令
         destroyCloudRoom();
         if (state.ws) {
             state.ws.close();
