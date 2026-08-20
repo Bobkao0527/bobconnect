@@ -390,11 +390,26 @@ export async function sendFileChunks() {
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
-    const chunkSize = 65536; // 64KB
-    const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
-    const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
+    const chunkSize = 65536;
+    const maxBufferedAmount = 8 * 1024 * 1024;
+    const resumeBufferedAmount = 2 * 1024 * 1024;
     let totalSent = 0;
     let lastUiUpdateTime = 0;
+    let lastSpeedTime = performance.now();
+    let lastSpeedBytes = 0;
+    let smoothSpeed = 0;
+    const transferStartTime = performance.now();
+    const formatEta = (seconds) => {
+        if (!isFinite(seconds) || seconds <= 0) return '--:--';
+        seconds = Math.ceil(seconds);
+        if (seconds < 60) return `00:${String(seconds).padStart(2, '0')}`;
+        const minutes = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        if (minutes < 60) return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    };
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
@@ -415,16 +430,18 @@ export async function sendFileChunks() {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise((resolve, reject) => {
+                        await new Promise((resolve) => {
                             let finished = false;
+                            let checkInterval = null;
                             const cleanup = () => {
                                 if (finished) return;
                                 finished = true;
-                                clearInterval(checkInterval);
+                                if (checkInterval) clearInterval(checkInterval);
                                 if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
                                 resolve();
                             };
-                            const checkInterval = setInterval(() => {
+
+                            checkInterval = setInterval(() => {
                                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                                     cleanup();
                                     return;
@@ -441,22 +458,41 @@ export async function sendFileChunks() {
                                     }
                                 };
                             }
-                            if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                                cleanup();
-                            }
                         });
-
                     }
                     const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
-                    const now = Date.now();
+
+                    const now = performance.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
                         lastUiUpdateTime = now;
+
                         const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
                         document.getElementById('progress-percent').innerText = `${percent}%`;
                         document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                        const speedElapsed = (now - lastSpeedTime) / 1000;
+                        if (speedElapsed > 0) {
+                            const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
+                            smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                            lastSpeedBytes = totalSent;
+                            lastSpeedTime = now;
+
+                            const speedText = document.getElementById('transfer-speed');
+                            if (speedText) {
+                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                            }
+
+                            const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
+                            const etaSeconds = remainingBytes / smoothSpeed;
+
+                            const timeText = document.getElementById('transfer-time');
+                            if (timeText) {
+                                timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                            }
+                        }
                     }
                 }
                 if (offset < currentData.length) {
@@ -480,19 +516,28 @@ export async function sendFileChunks() {
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
+
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
+
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
+
+        const speedText = document.getElementById('transfer-speed');
+        if (speedText && smoothSpeed > 0) {
+            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+        }
+
+        const timeText = document.getElementById('transfer-time');
+        if (timeText) timeText.innerText = '00:00';
+
         showToast('檔案已完全投遞！', 'success');
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
         showToast('傳輸中斷：' + e.message, 'error');
     } finally {
         if (btnSend) {
-            if (state.dataChannel) {
-                state.dataChannel.onbufferedamountlow = null;
-            }
+            if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
             btnSend.disabled = false;
             btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
         }
