@@ -11,7 +11,6 @@ export function checkInAppBrowser() {
     const isInApp = (ua.indexOf("FBAN") > -1) || 
                     (ua.indexOf("FBAV") > -1) || 
                     (ua.indexOf("Line") > -1) || 
-                    (ua.indexOf("GSA") > -1) || 
                     (ua.indexOf("Messenger") > -1) ||
                     (ua.indexOf("Instagram") > -1);
     
