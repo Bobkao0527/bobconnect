@@ -45,30 +45,28 @@ self.addEventListener('message', (event) => {
     if (type === 'init') {
         let controller;
         const port = event.ports && event.ports[0];
+        let firstPull = true;
 
         // 將 highWaterMark 降至 2MB，防止 iPad/iOS Safari 記憶體上限溢出
         const stream = new ReadableStream({
-            start(c) {
-                controller = c;
-            },
+            start(c) { controller = c; },
             pull(c) {
-                console.log(
-                    '[SW PULL]',
-                    downloadId,
-                    'desiredSize=',
-                    c.desiredSize,
-                    'time=',
-                    Date.now()
-                );
+                console.log('[SW PULL]', downloadId, 'desiredSize=', c.desiredSize);
+                if (firstPull) {
+                    firstPull = false;
+                    if (port) {
+                        port.postMessage({ type: 'download-started' });
+                    }
+                }
                 if (port) {
-                    port.postMessage({ 
-                        type: 'drain', 
-                        desiredSize: c.desiredSize 
-                    });
+                    port.postMessage({ type: 'drain', desiredSize: c.desiredSize });
                 }
             },
             cancel(reason) {
                 console.warn('[SW] 串流被取消:', reason);
+                if (port) {
+                    port.postMessage({ type: 'download-cancelled', reason: String(reason) });
+                }
                 downloadStreams.delete(downloadId);
             }
         }, new ByteLengthQueuingStrategy({ highWaterMark: 2 * 1024 * 1024 }));

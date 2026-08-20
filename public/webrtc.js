@@ -303,11 +303,7 @@ export async function handleIncomingData(data) {
                 swBackpressureResolve = null;
 
                 swPort.onmessage = (e) => {
-                    console.log(
-                        '[PAGE ← SW]',
-                        e.data.type,
-                        e.data.desiredSize
-                    );
+                    console.log('[PAGE ← SW]', e.data.type, e.data.desiredSize);
 
                     if (e.data.type === 'init-success') {
                         const downloadUrl = `./sw-download?id=${currentDownloadId}`;
@@ -328,7 +324,20 @@ export async function handleIncomingData(data) {
                         }
 
                         if (resolveSwInit) resolveSwInit();
-                    } 
+                    }
+                    else if (e.data.type === 'download-started') {
+                        // 通知發送端可以開始發送數據
+                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+                            state.dataChannel.send(JSON.stringify({ type: 'start' }));
+                        }
+                    }
+                    else if (e.data.type === 'download-cancelled') {
+                        // 取消下載，通知發送端停止
+                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+                            state.dataChannel.send(JSON.stringify({ type: 'cancel' }));
+                        }
+                        cleanupSWStream();
+                    }
                     else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
                         currentDesiredSize = e.data.desiredSize;
                         if (currentDesiredSize > 0 && swBackpressureResolve) {
@@ -457,6 +466,34 @@ export async function sendFileChunks() {
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
+
+    let startReceived = false;
+    const startPromise = new Promise((resolve) => {
+        const onMessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'start') {
+                    startReceived = true;
+                    state.dataChannel.removeEventListener('message', onMessage);
+                    resolve();
+                } else if (msg.type === 'cancel') {
+                    state.dataChannel.removeEventListener('message', onMessage);
+                    resolve(new Error('接收端取消了下载'));
+                }
+            } catch (_) {}
+        };
+        state.dataChannel.addEventListener('message', onMessage);
+        // 超时保护（10秒）
+        setTimeout(() => {
+            state.dataChannel.removeEventListener('message', onMessage);
+            if (!startReceived) {
+                console.warn('[发送端] 等待 start 超时，继续发送');
+                resolve();
+            }
+        }, 10000);
+    });
+
+    await startPromise;  // 如果被 cancel 则可能抛出错误，需要捕获
 
     const chunkSize = 65536; // 64KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
