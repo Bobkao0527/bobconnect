@@ -372,7 +372,8 @@ export async function handleIncomingData(data) {
         console.log('[RECV START]', data.byteLength, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
     }
 
-    state.receiveBuffer.push(data);
+    //Test Only
+    //state.receiveBuffer.push(data);
 
     if (state.incomingFileInfo) {
         const now = Date.now();
