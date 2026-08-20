@@ -82,7 +82,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
+        state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -204,7 +204,7 @@ export async function initJoinerWithRoom(roomId) {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
+            state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
             setupDataChannelListeners();
         };
         state.peerConnection.onicecandidate = (event) => {
