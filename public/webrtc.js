@@ -314,18 +314,16 @@ export async function handleIncomingData(data) {
                         
                         // iOS / iPadOS Safari 對 iframe 觸發 SW 下載較敏感，相容性處理
                         const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-                        if (isIOS) {
-                            window.location.href = downloadUrl;
-                        } else {
-                            let iframe = document.getElementById('sw-download-iframe');
-                            if (!iframe) {
-                                iframe = document.createElement('iframe');
-                                iframe.id = 'sw-download-iframe';
-                                iframe.style.display = 'none';
-                                document.body.appendChild(iframe);
-                            }
-                            iframe.src = downloadUrl;
+                        let iframe = document.getElementById('sw-download-iframe');
+
+                        if (!iframe) {
+                            iframe = document.createElement('iframe');
+                            iframe.id = 'sw-download-iframe';
+                            iframe.style.display = 'none';
+                            document.body.appendChild(iframe);
                         }
+
+                        iframe.src = downloadUrl;
 
                         if (resolveSwInit) resolveSwInit();
                     } 
