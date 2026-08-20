@@ -26,11 +26,9 @@ async function initServiceWorker() {
                     navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
                 });
             }
-            useServiceWorker = true;
         } catch (err) {
             console.error('[Service Worker] 註冊或控制失敗，串流下載功能無法使用:', err);
             showToast('Service Worker 初始化失敗，無法進行串流傳輸', 'error');
-            useServiceWorker = false;
         }
     } else {
         showToast('您的瀏覽器不支援 Service Worker 串流傳輸', 'error');
