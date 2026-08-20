@@ -15,16 +15,16 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
 
-    // 攔截 Service Worker 串流下載路徑
-    if (url.pathname.endsWith('/sw-download')) {
+    if (url.pathname.endsWith('/sw-download') && event.request.method === 'GET') {
         const downloadId = url.searchParams.get('id');
         const streamData = downloadStreams.get(downloadId);
 
         if (streamData) {
             const { stream, filename, size } = streamData;
+
             const safeFilename = filename.replace(/"/g, '\\"');
             const encodedFilename = encodeURIComponent(filename);
-            
+
             const headers = new Headers({
                 'Content-Type': 'application/octet-stream',
                 'Content-Disposition': `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`,

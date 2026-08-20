@@ -16,6 +16,7 @@ let swPort = null;
 const RECEIVER_WINDOW = 2 * 1024 * 1024;
 const MIN_RECEIVER_CREDIT = 64 * 1024;
 
+let receiverUserConfirmed = false;
 let receiverReadySent = false;
 let receiverDownloadTriggered = false;
 let receiverCreditOutstanding = 0;
@@ -218,6 +219,20 @@ function hideReceiverAcceptUI() {
     }
 }
 
+function hideReceiverAllowConfirmUI() {
+    const btn = document.getElementById('btn-confirm-allow-download');
+
+    if (btn) {
+        btn.onclick = null;
+        btn.remove();
+    }
+}
+
+function confirmReceiverAllowed() {
+    receiverUserConfirmed = true;
+    maybeNotifySenderReady();
+}
+
 function triggerStreamDownload(downloadUrl, filename) {
     if (isAppleMobile()) {
         const a = document.createElement('a');
@@ -283,7 +298,7 @@ function setupReceiverSwPort(filename, size) {
                     resolveSwStarted();
                 }
 
-                waitForSwStartAndNotifySender();
+                maybeNotifySenderReady();
             }
 
             if (currentDesiredSize > 0) {
@@ -316,37 +331,86 @@ function startReceiverDownloadFlow() {
     const downloadUrl = `./sw-download?id=${currentDownloadId}`;
     triggerStreamDownload(downloadUrl, state.incomingFileInfo?.name);
 
-    waitForSwStartAndNotifySender();
+    if (isAppleMobile()) {
+        receiverUserConfirmed = false;
+        showReceiverAllowConfirmUI();
+    } else {
+        receiverUserConfirmed = true;
+    }
+
+    maybeNotifySenderReady();
 }
 
-function waitForSwStartAndNotifySender() {
-    if (!swStartedPromise) return;
+function showReceiverAllowConfirmUI() {
+    const box = document.getElementById('incoming-file-box') || document.body;
 
-    swStartedPromise.then(() => {
-        if (receiverReadySent || !state.dataChannel || state.dataChannel.readyState !== 'open') {
-            return;
-        }
+    let btn = document.getElementById('btn-confirm-allow-download');
 
-        receiverReadySent = true;
+    if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'btn-confirm-allow-download';
+        btn.type = 'button';
 
-        const desired = Number(currentDesiredSize) > 0
-            ? Number(currentDesiredSize)
-            : RECEIVER_WINDOW;
+        Object.assign(btn.style, {
+            display: 'block',
+            marginTop: '12px',
+            padding: '10px 16px',
+            borderRadius: '10px',
+            border: 'none',
+            background: '#16a34a',
+            color: '#ffffff',
+            fontSize: '15px',
+            cursor: 'pointer'
+        });
 
-        const credit = Math.max(
-            MIN_RECEIVER_CREDIT,
-            Math.min(RECEIVER_WINDOW, desired)
-        );
+        box.appendChild(btn);
+    }
 
-        receiverCreditOutstanding += credit;
+    btn.disabled = true;
+    btn.innerText = '等待 Safari 下載提示...';
 
-        state.dataChannel.send(JSON.stringify({
-            type: 'receiver-ready',
-            credit
-        }));
-    }).catch(() => {
-        // 串流可能被取消或清理，忽略即可
-    });
+    btn.onclick = () => {
+        btn.disabled = true;
+        hideReceiverAllowConfirmUI();
+        confirmReceiverAllowed();
+    };
+
+    // 短暫延遲，避免使用者還沒看到 Safari 提示就點到
+    setTimeout(() => {
+        const b = document.getElementById('btn-confirm-allow-download');
+        if (!b) return;
+
+        b.disabled = false;
+        b.innerText = '我已按下 Safari 的「允許」，開始傳輸';
+    }, 1200);
+}
+
+function maybeNotifySenderReady() {
+    if (!receiverUserConfirmed || !firstSwDrainReceived) {
+        return;
+    }
+
+    if (receiverReadySent || !state.dataChannel || state.dataChannel.readyState !== 'open') {
+        return;
+    }
+
+    receiverReadySent = true;
+
+    const desired = Number(currentDesiredSize) > 0
+        ? Number(currentDesiredSize)
+        : RECEIVER_WINDOW;
+
+    const credit = Math.max(
+        MIN_RECEIVER_CREDIT,
+        Math.min(RECEIVER_WINDOW, desired)
+    );
+
+    receiverCreditOutstanding += credit;
+
+    state.dataChannel.send(JSON.stringify({
+        type: 'receiver-ready',
+        credit
+    }));
 }
 
 function grantCreditToSender() {
@@ -1067,6 +1131,7 @@ export function cleanupSWStream() {
     receiverDownloadTriggered = false;
     receiverReadySent = false;
     receiverCreditOutstanding = 0;
+    receiverUserConfirmed = false;
 
     currentDesiredSize = RECEIVER_WINDOW;
 
@@ -1077,4 +1142,5 @@ export function cleanupSWStream() {
     receiverProcessingChain = Promise.resolve();
 
     hideReceiverAcceptUI();
+    hideReceiverAllowConfirmUI();
 }
