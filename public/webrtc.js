@@ -10,15 +10,26 @@ let currentDownloadId = null;
 let swInitPromise = null;
 let resolveSwInit = null;
 
+const MAX_MEMORY_SIZE = 100 * 1024 * 1024; // 100MB 門檻
+let swBackpressurePromise = null;
+let swBackpressureResolve = null;
+let swPort = null;
+
 // 🚀 初始化並註冊 Service Worker
 async function initServiceWorker() {
     if ('serviceWorker' in navigator) {
         try {
             await navigator.serviceWorker.register('./sw.js', { scope: './' });
             await navigator.serviceWorker.ready;
+
+            if (!navigator.serviceWorker.controller) {
+                await new Promise((resolve) => {
+                    navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+                });
+            }
             useServiceWorker = true;
         } catch (err) {
-            console.warn('[Service Worker] 註冊失敗，降級為記憶體模式:', err);
+            console.warn('[Service Worker] 註冊或控制失敗，降級為記憶體模式:', err);
             useServiceWorker = false;
         }
     }
@@ -71,7 +82,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 131072;
+        state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -193,7 +204,7 @@ export async function initJoinerWithRoom(roomId) {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = 131072;
+            state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
             setupDataChannelListeners();
         };
         state.peerConnection.onicecandidate = (event) => {
@@ -220,6 +231,8 @@ export async function initJoinerWithRoom(roomId) {
 // 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
+    state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
@@ -240,12 +253,15 @@ export function setupDataChannelListeners() {
         tfPanel.classList.remove('hidden');
         tfPanel.style.opacity = '1';
     };
+
     state.dataChannel.onclose = () => {
+        cleanupSWStream(); // 斷線時主動釋放 SW 串流與 Port 資源
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
         document.getElementById('transfer-panel').classList.add('hidden');
         document.getElementById('setup-view').classList.remove('hidden');
     };
+
     state.dataChannel.onmessage = (event) => {
         handleIncomingData(event.data);
     };
@@ -263,6 +279,7 @@ export async function handleIncomingData(data) {
                 state.receiveBuffer = [];
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+                currentDesiredSize = 16 * 1024 * 1024;
 
                 let resolved = false;
                 swInitPromise = new Promise((resolve) => {
@@ -274,26 +291,22 @@ export async function handleIncomingData(data) {
                     };
                 });
 
-                // 超時保護：若 Service Worker 沒在 3 秒內反應則降級記憶體模式
-                const initTimeout = setTimeout(() => {
-                    if (!resolved) {
-                        console.warn('[Service Worker] 初始化逾時，降級至記憶體模式');
-                        useServiceWorker = false;
-                        if (resolveSwInit) resolveSwInit();
+                useServiceWorker = message.size > MAX_MEMORY_SIZE;
+
+                if (useServiceWorker) {
+                    if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller) {
+                        showToast('Service Worker 未就緒，無法進行 >100MB 大檔案串流下載', 'error');
+                        return;
                     }
-                }, 3000);
 
-                const originalResolve = resolveSwInit;
-                resolveSwInit = () => {
-                    clearTimeout(initTimeout);
-                    originalResolve();
-                };
-
-                if (useServiceWorker && navigator.serviceWorker.controller) {
                     const channel = new MessageChannel();
-                    channel.port1.onmessage = (e) => {
+                    swPort = channel.port1;
+
+                    swBackpressurePromise = null;
+                    swBackpressureResolve = null;
+
+                    swPort.onmessage = (e) => {
                         if (e.data.type === 'init-success') {
-                            // 🚀 建立隱藏 iframe 觸發瀏覽器原生存流下載
                             const downloadUrl = `./sw-download?id=${currentDownloadId}`;
                             let iframe = document.getElementById('sw-download-iframe');
                             if (!iframe) {
@@ -305,6 +318,15 @@ export async function handleIncomingData(data) {
                             iframe.src = downloadUrl;
 
                             if (resolveSwInit) resolveSwInit();
+                        } 
+                        else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
+                            // 即時同步 SW 隊列的可用空間狀態
+                            currentDesiredSize = e.data.desiredSize;
+                            if (currentDesiredSize > 0 && swBackpressureResolve) {
+                                swBackpressureResolve();
+                                swBackpressurePromise = null;
+                                swBackpressureResolve = null;
+                            }
                         }
                     };
 
@@ -315,7 +337,6 @@ export async function handleIncomingData(data) {
                         size: message.size
                     }, [channel.port2]);
                 } else {
-                    useServiceWorker = false;
                     if (resolveSwInit) resolveSwInit();
                 }
 
@@ -326,11 +347,8 @@ export async function handleIncomingData(data) {
             } else if (message.type === 'file-end') {
                 if (swInitPromise) await swInitPromise;
 
-                if (useServiceWorker && navigator.serviceWorker.controller) {
-                    navigator.serviceWorker.controller.postMessage({
-                        type: 'close',
-                        downloadId: currentDownloadId
-                    });
+                if (useServiceWorker) {
+                    cleanupSWStream();
 
                     document.getElementById('recv-percent').innerText = '100% (完成)';
                     showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
@@ -348,13 +366,24 @@ export async function handleIncomingData(data) {
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
+            cleanupSWStream();
         }
     } else {
         if (swInitPromise) await swInitPromise;
 
         state.receivedSize += data.byteLength;
 
-        if (useServiceWorker && navigator.serviceWorker.controller) {
+        if (useServiceWorker) {
+            // 同步判斷 SW 緩衝空間，若已滿則停止寫入並等待釋放
+            if (currentDesiredSize <= 0) {
+                if (!swBackpressurePromise) {
+                    swBackpressurePromise = new Promise((resolve) => {
+                        swBackpressureResolve = resolve;
+                    });
+                }
+                await swBackpressurePromise;
+            }
+
             try {
                 navigator.serviceWorker.controller.postMessage({
                     type: 'write',
@@ -362,9 +391,8 @@ export async function handleIncomingData(data) {
                     chunk: data
                 }, [data]);
             } catch (e) {
-                console.error('[Service Worker] 傳送失敗，降級記憶體模式:', e);
-                useServiceWorker = false;
-                state.receiveBuffer.push(data);
+                console.error('[Service Worker] 串流寫入失敗:', e);
+                cleanupSWStream();
             }
         } else {
             state.receiveBuffer.push(data);
@@ -418,6 +446,7 @@ export async function sendFileChunks() {
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
+
     const chunkSize = 65536;
     const maxBufferedAmount = 8 * 1024 * 1024;
     const resumeBufferedAmount = 2 * 1024 * 1024;
@@ -426,7 +455,7 @@ export async function sendFileChunks() {
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = 0;
     let smoothSpeed = 0;
-    const transferStartTime = performance.now();
+
     const formatEta = (seconds) => {
         if (!isFinite(seconds) || seconds <= 0) return '--:--';
         seconds = Math.ceil(seconds);
@@ -438,6 +467,7 @@ export async function sendFileChunks() {
         const mins = minutes % 60;
         return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     };
+
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
@@ -570,4 +600,19 @@ export async function sendFileChunks() {
             btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
         }
     }
+}
+
+export function cleanupSWStream() {
+    if (useServiceWorker && currentDownloadId && navigator.serviceWorker?.controller) {
+        navigator.serviceWorker.controller.postMessage({
+            type: 'close',
+            downloadId: currentDownloadId
+        });
+    }
+    if (swPort) {
+        swPort.close();
+        swPort = null;
+    }
+    swBackpressurePromise = null;
+    swBackpressureResolve = null;
 }

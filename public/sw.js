@@ -22,11 +22,12 @@ self.addEventListener('fetch', (event) => {
 
         if (streamData) {
             const { stream, filename, size } = streamData;
+            const safeFilename = filename.replace(/"/g, '\\"');
             const encodedFilename = encodeURIComponent(filename);
             
             const headers = new Headers({
                 'Content-Type': 'application/octet-stream',
-                'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`,
+                'Content-Disposition': `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`,
             });
 
             if (size) {
@@ -34,8 +35,6 @@ self.addEventListener('fetch', (event) => {
             }
 
             event.respondWith(new Response(stream, { headers }));
-            
-            // 🚨 修正：切勿在這裡 delete！否則後續寫入 chunk 會找不到 controller。
         }
     }
 });
@@ -45,16 +44,26 @@ self.addEventListener('message', (event) => {
 
     if (type === 'init') {
         let controller;
+        const port = event.ports && event.ports[0];
+
         const stream = new ReadableStream({
             start(c) {
                 controller = c;
+            },
+            pull(c) {
+                if (port) {
+                    port.postMessage({ 
+                        type: 'drain', 
+                        desiredSize: c.desiredSize 
+                    });
+                }
             }
-        });
+        }, new ByteLengthQueuingStrategy({ highWaterMark: 16 * 1024 * 1024 }));
         
-        downloadStreams.set(downloadId, { stream, controller, filename, size });
+        downloadStreams.set(downloadId, { stream, controller, filename, size, port });
 
-        if (event.ports && event.ports[0]) {
-            event.ports[0].postMessage({ type: 'init-success' });
+        if (port) {
+            port.postMessage({ type: 'init-success' });
         }
     } 
     else if (type === 'write') {
@@ -62,6 +71,13 @@ self.addEventListener('message', (event) => {
         if (streamData && streamData.controller) {
             try {
                 streamData.controller.enqueue(new Uint8Array(chunk));
+
+                if (streamData.port) {
+                    streamData.port.postMessage({
+                        type: 'write-ack',
+                        desiredSize: streamData.controller.desiredSize
+                    });
+                }
             } catch (err) {
                 console.error('[SW] 串流寫入失敗:', err);
             }
@@ -75,7 +91,6 @@ self.addEventListener('message', (event) => {
             } catch (err) {
                 console.error('[SW] 串流關閉失敗:', err);
             } finally {
-                // 🚀 傳輸完成且關閉串流後，才安全釋放記憶體
                 downloadStreams.delete(downloadId);
             }
         }
