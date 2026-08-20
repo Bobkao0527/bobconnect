@@ -1,40 +1,16 @@
 /**
- * webrtc.js - WebRTC 直連通道與信令核心
- * 負責連線握手、ICE 收集、連線狀態維護，並在連線開通時自我清理雲端信令空間。
+ * webrtc.js - WebRTC 直連通道與信令核心 (OPFS Web Worker 重構版)
+ * 負責連線握手、ICE 收集、連線狀態維護，並透過 Dedicated Web Worker + OPFS 同步寫入進行零記憶體大檔案接收。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
 
 let currentDownloadId = null;
-let swInitPromise = null;
-let resolveSwInit = null;
-
-let currentDesiredSize = 16 * 1024 * 1024;
-let swBackpressurePromise = null;
-let swBackpressureResolve = null;
-let swPort = null;
-
-// 🚀 初始化並註冊 Service Worker
-async function initServiceWorker() {
-    if ('serviceWorker' in navigator) {
-        try {
-            await navigator.serviceWorker.register('./sw.js', { scope: './' });
-            await navigator.serviceWorker.ready;
-
-            if (!navigator.serviceWorker.controller) {
-                await new Promise((resolve) => {
-                    navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
-                });
-            }
-        } catch (err) {
-            console.error('[Service Worker] 註冊或控制失敗，串流下載功能無法使用:', err);
-            showToast('Service Worker 初始化失敗，無法進行串流傳輸', 'error');
-        }
-    } else {
-        showToast('您的瀏覽器不支援 Service Worker 串流傳輸', 'error');
-    }
-}
-initServiceWorker();
+let opfsWorker = null;
+let opfsInitPromise = null;
+let resolveOpfsInit = null;
+let rejectOpfsInit = null;
+let currentOffset = 0;
 
 let localCandidates = [];
 let pendingCandidates = [];
@@ -126,7 +102,7 @@ export async function initHost() {
     }
 }
 
-//建立 Durable Object WebSocket 信令轉發通道
+// 建立 Durable Object WebSocket 信令轉發通道
 function connectSignalingWS() {
     const workerUrl = getWorkerUrl();
     const wsUrl = workerUrl.replace(/^http/, 'ws') + `/ws/${state.roomId}`;
@@ -255,7 +231,7 @@ export function setupDataChannelListeners() {
     };
 
     state.dataChannel.onclose = () => {
-        cleanupSWStream(); // 斷線時主動釋放 SW 串流與 Port 資源
+        cleanupOPFSWorker(); // 斷線時主動釋放 OPFS Worker 資源
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
         document.getElementById('transfer-panel').classList.add('hidden');
@@ -267,7 +243,7 @@ export function setupDataChannelListeners() {
     };
 }
 
-// 處理接收資料流
+// 處理接收資料流 (OPFS Dedicated Web Worker 模式)
 export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
@@ -276,63 +252,92 @@ export async function handleIncomingData(data) {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
+                currentOffset = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                currentDesiredSize = 16 * 1024 * 1024;
 
-                let resolved = false;
-                swInitPromise = new Promise((resolve) => {
-                    resolveSwInit = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            resolve();
-                        }
-                    };
+                cleanupOPFSWorker();
+
+                opfsInitPromise = new Promise((resolve, reject) => {
+                    resolveOpfsInit = resolve;
+                    rejectOpfsInit = reject;
                 });
 
-                const swAvailable = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
-                if (!swAvailable) {
-                    showToast('Service Worker 未就緒，無法進行串流下載', 'error');
+                try {
+                    opfsWorker = new Worker('./opfs-worker.js');
+                } catch (err) {
+                    showToast('無法建立 OPFS Worker: ' + err.message, 'error');
                     return;
                 }
 
-                const channel = new MessageChannel();
-                swPort = channel.port1;
+                opfsWorker.onmessage = (e) => {
+                    const msg = e.data;
+                    if (!msg) return;
 
-                swBackpressurePromise = null;
-                swBackpressureResolve = null;
-
-                swPort.onmessage = (e) => {
-                    if (e.data.type === 'init-success') {
-                        const downloadUrl = `./sw-download?id=${currentDownloadId}`;
-                        let iframe = document.getElementById('sw-download-iframe');
-                        if (!iframe) {
-                            iframe = document.createElement('iframe');
-                            iframe.id = 'sw-download-iframe';
-                            iframe.style.display = 'none';
-                            document.body.appendChild(iframe);
+                    if (msg.type === 'init-success') {
+                        if (resolveOpfsInit) {
+                            resolveOpfsInit();
+                            resolveOpfsInit = null;
+                            rejectOpfsInit = null;
                         }
-                        iframe.src = downloadUrl;
+                    }
+                    else if (msg.type === 'finish-success') {
+                        const { blobUrl, filename } = msg;
 
-                        if (resolveSwInit) resolveSwInit();
-                    } 
-                    else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
-                        // 即時同步 SW 隊列的可用空間狀態
-                        currentDesiredSize = e.data.desiredSize;
-                        if (currentDesiredSize > 0 && swBackpressureResolve) {
-                            swBackpressureResolve();
-                            swBackpressurePromise = null;
-                            swBackpressureResolve = null;
+                        // 觸發原生檔案下載
+                        if (typeof triggerAutoDownload === 'function') {
+                            triggerAutoDownload(blobUrl, filename);
+                        } else {
+                            const a = document.createElement('a');
+                            a.href = blobUrl;
+                            a.download = filename;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
                         }
+
+                        // 30秒後釋放 Blob URL 記憶體指標
+                        setTimeout(() => {
+                            URL.revokeObjectURL(blobUrl);
+                        }, 30000);
+
+                        const recvPercent = document.getElementById('recv-percent');
+                        const recvProgressBar = document.getElementById('recv-progress-bar');
+                        if (recvPercent) recvPercent.innerText = '100% (完成)';
+                        if (recvProgressBar) recvProgressBar.style.width = '100%';
+                        showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
+
+                        cleanupOPFSWorker();
+                    }
+                    else if (msg.type === 'error') {
+                        showToast('OPFS 寫入發生錯誤: ' + msg.message, 'error');
+                        if (rejectOpfsInit) {
+                            rejectOpfsInit(new Error(msg.message));
+                            resolveOpfsInit = null;
+                            rejectOpfsInit = null;
+                        }
+                        cleanupOPFSWorker();
                     }
                 };
 
-                navigator.serviceWorker.controller.postMessage({
+                opfsWorker.onerror = (err) => {
+                    console.error('[OPFS Worker 錯誤]:', err);
+                    showToast('OPFS Worker 發生例外錯誤', 'error');
+                    if (rejectOpfsInit) {
+                        rejectOpfsInit(err);
+                        resolveOpfsInit = null;
+                        rejectOpfsInit = null;
+                    }
+                    cleanupOPFSWorker();
+                };
+
+                // 向 Worker 發送初始化命令
+                opfsWorker.postMessage({
                     type: 'init',
                     downloadId: currentDownloadId,
                     filename: message.name,
                     size: message.size
-                }, [channel.port2]);
+                });
 
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
@@ -344,48 +349,42 @@ export async function handleIncomingData(data) {
                 if (recvProgressBar) recvProgressBar.style.width = '0%';
 
             } else if (message.type === 'file-end') {
-                if (swInitPromise) await swInitPromise;
+                if (opfsInitPromise) await opfsInitPromise;
 
-                cleanupSWStream();
-
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = '100% (完成)';
-                if (recvProgressBar) recvProgressBar.style.width = '100%';
-                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+                if (opfsWorker) {
+                    opfsWorker.postMessage({ type: 'finish' });
+                }
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
-            cleanupSWStream();
+            cleanupOPFSWorker();
         }
     } else {
-        if (swInitPromise) await swInitPromise;
+        if (opfsInitPromise) await opfsInitPromise;
 
         state.receivedSize += data.byteLength;
 
-        // 同步判斷 SW 緩衝空間，若已滿則停止寫入並等待釋放
-        if (currentDesiredSize <= 0) {
-            if (!swBackpressurePromise) {
-                swBackpressurePromise = new Promise((resolve) => {
-                    swBackpressureResolve = resolve;
-                });
+        // 零複製 (Zero-Copy) Transferable Objects 傳輸切片給 OPFS Worker
+        if (opfsWorker) {
+            try {
+                if (data instanceof ArrayBuffer) {
+                    opfsWorker.postMessage({
+                        type: 'write',
+                        chunk: data,
+                        offset: currentOffset
+                    }, [data]);
+                } else if (ArrayBuffer.isView(data)) {
+                    opfsWorker.postMessage({
+                        type: 'write',
+                        chunk: data.buffer,
+                        offset: currentOffset
+                    }, [data.buffer]);
+                }
+                currentOffset += data.byteLength;
+            } catch (e) {
+                console.error('[OPFS Direct Write] 切片寫入轉發失敗:', e);
+                cleanupOPFSWorker();
             }
-            await swBackpressurePromise;
-        }
-
-        try {
-            if (navigator.serviceWorker?.controller) {
-                navigator.serviceWorker.controller.postMessage({
-                    type: 'write',
-                    downloadId: currentDownloadId,
-                    chunk: data
-                }, [data]);
-            } else {
-                throw new Error('Service Worker 控制器不存在');
-            }
-        } catch (e) {
-            console.error('[Service Worker] 串流寫入失敗:', e);
-            cleanupSWStream();
         }
 
         if (state.incomingFileInfo) {
@@ -592,17 +591,20 @@ export async function sendFileChunks() {
     }
 }
 
-export function cleanupSWStream() {
-    if (currentDownloadId && navigator.serviceWorker?.controller) {
-        navigator.serviceWorker.controller.postMessage({
-            type: 'close',
-            downloadId: currentDownloadId
-        });
+// 釋放 OPFS Worker 與內部資源
+export function cleanupOPFSWorker() {
+    if (opfsWorker) {
+        try {
+            opfsWorker.postMessage({ type: 'abort' });
+        } catch (e) {}
+        opfsWorker.terminate();
+        opfsWorker = null;
     }
-    if (swPort) {
-        swPort.close();
-        swPort = null;
-    }
-    swBackpressurePromise = null;
-    swBackpressureResolve = null;
+    opfsInitPromise = null;
+    resolveOpfsInit = null;
+    rejectOpfsInit = null;
+    currentOffset = 0;
 }
+
+// 保持與原 webrtc.js 的導出相容，避免外部 JS 調用時失效
+export const cleanupSWStream = cleanupOPFSWorker;

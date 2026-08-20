@@ -1,0 +1,131 @@
+/**
+ * opfs-worker.js - OPFS 高效零記憶體檔案寫入 Worker
+ * 採用 Origin Private File System (OPFS) 搭配 createSyncAccessHandle 實作硬碟直寫
+ */
+
+let accessHandle = null;
+let fileHandle = null;
+let rootDir = null;
+let tempFilename = null;
+let targetFilename = '';
+
+self.onmessage = async (event) => {
+    const data = event.data;
+    if (!data || !data.type) return;
+
+    switch (data.type) {
+        case 'init': {
+            const { downloadId, size, filename } = data;
+            targetFilename = filename || 'downloaded_file';
+
+            try {
+                // 配額檢查 (Storage Quota Check) 防範 QuotaExceededError
+                if (navigator.storage && navigator.storage.estimate) {
+                    const { quota, usage } = await navigator.storage.estimate();
+                    const available = quota - usage;
+                    if (size && available < size) {
+                        throw new Error(`儲存空間不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，剩餘可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
+                    }
+                }
+
+                rootDir = await navigator.storage.getDirectory();
+
+                // 動態亂數檔名防範 Safari 獨佔鎖與 NoModificationAllowedError
+                tempFilename = `temp_${downloadId || Date.now()}_${Date.now()}.tmp`;
+                fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
+                accessHandle = await fileHandle.createSyncAccessHandle();
+
+                self.postMessage({ type: 'init-success' });
+            } catch (err) {
+                console.error('[OPFS Worker] 初始化失敗:', err);
+                await cleanup();
+                self.postMessage({ type: 'error', message: err.message || 'OPFS 初始化失敗' });
+            }
+            break;
+        }
+
+        case 'write': {
+            const { chunk, offset } = data;
+            try {
+                if (!accessHandle) {
+                    throw new Error('OPFS 寫入句柄未就緒或已關閉');
+                }
+
+                const view = new Uint8Array(chunk);
+                accessHandle.write(view, { at: offset });
+
+                self.postMessage({ type: 'write-ack', offset: offset + view.byteLength });
+            } catch (err) {
+                console.error('[OPFS Worker] 寫入失敗:', err);
+                await cleanup();
+                self.postMessage({ type: 'error', message: err.message || 'OPFS 寫入失敗' });
+            }
+            break;
+        }
+
+        case 'finish': {
+            try {
+                if (accessHandle) {
+                    // 顯式呼叫 flush() 確保 WebKit (Safari) 將記憶體緩衝區刷入實體磁碟
+                    accessHandle.flush();
+                    accessHandle.close();
+                    accessHandle = null;
+                }
+
+                if (!fileHandle) {
+                    throw new Error('OPFS 檔案控制桿不存在');
+                }
+
+                const file = await fileHandle.getFile();
+                const blobUrl = URL.createObjectURL(file);
+
+                self.postMessage({
+                    type: 'finish-success',
+                    blobUrl: blobUrl,
+                    filename: targetFilename
+                });
+
+                // 匯出 Blob URL 後主動刪除 OPFS 內的暫存檔
+                if (rootDir && tempFilename) {
+                    await rootDir.removeEntry(tempFilename).catch(() => {});
+                    tempFilename = null;
+                    fileHandle = null;
+                }
+            } catch (err) {
+                console.error('[OPFS Worker] 結束寫入處理解析失敗:', err);
+                await cleanup();
+                self.postMessage({ type: 'error', message: err.message || 'OPFS 結束寫入處理解析失敗' });
+            }
+            break;
+        }
+
+        case 'abort': {
+            await cleanup();
+            break;
+        }
+
+        default:
+            console.warn('[OPFS Worker] 接收到未知的訊息類型:', data.type);
+            break;
+    }
+};
+
+async function cleanup() {
+    if (accessHandle) {
+        try {
+            accessHandle.close();
+        } catch (e) {
+            console.warn('[OPFS Worker] 關閉 accessHandle 失敗:', e);
+        }
+        accessHandle = null;
+    }
+    if (rootDir && tempFilename) {
+        try {
+            await rootDir.removeEntry(tempFilename);
+        } catch (e) {
+            // 忽略刪除失敗 (例如檔案已被刪除)
+        }
+        tempFilename = null;
+        fileHandle = null;
+    }
+}
