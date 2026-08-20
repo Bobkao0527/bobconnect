@@ -323,7 +323,11 @@ export async function handleIncomingData(data) {
                             document.body.appendChild(iframe);
                         }
 
-                        iframe.src = downloadUrl;
+                        const win = window.open('about:blank', '_blank');
+
+                        if (win) {
+                            win.location.href = downloadUrl;
+                        }
 
                         if (resolveSwInit) resolveSwInit();
                     } 
