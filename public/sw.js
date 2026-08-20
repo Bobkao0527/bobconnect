@@ -52,6 +52,14 @@ self.addEventListener('message', (event) => {
                 controller = c;
             },
             pull(c) {
+                console.log(
+                    '[SW PULL]',
+                    downloadId,
+                    'desiredSize=',
+                    c.desiredSize,
+                    'time=',
+                    Date.now()
+                );
                 if (port) {
                     port.postMessage({ 
                         type: 'drain', 
@@ -76,6 +84,16 @@ self.addEventListener('message', (event) => {
         if (streamData && streamData.controller) {
             try {
                 streamData.controller.enqueue(new Uint8Array(chunk));
+
+                console.log(
+                    '[SW WRITE]',
+                    'chunk=',
+                    chunk.byteLength,
+                    'desiredSize=',
+                    streamData.controller.desiredSize,
+                    'time=',
+                    Date.now()
+                );
 
                 if (streamData.port) {
                     streamData.port.postMessage({

@@ -9,7 +9,7 @@ let currentDownloadId = null;
 let swInitPromise = null;
 let resolveSwInit = null;
 
-let currentDesiredSize = 16 * 1024 * 1024;
+let currentDesiredSize = 16 * 1024 * 1024; // 16MB
 let swBackpressurePromise = null;
 let swBackpressureResolve = null;
 let swPort = null;
@@ -303,6 +303,12 @@ export async function handleIncomingData(data) {
                 swBackpressureResolve = null;
 
                 swPort.onmessage = (e) => {
+                    console.log(
+                        '[PAGE ← SW]',
+                        e.data.type,
+                        e.data.desiredSize
+                    );
+
                     if (e.data.type === 'init-success') {
                         const downloadUrl = `./sw-download?id=${currentDownloadId}`;
                         
@@ -452,9 +458,9 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 64KB 切片
-    const maxBufferedAmount = 8 * 1024 * 1024;
-    const resumeBufferedAmount = 2 * 1024 * 1024;
+    const chunkSize = 65536; // 64KB
+    const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
+    const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
