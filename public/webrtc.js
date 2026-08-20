@@ -11,6 +11,7 @@ let swInitPromise = null;
 let resolveSwInit = null;
 
 const MAX_MEMORY_SIZE = 100 * 1024 * 1024; // 100MB 門檻
+let currentDesiredSize = 16 * 1024 * 1024;
 let swBackpressurePromise = null;
 let swBackpressureResolve = null;
 let swPort = null;
@@ -291,14 +292,10 @@ export async function handleIncomingData(data) {
                     };
                 });
 
-                useServiceWorker = message.size > MAX_MEMORY_SIZE;
+                const swAvailable = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
+                useServiceWorker = swAvailable && (message.size > MAX_MEMORY_SIZE);
 
                 if (useServiceWorker) {
-                    if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller) {
-                        showToast('Service Worker 未就緒，無法進行 >100MB 大檔案串流下載', 'error');
-                        return;
-                    }
-
                     const channel = new MessageChannel();
                     swPort = channel.port1;
 
@@ -344,13 +341,21 @@ export async function handleIncomingData(data) {
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = '0%';
+                if (recvProgressBar) recvProgressBar.style.width = '0%';
+
             } else if (message.type === 'file-end') {
                 if (swInitPromise) await swInitPromise;
 
                 if (useServiceWorker) {
                     cleanupSWStream();
 
-                    document.getElementById('recv-percent').innerText = '100% (完成)';
+                    const recvPercent = document.getElementById('recv-percent');
+                    const recvProgressBar = document.getElementById('recv-progress-bar');
+                    if (recvPercent) recvPercent.innerText = '100% (完成)';
+                    if (recvProgressBar) recvProgressBar.style.width = '100%';
                     showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
                 } else {
                     const blob = new Blob(state.receiveBuffer);
@@ -358,7 +363,10 @@ export async function handleIncomingData(data) {
                     state.receiveBuffer = [];
 
                     triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                    document.getElementById('recv-percent').innerText = '100% (完成)';
+                    const recvPercent = document.getElementById('recv-percent');
+                    const recvProgressBar = document.getElementById('recv-progress-bar');
+                    if (recvPercent) recvPercent.innerText = '100% (完成)';
+                    if (recvProgressBar) recvProgressBar.style.width = '100%';
                     showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
 
                     setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
