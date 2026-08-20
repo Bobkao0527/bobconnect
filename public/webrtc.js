@@ -8,11 +8,411 @@ import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAp
 let currentDownloadId = null;
 let swInitPromise = null;
 let resolveSwInit = null;
-
-let currentDesiredSize = 16 * 1024 * 1024; // 16MB
+let currentDesiredSize = 2 * 1024 * 1024; // 2MB
 let swBackpressurePromise = null;
 let swBackpressureResolve = null;
 let swPort = null;
+
+const RECEIVER_WINDOW = 2 * 1024 * 1024;
+const MIN_RECEIVER_CREDIT = 64 * 1024;
+
+let receiverReadySent = false;
+let receiverDownloadTriggered = false;
+let receiverCreditOutstanding = 0;
+let receiverProcessingChain = Promise.resolve();
+
+let senderCredit = 0;
+let senderReadyPromise = null;
+let senderReadyResolve = null;
+let senderCreditResolvers = [];
+let senderAbort = false;
+let senderAbortReason = '';
+
+let swStartedPromise = null;
+let resolveSwStarted = null;
+let firstSwDrainReceived = false;
+
+let swBackpressureReject = null;
+
+function isAppleMobile() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function resolveSenderCreditWaiters() {
+    const resolvers = senderCreditResolvers;
+    senderCreditResolvers = [];
+    resolvers.forEach(resolve => resolve());
+}
+
+function abortSender(reason) {
+    senderAbort = true;
+    senderAbortReason = reason || '傳輸中斷';
+
+    if (senderReadyResolve) {
+        const resolve = senderReadyResolve;
+        senderReadyResolve = null;
+        resolve();
+    }
+
+    resolveSenderCreditWaiters();
+}
+
+function resetSenderFlow() {
+    senderCredit = 0;
+    senderAbort = false;
+    senderAbortReason = '';
+
+    senderReadyPromise = new Promise((resolve) => {
+        senderReadyResolve = resolve;
+    });
+
+    senderCreditResolvers = [];
+}
+
+async function waitForSenderCredit(minBytes = 1) {
+    while (!senderAbort && senderCredit < minBytes && state.dataChannel?.readyState === 'open') {
+        await new Promise((resolve) => {
+            senderCreditResolvers.push(resolve);
+        });
+    }
+
+    if (senderAbort) {
+        throw new Error(senderAbortReason || '接收端取消傳輸');
+    }
+
+    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+        throw new Error('DataChannel 已關閉');
+    }
+}
+
+function sendReceiverCancel(reason) {
+    if (state.dataChannel && state.dataChannel.readyState === 'open') {
+        try {
+            state.dataChannel.send(JSON.stringify({
+                type: 'receiver-cancel',
+                reason: String(reason || '')
+            }));
+        } catch (e) {
+            console.warn('[Receiver] 發送 receiver-cancel 失敗:', e);
+        }
+    }
+}
+
+function resolveSwBackpressure() {
+    if (swBackpressureResolve) {
+        const resolve = swBackpressureResolve;
+
+        swBackpressurePromise = null;
+        swBackpressureResolve = null;
+        swBackpressureReject = null;
+
+        resolve();
+    }
+}
+
+function rejectSwBackpressure(err) {
+    if (swBackpressureReject) {
+        const reject = swBackpressureReject;
+
+        swBackpressurePromise = null;
+        swBackpressureResolve = null;
+        swBackpressureReject = null;
+
+        reject(err || new Error('串流背壓被中斷'));
+    } else {
+        swBackpressurePromise = null;
+        swBackpressureResolve = null;
+        swBackpressureReject = null;
+    }
+}
+
+function waitForSwDrain() {
+    if (currentDesiredSize > 0) {
+        return Promise.resolve();
+    }
+
+    if (!swBackpressurePromise) {
+        swBackpressurePromise = new Promise((resolve, reject) => {
+            swBackpressureResolve = resolve;
+            swBackpressureReject = reject;
+        });
+    }
+
+    return swBackpressurePromise;
+}
+
+function updateIncomingFileUI(force = false) {
+    if (!state.incomingFileInfo) return;
+
+    const now = Date.now();
+
+    if (!force && now - state.lastRecvUiTime <= 100 && state.receivedSize < state.incomingFileInfo.size) {
+        return;
+    }
+
+    state.lastRecvUiTime = now;
+
+    const percent = Math.min(
+        100,
+        Math.round((state.receivedSize / state.incomingFileInfo.size) * 100)
+    );
+
+    const recvPercent = document.getElementById('recv-percent');
+    const recvProgressBar = document.getElementById('recv-progress-bar');
+
+    if (recvPercent) recvPercent.innerText = `${percent}%`;
+    if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+}
+
+function showReceiverAcceptUI() {
+    const box = document.getElementById('incoming-file-box') || document.body;
+
+    let btn = document.getElementById('btn-accept-download');
+
+    if (!btn) {
+        btn = document.createElement('button');
+        btn.id = 'btn-accept-download';
+        btn.type = 'button';
+
+        Object.assign(btn.style, {
+            display: 'block',
+            marginTop: '12px',
+            padding: '10px 16px',
+            borderRadius: '10px',
+            border: 'none',
+            background: '#2563eb',
+            color: '#ffffff',
+            fontSize: '15px',
+            cursor: 'pointer'
+        });
+
+        box.appendChild(btn);
+    }
+
+    btn.disabled = true;
+    btn.innerText = '正在準備接收...';
+
+    btn.onclick = () => {
+        btn.disabled = true;
+        hideReceiverAcceptUI();
+        startReceiverDownloadFlow();
+    };
+}
+
+function enableReceiverAcceptUI() {
+    const btn = document.getElementById('btn-accept-download');
+
+    if (btn) {
+        btn.disabled = false;
+        btn.innerText = '允許並開始儲存';
+    }
+}
+
+function hideReceiverAcceptUI() {
+    const btn = document.getElementById('btn-accept-download');
+
+    if (btn) {
+        btn.onclick = null;
+        btn.remove();
+    }
+}
+
+function triggerStreamDownload(downloadUrl, filename) {
+    if (isAppleMobile()) {
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = filename || 'download';
+        a.style.display = 'none';
+        a.rel = 'noopener';
+
+        document.body.appendChild(a);
+        a.click();
+
+        setTimeout(() => {
+            a.remove();
+        }, 10000);
+    } else {
+        let iframe = document.getElementById('sw-download-iframe');
+
+        if (!iframe) {
+            iframe = document.createElement('iframe');
+            iframe.id = 'sw-download-iframe';
+            iframe.style.display = 'none';
+            document.body.appendChild(iframe);
+        }
+
+        iframe.src = downloadUrl;
+    }
+}
+
+function setupReceiverSwPort(filename, size) {
+    const channel = new MessageChannel();
+    swPort = channel.port1;
+
+    swInitPromise = new Promise((resolve) => {
+        resolveSwInit = resolve;
+    });
+
+    swStartedPromise = new Promise((resolve) => {
+        resolveSwStarted = resolve;
+    });
+
+    firstSwDrainReceived = false;
+
+    swPort.onmessage = (e) => {
+        const msg = e.data || {};
+
+        if (msg.type === 'init-success') {
+            if (resolveSwInit) resolveSwInit();
+
+            if (isAppleMobile()) {
+                enableReceiverAcceptUI();
+            } else {
+                startReceiverDownloadFlow();
+            }
+        }
+
+        else if (msg.type === 'drain' || msg.type === 'write-ack') {
+            currentDesiredSize = Number(msg.desiredSize) || 0;
+
+            if (!firstSwDrainReceived) {
+                firstSwDrainReceived = true;
+
+                if (resolveSwStarted) {
+                    resolveSwStarted();
+                }
+
+                waitForSwStartAndNotifySender();
+            }
+
+            if (currentDesiredSize > 0) {
+                resolveSwBackpressure();
+                grantCreditToSender();
+            }
+        }
+
+        else if (msg.type === 'stream-cancel') {
+            console.warn('[PAGE] SW 串流取消:', msg.reason);
+            showToast('接收端下載已取消或失敗', 'error');
+            sendReceiverCancel(msg.reason || 'stream-cancel');
+            cleanupSWStream();
+        }
+    };
+
+    navigator.serviceWorker.controller.postMessage({
+        type: 'init',
+        downloadId: currentDownloadId,
+        filename,
+        size
+    }, [channel.port2]);
+}
+
+function startReceiverDownloadFlow() {
+    if (!currentDownloadId || receiverDownloadTriggered) return;
+
+    receiverDownloadTriggered = true;
+
+    const downloadUrl = `./sw-download?id=${currentDownloadId}`;
+    triggerStreamDownload(downloadUrl, state.incomingFileInfo?.name);
+
+    waitForSwStartAndNotifySender();
+}
+
+function waitForSwStartAndNotifySender() {
+    if (!swStartedPromise) return;
+
+    swStartedPromise.then(() => {
+        if (receiverReadySent || !state.dataChannel || state.dataChannel.readyState !== 'open') {
+            return;
+        }
+
+        receiverReadySent = true;
+
+        const desired = Number(currentDesiredSize) > 0
+            ? Number(currentDesiredSize)
+            : RECEIVER_WINDOW;
+
+        const credit = Math.max(
+            MIN_RECEIVER_CREDIT,
+            Math.min(RECEIVER_WINDOW, desired)
+        );
+
+        receiverCreditOutstanding += credit;
+
+        state.dataChannel.send(JSON.stringify({
+            type: 'receiver-ready',
+            credit
+        }));
+    }).catch(() => {
+        // 串流可能被取消或清理，忽略即可
+    });
+}
+
+function grantCreditToSender() {
+    if (!receiverReadySent || !state.dataChannel || state.dataChannel.readyState !== 'open') {
+        return;
+    }
+
+    const target = Math.max(0, Math.floor(Number(currentDesiredSize) || 0));
+
+    let credit = target - receiverCreditOutstanding;
+
+    if (credit <= 0) return;
+
+    // 避免過度頻繁送出小 credit
+    if (credit < MIN_RECEIVER_CREDIT && receiverCreditOutstanding > 0) {
+        return;
+    }
+
+    credit = Math.floor(Math.min(credit, RECEIVER_WINDOW));
+
+    if (credit <= 0) return;
+
+    receiverCreditOutstanding += credit;
+
+    try {
+        state.dataChannel.send(JSON.stringify({
+            type: 'receiver-credit',
+            credit
+        }));
+    } catch (e) {
+        console.warn('[Receiver] 發送 receiver-credit 失敗:', e);
+    }
+}
+
+async function processBinaryChunk(data) {
+    if (!currentDownloadId || !state.incomingFileInfo) return;
+
+    if (swInitPromise) {
+        await swInitPromise;
+    }
+
+    const byteLength = data.byteLength;
+
+    receiverCreditOutstanding = Math.max(
+        0,
+        receiverCreditOutstanding - byteLength
+    );
+
+    state.receivedSize += byteLength;
+
+    if (currentDesiredSize <= 0) {
+        await waitForSwDrain();
+    }
+
+    if (!navigator.serviceWorker?.controller) {
+        throw new Error('Service Worker 控制器不存在');
+    }
+
+    navigator.serviceWorker.controller.postMessage({
+        type: 'write',
+        downloadId: currentDownloadId,
+        chunk: data
+    }, [data]);
+
+    updateIncomingFileUI();
+}
 
 // 🚀 初始化並註冊 Service Worker
 async function initServiceWorker() {
@@ -237,29 +637,39 @@ export function setupDataChannelListeners() {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
         triggerAppleGlow();
+
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile
         }));
+
         if (state.ws) {
             state.ws.close();
             state.ws = null;
-            console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
+            console.log('[DO 信令] 握手成功，已主動關閉 WebSocket 連線');
         }
+
         document.getElementById('setup-view').classList.add('hidden');
         document.getElementById('signaling-box').classList.add('hidden');
-        
+
         const tfPanel = document.getElementById('transfer-panel');
         tfPanel.classList.remove('hidden');
         tfPanel.style.opacity = '1';
     };
 
     state.dataChannel.onclose = () => {
-        cleanupSWStream(); // 斷線時主動釋放 SW 串流與 Port 資源
+        abortSender('DataChannel 已關閉');
+        cleanupSWStream();
+
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
+
         document.getElementById('transfer-panel').classList.add('hidden');
         document.getElementById('setup-view').classList.remove('hidden');
+    };
+
+    state.dataChannel.onerror = () => {
+        abortSender('DataChannel 發生錯誤');
     };
 
     state.dataChannel.onmessage = (event) => {
@@ -272,153 +682,104 @@ export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
+
             if (message.type === 'file-meta') {
-                state.incomingFileInfo = { name: message.name, size: message.size };
+                state.incomingFileInfo = {
+                    name: message.name,
+                    size: message.size
+                };
+
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
 
-                currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                currentDesiredSize = 2 * 1024 * 1024;
+                cleanupSWStream();
 
-                let resolved = false;
-                swInitPromise = new Promise((resolve) => {
-                    resolveSwInit = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            resolve();
-                        }
-                    };
-                });
+                currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+                currentDesiredSize = RECEIVER_WINDOW;
+                receiverProcessingChain = Promise.resolve();
+
+                document.getElementById('incoming-file-box')?.classList.remove('hidden');
+
+                const recvFileName = document.getElementById('recv-file-name');
+                if (recvFileName) {
+                    recvFileName.innerText = state.incomingFileInfo.name;
+                }
+
+                updateIncomingFileUI(true);
 
                 const swAvailable = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
+
                 if (!swAvailable) {
                     showToast('Service Worker 未就緒，無法進行串流下載', 'error');
+                    sendReceiverCancel('Service Worker 未就緒');
                     return;
                 }
 
-                const channel = new MessageChannel();
-                swPort = channel.port1;
+                setupReceiverSwPort(message.name, message.size);
 
-                swBackpressurePromise = null;
-                swBackpressureResolve = null;
+                if (isAppleMobile()) {
+                    showReceiverAcceptUI();
+                }
+            }
 
-                swPort.onmessage = (e) => {
-                    console.log(
-                        '[PAGE ← SW]',
-                        e.data.type,
-                        e.data.desiredSize
-                    );
+            else if (message.type === 'receiver-ready') {
+                if (state.isHost) {
+                    senderCredit += Math.max(0, Number(message.credit) || 0);
 
-                    if (e.data.type === 'init-success') {
-                        const downloadUrl = `./sw-download?id=${currentDownloadId}`;
-                        
-                        // iOS / iPadOS Safari 對 iframe 觸發 SW 下載較敏感，相容性處理
-                        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-                        if (isIOS) {
-                            window.location.href = downloadUrl;
-                        } else {
-                            let iframe = document.getElementById('sw-download-iframe');
-                            if (!iframe) {
-                                iframe = document.createElement('iframe');
-                                iframe.id = 'sw-download-iframe';
-                                iframe.style.display = 'none';
-                                document.body.appendChild(iframe);
-                            }
-                            iframe.src = downloadUrl;
-                        }
-
-                        if (resolveSwInit) resolveSwInit();
-                    } 
-                    else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
-                        currentDesiredSize = e.data.desiredSize;
-                        if (currentDesiredSize > 0 && swBackpressureResolve) {
-                            swBackpressureResolve();
-                            swBackpressurePromise = null;
-                            swBackpressureResolve = null;
-                        }
+                    if (senderReadyResolve) {
+                        const resolve = senderReadyResolve;
+                        senderReadyResolve = null;
+                        resolve();
                     }
-                };
 
-                navigator.serviceWorker.controller.postMessage({
-                    type: 'init',
-                    downloadId: currentDownloadId,
-                    filename: message.name,
-                    size: message.size
-                }, [channel.port2]);
+                    resolveSenderCreditWaiters();
 
-                document.getElementById('incoming-file-box')?.classList.remove('hidden');
-                const recvFileName = document.getElementById('recv-file-name');
-                if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
+                    updateStatus('接收端已允許下載，開始傳輸...', 'green');
+                }
+            }
 
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = '0%';
-                if (recvProgressBar) recvProgressBar.style.width = '0%';
+            else if (message.type === 'receiver-credit') {
+                if (state.isHost) {
+                    senderCredit += Math.max(0, Number(message.credit) || 0);
+                    resolveSenderCreditWaiters();
+                }
+            }
 
-            } else if (message.type === 'file-end') {
-                if (swInitPromise) await swInitPromise;
+            else if (message.type === 'receiver-cancel') {
+                if (state.isHost) {
+                    abortSender(message.reason || '接收端取消下載');
+                    showToast('接收端取消或下載失敗', 'error');
+                    updateStatus('接收端取消或下載失敗', 'red');
+                }
+            }
+
+            else if (message.type === 'file-end') {
+                await receiverProcessingChain;
 
                 cleanupSWStream();
 
+                updateIncomingFileUI(true);
+
                 const recvPercent = document.getElementById('recv-percent');
                 const recvProgressBar = document.getElementById('recv-progress-bar');
+
                 if (recvPercent) recvPercent.innerText = '100% (完成)';
                 if (recvProgressBar) recvProgressBar.style.width = '100%';
-                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+
+                showToast(`「${state.incomingFileInfo?.name || '檔案'}」傳輸成功！`, 'success');
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
             cleanupSWStream();
         }
     } else {
-        if (swInitPromise) await swInitPromise;
-
-        state.receivedSize += data.byteLength;
-
-        // 背壓機制：控制 SW 佇列，並加入 50ms 安全逾時防止 WebKit 死鎖
-        if (currentDesiredSize <= 0) {
-            if (!swBackpressurePromise) {
-                swBackpressurePromise = new Promise((resolve) => {
-                    swBackpressureResolve = resolve;
-                    setTimeout(() => {
-                        if (swBackpressureResolve) {
-                            swBackpressureResolve();
-                            swBackpressurePromise = null;
-                            swBackpressureResolve = null;
-                        }
-                    }, 50);
-                });
-            }
-            await swBackpressurePromise;
-        }
-
-        try {
-            if (navigator.serviceWorker?.controller) {
-                navigator.serviceWorker.controller.postMessage({
-                    type: 'write',
-                    downloadId: currentDownloadId,
-                    chunk: data
-                }, [data]);
-            } else {
-                throw new Error('Service Worker 控制器不存在');
-            }
-        } catch (e) {
-            console.error('[Service Worker] 串流寫入失敗:', e);
-            cleanupSWStream();
-        }
-
-        if (state.incomingFileInfo) {
-            const now = Date.now();
-            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
-                state.lastRecvUiTime = now;
-                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = `${percent}%`;
-                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
-            }
-        }
+        receiverProcessingChain = receiverProcessingChain
+            .then(() => processBinaryChunk(data))
+            .catch((err) => {
+                console.error('[Receiver] 處理二進位資料失敗:', err);
+                sendReceiverCancel(err?.message || 'receiver chunk error');
+                cleanupSWStream();
+            });
     }
 }
 
@@ -445,22 +806,28 @@ export async function sendFileChunks() {
         showToast('通道尚未連線或未選擇檔案', 'error');
         return;
     }
+
     const btnSend = document.getElementById('btn-send');
+
     if (btnSend) {
         btnSend.disabled = true;
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
 
-    // 發送元數據
+    resetSenderFlow();
+
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
 
+    updateStatus('等待接收端允許下載...', 'yellow');
+
     const chunkSize = 65536; // 64KB
     const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
     const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
+
     let totalSent = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
@@ -469,45 +836,74 @@ export async function sendFileChunks() {
 
     const formatEta = (seconds) => {
         if (!isFinite(seconds) || seconds <= 0) return '--:--';
+
         seconds = Math.ceil(seconds);
-        if (seconds < 60) return `00:${String(seconds).padStart(2, '0')}`;
+
+        if (seconds < 60) {
+            return `00:${String(seconds).padStart(2, '0')}`;
+        }
+
         const minutes = Math.floor(seconds / 60);
         const secs = seconds % 60;
-        if (minutes < 60) return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+        if (minutes < 60) {
+            return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        }
+
         const hours = Math.floor(minutes / 60);
         const mins = minutes % 60;
+
         return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     };
 
     try {
+        await senderReadyPromise;
+
+        if (senderAbort) {
+            throw new Error(senderAbortReason || '接收端取消下載');
+        }
+
+        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+            throw new Error('DataChannel 已關閉');
+        }
+
+        updateStatus('接收端已允許，開始傳輸...', 'green');
+
         const file = state.selectedFile;
         const fileSize = file.size;
         let offset = 0;
 
-        // 改用 File.slice() 搭配 ArrayBuffer 讀取，完全相容 iPadOS / Mobile Safari
         while (offset < fileSize) {
+            if (senderAbort) {
+                throw new Error(senderAbortReason || '接收端取消下載');
+            }
+
             if (state.dataChannel.readyState !== 'open') {
                 throw new Error('傳輸途中 DataChannel 已關閉');
             }
 
-            // WebRTC 緩衝區監控
+            // WebRTC DataChannel 本地緩衝區背壓
             if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
                 await new Promise((resolve) => {
                     let finished = false;
                     let checkInterval = null;
+
                     const cleanup = () => {
                         if (finished) return;
                         finished = true;
+
                         if (checkInterval) clearInterval(checkInterval);
                         if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
+
                         resolve();
                     };
 
                     checkInterval = setInterval(() => {
-                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                        if (senderAbort || !state.dataChannel || state.dataChannel.readyState !== 'open') {
                             cleanup();
                             return;
                         }
+
                         if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                             cleanup();
                         }
@@ -521,29 +917,60 @@ export async function sendFileChunks() {
                         };
                     }
                 });
+
+                if (senderAbort) {
+                    throw new Error(senderAbortReason || '接收端取消下載');
+                }
             }
 
-            // 讀取 64KB 切片
-            const slice = file.slice(offset, offset + chunkSize);
+            // 接收端 Service Worker / 下載端 credit 背壓
+            await waitForSenderCredit(1);
+
+            if (senderAbort) {
+                throw new Error(senderAbortReason || '接收端取消下載');
+            }
+
+            const creditAvailable = Math.max(0, Math.floor(senderCredit));
+
+            const nextChunkSize = Math.min(
+                chunkSize,
+                creditAvailable,
+                fileSize - offset
+            );
+
+            if (nextChunkSize <= 0) {
+                await waitForSenderCredit(1);
+                continue;
+            }
+
+            const slice = file.slice(offset, offset + nextChunkSize);
             const buffer = await slice.arrayBuffer();
 
+            senderCredit -= buffer.byteLength;
             state.dataChannel.send(buffer);
+
             offset += buffer.byteLength;
             totalSent += buffer.byteLength;
 
-            // UI 進度與速率計算
             const now = performance.now();
+
             if (now - lastUiUpdateTime > 100 || totalSent >= fileSize) {
                 lastUiUpdateTime = now;
 
                 const percent = Math.min(100, Math.round((totalSent / fileSize) * 100));
+
                 document.getElementById('progress-percent').innerText = `${percent}%`;
                 document.getElementById('progress-bar').style.width = `${percent}%`;
 
                 const speedElapsed = (now - lastSpeedTime) / 1000;
+
                 if (speedElapsed > 0) {
                     const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                    smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+
+                    smoothSpeed = smoothSpeed === 0
+                        ? instantSpeed
+                        : smoothSpeed * 0.7 + instantSpeed * 0.3;
+
                     lastSpeedBytes = totalSent;
                     lastSpeedTime = now;
 
@@ -565,6 +992,14 @@ export async function sendFileChunks() {
 
         // 等待 DataChannel 緩衝清空
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
+            if (senderAbort) {
+                throw new Error(senderAbortReason || '接收端取消下載');
+            }
+
+            if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                throw new Error('DataChannel 已關閉');
+            }
+
             await new Promise(resolve => setTimeout(resolve, 50));
         }
 
@@ -586,9 +1021,11 @@ export async function sendFileChunks() {
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
         showToast('傳輸中斷：' + e.message, 'error');
+        updateStatus('傳輸中斷', 'red');
     } finally {
         if (btnSend) {
             if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
+
             btnSend.disabled = false;
             btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
         }
@@ -597,15 +1034,47 @@ export async function sendFileChunks() {
 
 export function cleanupSWStream() {
     if (currentDownloadId && navigator.serviceWorker?.controller) {
-        navigator.serviceWorker.controller.postMessage({
-            type: 'close',
-            downloadId: currentDownloadId
-        });
+        try {
+            navigator.serviceWorker.controller.postMessage({
+                type: 'close',
+                downloadId: currentDownloadId
+            });
+        } catch (e) {
+            console.warn('[Cleanup] 發送 SW close 失敗:', e);
+        }
     }
+
+    rejectSwBackpressure(new Error('串流已清理'));
+
     if (swPort) {
-        swPort.close();
+        try {
+            swPort.close();
+        } catch (e) {
+            // ignore
+        }
         swPort = null;
     }
+
+    currentDownloadId = null;
+
+    swInitPromise = null;
+    resolveSwInit = null;
+
+    swStartedPromise = null;
+    resolveSwStarted = null;
+
+    firstSwDrainReceived = false;
+    receiverDownloadTriggered = false;
+    receiverReadySent = false;
+    receiverCreditOutstanding = 0;
+
+    currentDesiredSize = RECEIVER_WINDOW;
+
     swBackpressurePromise = null;
     swBackpressureResolve = null;
+    swBackpressureReject = null;
+
+    receiverProcessingChain = Promise.resolve();
+
+    hideReceiverAcceptUI();
 }
