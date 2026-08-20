@@ -605,6 +605,3 @@ export function cleanupOPFSWorker() {
     rejectOpfsInit = null;
     currentOffset = 0;
 }
-
-// 保持與原 webrtc.js 的導出相容，避免外部 JS 調用時失效
-export const cleanupSWStream = cleanupOPFSWorker;
