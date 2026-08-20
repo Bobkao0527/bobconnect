@@ -303,7 +303,6 @@ export async function handleIncomingData(data) {
                     };
                 });
 
-                // 🚨 iOS Safari OPFS 初始化最多等待 3 秒，避免永遠卡在 0%
                 const initTimeout = setTimeout(() => {
                     if (!resolved) {
                         console.warn('[OPFS] 初始化逾時，降級至記憶體模式');
@@ -325,7 +324,9 @@ export async function handleIncomingData(data) {
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
             } else if (message.type === 'file-end') {
-                if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+                if (opfsWorkerInitPromise) {
+                    await opfsWorkerInitPromise;
+                }
 
                 if (useOpfsWorker) {
                     opfsWorker.postMessage({ type: 'close' });
@@ -342,39 +343,39 @@ export async function handleIncomingData(data) {
                 }
             }
         } catch (e) {
-            console.error('解析控制訊息失敗:', e);
+            console.error('[RECV CONTROL ERROR]', e);
         }
-    } else {
-        // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
-        if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
-        console.log('[RECV]', data.byteLength, state.receivedSize, '/', state.incomingFileInfo?.size);
-
-        state.receivedSize += data.byteLength;
-
-        if (useOpfsWorker) {
-            try {
-                opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
-            } catch (e) {
-                console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
-                useOpfsWorker = false;
-                state.receiveBuffer.push(data);
-            }
-        } else {
+        return;
+    }
+    // binary chunk 不再等待 OPFS 初始化
+    state.receivedSize += data.byteLength;
+    if (state.receivedSize === data.byteLength) {
+        console.log('[RECV START]', data.byteLength, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
+    }
+    if (useOpfsWorker) {
+        try {
+            opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
+        } catch (e) {
+            console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
+            useOpfsWorker = false;
             state.receiveBuffer.push(data);
         }
-
-        if (state.incomingFileInfo) {
-            const now = Date.now();
-            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
-                state.lastRecvUiTime = now;
-                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = `${percent}%`;
-                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
-            }
+    } else {
+        state.receiveBuffer.push(data);
+    }
+    if (state.incomingFileInfo) {
+        const now = Date.now();
+        if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
+            state.lastRecvUiTime = now;
+            const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+            const recvPercent = document.getElementById('recv-percent');
+            const recvProgressBar = document.getElementById('recv-progress-bar');
+            if (recvPercent) recvPercent.innerText = `${percent}%`;
+            if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
         }
+    }
+    if (state.receivedSize % (4 * 1024 * 1024) < data.byteLength) {
+        console.log('[RECV PROGRESS]', state.receivedSize, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
     }
 }
 
