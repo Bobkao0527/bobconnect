@@ -288,92 +288,61 @@ export async function handleIncomingData(data) {
 
             if (message.type === 'file-meta') {
                 useOpfsWorker = false;
+                opfsWorkerInitPromise = null;
+                resolveOpfsWorkerInit = null;
+
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
                 state.receiveBuffer = [];
 
-                let resolved = false;
-                opfsWorkerInitPromise = new Promise((resolve) => {
-                    resolveOpfsWorkerInit = () => {
-                        if (!resolved) {
-                            resolved = true;
-                            resolve();
-                        }
-                    };
-                });
-
-                const initTimeout = setTimeout(() => {
-                    if (!resolved) {
-                        console.warn('[OPFS] 初始化逾時，降級至記憶體模式');
-                        useOpfsWorker = false;
-                        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
-                    }
-                }, 3000);
-
-                const originalResolve = resolveOpfsWorkerInit;
-                resolveOpfsWorkerInit = () => {
-                    clearTimeout(initTimeout);
-                    originalResolve();
-                };
-
-                opfsWorker.postMessage({ type: 'init', filename: message.name });
-
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
+                console.log('[RECV MODE] 記憶體模式，OPFS 暫停測試');
+
             } else if (message.type === 'file-end') {
-                if (opfsWorkerInitPromise) {
-                    await opfsWorkerInitPromise;
-                }
+                const blob = new Blob(state.receiveBuffer);
+                const downloadUrl = URL.createObjectURL(blob);
+                state.receiveBuffer = [];
 
-                if (useOpfsWorker) {
-                    opfsWorker.postMessage({ type: 'close' });
-                } else {
-                    const blob = new Blob(state.receiveBuffer);
-                    const downloadUrl = URL.createObjectURL(blob);
-                    state.receiveBuffer = [];
+                triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
+                document.getElementById('recv-percent').innerText = '100% (完成)';
+                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
 
-                    triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                    document.getElementById('recv-percent').innerText = '100% (完成)';
-                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
-
-                    setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
-                }
+                setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
             }
         } catch (e) {
             console.error('[RECV CONTROL ERROR]', e);
         }
         return;
     }
-    // binary chunk 不再等待 OPFS 初始化
+
     state.receivedSize += data.byteLength;
+
     if (state.receivedSize === data.byteLength) {
         console.log('[RECV START]', data.byteLength, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
     }
-    if (useOpfsWorker) {
-        try {
-            opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
-        } catch (e) {
-            console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
-            useOpfsWorker = false;
-            state.receiveBuffer.push(data);
-        }
-    } else {
-        state.receiveBuffer.push(data);
-    }
+
+    state.receiveBuffer.push(data);
+
     if (state.incomingFileInfo) {
         const now = Date.now();
+
         if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
             state.lastRecvUiTime = now;
+
             const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+
             const recvPercent = document.getElementById('recv-percent');
             const recvProgressBar = document.getElementById('recv-progress-bar');
+
             if (recvPercent) recvPercent.innerText = `${percent}%`;
             if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
         }
     }
+
     if (state.receivedSize % (4 * 1024 * 1024) < data.byteLength) {
         console.log('[RECV PROGRESS]', state.receivedSize, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
     }
