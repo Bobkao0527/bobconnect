@@ -246,7 +246,6 @@ export function setupDataChannelListeners() {
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
-        
         triggerAppleGlow();
 
         state.dataChannel.send(JSON.stringify({
@@ -260,9 +259,43 @@ export function setupDataChannelListeners() {
             console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
 
+        if (window.__rtcStatsTimer) clearInterval(window.__rtcStatsTimer);
+        window.__rtcStatsTimer = setInterval(async () => {
+            if (!state.peerConnection || state.peerConnection.connectionState !== 'connected') return;
+
+            try {
+                const stats = await state.peerConnection.getStats();
+
+                stats.forEach(report => {
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+                        console.log('[RTC STATS]', {
+                            type: 'candidate-pair',
+                            local: report.localCandidateId,
+                            remote: report.remoteCandidateId,
+                            rtt: report.currentRoundTripTime,
+                            availableBitrate: report.availableOutgoingBitrate,
+                            requestsSent: report.requestsSent,
+                            responsesReceived: report.responsesReceived
+                        });
+                    }
+
+                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+                        console.log('[RTC TRAFFIC]', {
+                            bytesSent: report.bytesSent,
+                            bytesReceived: report.bytesReceived,
+                            packetsSent: report.packetsSent,
+                            packetsReceived: report.packetsReceived
+                        });
+                    }
+                });
+            } catch (e) {
+                console.warn('[RTC STATS ERROR]', e);
+            }
+        }, 1000);
+
         document.getElementById('setup-view').classList.add('hidden');
         document.getElementById('signaling-box').classList.add('hidden');
-        
+
         const tfPanel = document.getElementById('transfer-panel');
         tfPanel.classList.remove('hidden');
         tfPanel.style.opacity = '1';
