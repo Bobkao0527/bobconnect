@@ -46,6 +46,7 @@ self.addEventListener('message', (event) => {
         let controller;
         const port = event.ports && event.ports[0];
 
+        // 將 highWaterMark 降至 2MB，防止 iPad/iOS Safari 記憶體上限溢出
         const stream = new ReadableStream({
             start(c) {
                 controller = c;
@@ -57,8 +58,12 @@ self.addEventListener('message', (event) => {
                         desiredSize: c.desiredSize 
                     });
                 }
+            },
+            cancel(reason) {
+                console.warn('[SW] 串流被取消:', reason);
+                downloadStreams.delete(downloadId);
             }
-        }, new ByteLengthQueuingStrategy({ highWaterMark: 16 * 1024 * 1024 }));
+        }, new ByteLengthQueuingStrategy({ highWaterMark: 2 * 1024 * 1024 }));
         
         downloadStreams.set(downloadId, { stream, controller, filename, size, port });
 

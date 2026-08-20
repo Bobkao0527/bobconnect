@@ -278,7 +278,7 @@ export async function handleIncomingData(data) {
                 state.lastRecvUiTime = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                currentDesiredSize = 16 * 1024 * 1024;
+                currentDesiredSize = 2 * 1024 * 1024;
 
                 let resolved = false;
                 swInitPromise = new Promise((resolve) => {
@@ -305,19 +305,25 @@ export async function handleIncomingData(data) {
                 swPort.onmessage = (e) => {
                     if (e.data.type === 'init-success') {
                         const downloadUrl = `./sw-download?id=${currentDownloadId}`;
-                        let iframe = document.getElementById('sw-download-iframe');
-                        if (!iframe) {
-                            iframe = document.createElement('iframe');
-                            iframe.id = 'sw-download-iframe';
-                            iframe.style.display = 'none';
-                            document.body.appendChild(iframe);
+                        
+                        // iOS / iPadOS Safari 對 iframe 觸發 SW 下載較敏感，相容性處理
+                        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+                        if (isIOS) {
+                            window.location.href = downloadUrl;
+                        } else {
+                            let iframe = document.getElementById('sw-download-iframe');
+                            if (!iframe) {
+                                iframe = document.createElement('iframe');
+                                iframe.id = 'sw-download-iframe';
+                                iframe.style.display = 'none';
+                                document.body.appendChild(iframe);
+                            }
+                            iframe.src = downloadUrl;
                         }
-                        iframe.src = downloadUrl;
 
                         if (resolveSwInit) resolveSwInit();
                     } 
                     else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
-                        // 即時同步 SW 隊列的可用空間狀態
                         currentDesiredSize = e.data.desiredSize;
                         if (currentDesiredSize > 0 && swBackpressureResolve) {
                             swBackpressureResolve();
@@ -363,11 +369,18 @@ export async function handleIncomingData(data) {
 
         state.receivedSize += data.byteLength;
 
-        // 同步判斷 SW 緩衝空間，若已滿則停止寫入並等待釋放
+        // 背壓機制：控制 SW 佇列，並加入 50ms 安全逾時防止 WebKit 死鎖
         if (currentDesiredSize <= 0) {
             if (!swBackpressurePromise) {
                 swBackpressurePromise = new Promise((resolve) => {
                     swBackpressureResolve = resolve;
+                    setTimeout(() => {
+                        if (swBackpressureResolve) {
+                            swBackpressureResolve();
+                            swBackpressurePromise = null;
+                            swBackpressureResolve = null;
+                        }
+                    }, 50);
                 });
             }
             await swBackpressurePromise;
@@ -431,13 +444,15 @@ export async function sendFileChunks() {
         btnSend.disabled = true;
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
+
+    // 發送元數據
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536;
+    const chunkSize = 65536; // 64KB 切片
     const maxBufferedAmount = 8 * 1024 * 1024;
     const resumeBufferedAmount = 2 * 1024 * 1024;
     let totalSent = 0;
@@ -459,108 +474,90 @@ export async function sendFileChunks() {
     };
 
     try {
-        const reader = state.selectedFile.stream().getReader();
-        let leftover = null;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (value) {
-                let currentData = value;
-                if (leftover && leftover.length > 0) {
-                    const combined = new Uint8Array(leftover.length + value.length);
-                    combined.set(leftover);
-                    combined.set(value, leftover.length);
-                    currentData = combined;
-                    leftover = null;
-                }
-                let offset = 0;
-                while (offset + chunkSize <= currentData.length) {
-                    if (state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸途中 DataChannel 已關閉');
-                    }
-                    if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise((resolve) => {
-                            let finished = false;
-                            let checkInterval = null;
-                            const cleanup = () => {
-                                if (finished) return;
-                                finished = true;
-                                if (checkInterval) clearInterval(checkInterval);
-                                if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
-                                resolve();
-                            };
+        const file = state.selectedFile;
+        const fileSize = file.size;
+        let offset = 0;
 
-                            checkInterval = setInterval(() => {
-                                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                                    cleanup();
-                                    return;
-                                }
-
-                                if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
-                                    cleanup();
-                                }
-                            }, 50);
-                            if (state.dataChannel) {
-                                state.dataChannel.onbufferedamountlow = () => {
-                                    if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
-                                        cleanup();
-                                    }
-                                };
-                            }
-                        });
-                    }
-                    const chunk = currentData.subarray(offset, offset + chunkSize);
-                    state.dataChannel.send(chunk);
-                    offset += chunkSize;
-                    totalSent += chunkSize;
-
-                    const now = performance.now();
-                    if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
-                        lastUiUpdateTime = now;
-
-                        const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
-                        document.getElementById('progress-percent').innerText = `${percent}%`;
-                        document.getElementById('progress-bar').style.width = `${percent}%`;
-
-                        const speedElapsed = (now - lastSpeedTime) / 1000;
-                        if (speedElapsed > 0) {
-                            const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                            smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
-                            lastSpeedBytes = totalSent;
-                            lastSpeedTime = now;
-
-                            const speedText = document.getElementById('transfer-speed');
-                            if (speedText) {
-                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-                            }
-
-                            const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
-                            const etaSeconds = remainingBytes / smoothSpeed;
-
-                            const timeText = document.getElementById('transfer-time');
-                            if (timeText) {
-                                timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
-                            }
-                        }
-                    }
-                }
-                if (offset < currentData.length) {
-                    leftover = currentData.subarray(offset);
-                }
+        // 改用 File.slice() 搭配 ArrayBuffer 讀取，完全相容 iPadOS / Mobile Safari
+        while (offset < fileSize) {
+            if (state.dataChannel.readyState !== 'open') {
+                throw new Error('傳輸途中 DataChannel 已關閉');
             }
-            if (done) {
-                if (leftover && leftover.length > 0) {
-                    if (state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸途中 DataChannel 已關閉');
+
+            // WebRTC 緩衝區監控
+            if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+                await new Promise((resolve) => {
+                    let finished = false;
+                    let checkInterval = null;
+                    const cleanup = () => {
+                        if (finished) return;
+                        finished = true;
+                        if (checkInterval) clearInterval(checkInterval);
+                        if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
+                        resolve();
+                    };
+
+                    checkInterval = setInterval(() => {
+                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                            cleanup();
+                            return;
+                        }
+                        if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
+                            cleanup();
+                        }
+                    }, 50);
+
+                    if (state.dataChannel) {
+                        state.dataChannel.onbufferedamountlow = () => {
+                            if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
+                                cleanup();
+                            }
+                        };
                     }
-                    while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise(resolve => setTimeout(resolve, 50));
+                });
+            }
+
+            // 讀取 64KB 切片
+            const slice = file.slice(offset, offset + chunkSize);
+            const buffer = await slice.arrayBuffer();
+
+            state.dataChannel.send(buffer);
+            offset += buffer.byteLength;
+            totalSent += buffer.byteLength;
+
+            // UI 進度與速率計算
+            const now = performance.now();
+            if (now - lastUiUpdateTime > 100 || totalSent >= fileSize) {
+                lastUiUpdateTime = now;
+
+                const percent = Math.min(100, Math.round((totalSent / fileSize) * 100));
+                document.getElementById('progress-percent').innerText = `${percent}%`;
+                document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                const speedElapsed = (now - lastSpeedTime) / 1000;
+                if (speedElapsed > 0) {
+                    const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
+                    smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                    lastSpeedBytes = totalSent;
+                    lastSpeedTime = now;
+
+                    const speedText = document.getElementById('transfer-speed');
+                    if (speedText) {
+                        speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
                     }
-                    state.dataChannel.send(leftover);
-                    totalSent += leftover.length;
+
+                    const remainingBytes = Math.max(0, fileSize - totalSent);
+                    const etaSeconds = remainingBytes / smoothSpeed;
+
+                    const timeText = document.getElementById('transfer-time');
+                    if (timeText) {
+                        timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                    }
                 }
-                break;
             }
         }
+
+        // 等待 DataChannel 緩衝清空
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
