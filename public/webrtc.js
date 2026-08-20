@@ -362,27 +362,33 @@ export async function handleIncomingData(data) {
     } else {
         if (opfsInitPromise) await opfsInitPromise;
 
+        const chunkSize = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
+        if (chunkSize === 0) return;
+
         state.receivedSize += data.byteLength;
 
         // 零複製 (Zero-Copy) Transferable Objects 傳輸切片給 OPFS Worker
         if (opfsWorker) {
             try {
+                let bufferToTransfer = null;
+
                 if (data instanceof ArrayBuffer) {
-                    opfsWorker.postMessage({
-                        type: 'write',
-                        chunk: data,
-                        offset: currentOffset
-                    }, [data]);
+                    bufferToTransfer = data;
                 } else if (ArrayBuffer.isView(data)) {
+                    bufferToTransfer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                }
+
+                if (bufferToTransfer) {
                     opfsWorker.postMessage({
                         type: 'write',
-                        chunk: data.buffer,
+                        chunk: bufferToTransfer,
                         offset: currentOffset
-                    }, [data.buffer]);
+                    }, [bufferToTransfer]); // 轉移所有權
+
+                    currentOffset += chunkSize;
                 }
-                currentOffset += data.byteLength;
             } catch (e) {
-                console.error('[OPFS Direct Write] 切片寫入轉發失敗:', e);
+                console.error('[OPFS Direct Write] 切片寫入轉送失敗:', e);
                 cleanupOPFSWorker();
             }
         }
