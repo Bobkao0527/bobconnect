@@ -1,5 +1,5 @@
 /**
- * sw.js - Service Worker 串流下載服務
+ * sw.js - Service Worker 串流下載服務 (修正版)
  * 攔截特定下載請求，透過 ReadableStream 實現免記憶體暫存的檔案串流下載
  */
 const downloadStreams = new Map();
@@ -22,9 +22,11 @@ self.addEventListener('fetch', (event) => {
 
         if (streamData) {
             const { stream, filename, size } = streamData;
+            const encodedFilename = encodeURIComponent(filename);
+            
             const headers = new Headers({
                 'Content-Type': 'application/octet-stream',
-                'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+                'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`,
             });
 
             if (size) {
@@ -32,7 +34,8 @@ self.addEventListener('fetch', (event) => {
             }
 
             event.respondWith(new Response(stream, { headers }));
-            downloadStreams.delete(downloadId);
+            
+            // 🚨 修正：切勿在這裡 delete！否則後續寫入 chunk 會找不到 controller。
         }
     }
 });
@@ -71,6 +74,9 @@ self.addEventListener('message', (event) => {
                 streamData.controller.close();
             } catch (err) {
                 console.error('[SW] 串流關閉失敗:', err);
+            } finally {
+                // 🚀 傳輸完成且關閉串流後，才安全釋放記憶體
+                downloadStreams.delete(downloadId);
             }
         }
     }
