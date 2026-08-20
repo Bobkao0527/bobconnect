@@ -87,7 +87,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 131072;
+        state.dataChannel.bufferedAmountLowThreshold = 256 * 1024;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -212,7 +212,7 @@ export async function initJoinerWithRoom(roomId) {
 
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = 131072;
+            state.dataChannel.bufferedAmountLowThreshold = 256 * 1024;
             setupDataChannelListeners();
         };
 
@@ -417,9 +417,9 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 64KB
-    const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
-    const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
+    const chunkSize = 16384; // 16KB
+    const maxBufferedAmount = 1 * 1024 * 1024; // 1MB
+    const resumeBufferedAmount = 256 * 1024; // 256KB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
 
