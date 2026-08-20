@@ -87,7 +87,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 256 * 1024;
+        state.dataChannel.bufferedAmountLowThreshold = 131072;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -201,21 +201,17 @@ async function processPendingCandidates() {
 // 接收端：自動對接
 export async function initJoinerWithRoom(roomId) {
     if (roomId) state.roomId = roomId;
-
     document.getElementById('setup-view').classList.add('hidden');
     document.getElementById('signaling-box').classList.remove('hidden');
     document.getElementById('joiner-panel').classList.remove('hidden');
     updateStatus('正在連接 DO 信令房間...', 'yellow');
-
     try {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
-
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = 256 * 1024;
+            state.dataChannel.bufferedAmountLowThreshold = 131072;
             setupDataChannelListeners();
         };
-
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 const payload = {
@@ -230,9 +226,7 @@ export async function initJoinerWithRoom(roomId) {
                 }
             }
         };
-
         connectSignalingWS();
-
     } catch (e) {
         showToast(e.message, 'error');
         updateStatus('連線建立中斷', 'red');
@@ -242,86 +236,32 @@ export async function initJoinerWithRoom(roomId) {
 // 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
-
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
         triggerAppleGlow();
-
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile
         }));
-
         if (state.ws) {
             state.ws.close();
             state.ws = null;
             console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
-
-        state.dataChannel.onbufferedamountlow = null;
-
-        state.dataChannel.addEventListener('closing', () => {
-            console.warn('[RTC DC] closing');
-        });
-
-        state.dataChannel.addEventListener('close', () => {
-            console.warn('[RTC DC] close');
-        });
-
-        state.dataChannel.addEventListener('error', (e) => {
-            console.error('[RTC DC] error', e);
-        });
-
-        if (window.__rtcStatsTimer) clearInterval(window.__rtcStatsTimer);
-        window.__rtcStatsTimer = setInterval(async () => {
-            if (!state.peerConnection || state.peerConnection.connectionState !== 'connected') return;
-
-            try {
-                const stats = await state.peerConnection.getStats();
-
-                stats.forEach(report => {
-                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-                        console.log('[RTC STATS]', {
-                            type: 'candidate-pair',
-                            local: report.localCandidateId,
-                            remote: report.remoteCandidateId,
-                            rtt: report.currentRoundTripTime,
-                            availableBitrate: report.availableOutgoingBitrate,
-                            requestsSent: report.requestsSent,
-                            responsesReceived: report.responsesReceived
-                        });
-                    }
-
-                    if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
-                        console.log('[RTC TRAFFIC]', {
-                            bytesSent: report.bytesSent,
-                            bytesReceived: report.bytesReceived,
-                            packetsSent: report.packetsSent,
-                            packetsReceived: report.packetsReceived
-                        });
-                    }
-                });
-            } catch (e) {
-                console.warn('[RTC STATS ERROR]', e);
-            }
-        }, 1000);
-
         document.getElementById('setup-view').classList.add('hidden');
         document.getElementById('signaling-box').classList.add('hidden');
-
+        
         const tfPanel = document.getElementById('transfer-panel');
         tfPanel.classList.remove('hidden');
         tfPanel.style.opacity = '1';
     };
-
     state.dataChannel.onclose = () => {
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
         document.getElementById('transfer-panel').classList.add('hidden');
         document.getElementById('setup-view').classList.remove('hidden');
     };
-
     state.dataChannel.onmessage = (event) => {
         handleIncomingData(event.data);
     };
@@ -332,67 +272,88 @@ export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
-
             if (message.type === 'file-meta') {
                 useOpfsWorker = false;
-                opfsWorkerInitPromise = null;
-                resolveOpfsWorkerInit = null;
-
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
                 state.receiveBuffer = [];
-
+                let resolved = false;
+                opfsWorkerInitPromise = new Promise((resolve) => {
+                    resolveOpfsWorkerInit = () => {
+                        if (!resolved) {
+                            resolved = true;
+                            resolve();
+                        }
+                    };
+                });
+                // 🚨 iOS Safari OPFS 初始化最多等待 3 秒，避免永遠卡在 0%
+                const initTimeout = setTimeout(() => {
+                    if (!resolved) {
+                        console.warn('[OPFS] 初始化逾時，降級至記憶體模式');
+                        useOpfsWorker = false;
+                        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
+                    }
+                }, 3000);
+                const originalResolve = resolveOpfsWorkerInit;
+                resolveOpfsWorkerInit = () => {
+                    clearTimeout(initTimeout);
+                    originalResolve();
+                };
+                opfsWorker.postMessage({ type: 'init', filename: message.name });
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
-                console.log('[RECV MODE] 記憶體模式，OPFS 暫停測試');
-
             } else if (message.type === 'file-end') {
-                const blob = new Blob(state.receiveBuffer);
-                const downloadUrl = URL.createObjectURL(blob);
-                state.receiveBuffer = [];
+                if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+                if (useOpfsWorker) {
+                    opfsWorker.postMessage({ type: 'close' });
+                } else {
+                    const blob = new Blob(state.receiveBuffer);
+                    const downloadUrl = URL.createObjectURL(blob);
+                    state.receiveBuffer = [];
 
-                triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                document.getElementById('recv-percent').innerText = '100% (完成)';
-                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
+                    triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
+                    document.getElementById('recv-percent').innerText = '100% (完成)';
+                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
 
-                setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
+                    setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
+                }
             }
         } catch (e) {
-            console.error('[RECV CONTROL ERROR]', e);
+            console.error('解析控制訊息失敗:', e);
         }
-        return;
-    }
+    } else {
+        // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
+        if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
 
-    state.receivedSize += data.byteLength;
+        state.receivedSize += data.byteLength;
 
-    if (state.receivedSize === data.byteLength) {
-        console.log('[RECV START]', data.byteLength, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
-    }
-
-    //Test Only
-    //state.receiveBuffer.push(data);
-
-    if (state.incomingFileInfo) {
-        const now = Date.now();
-
-        if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
-            state.lastRecvUiTime = now;
-
-            const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-
-            const recvPercent = document.getElementById('recv-percent');
-            const recvProgressBar = document.getElementById('recv-progress-bar');
-
-            if (recvPercent) recvPercent.innerText = `${percent}%`;
-            if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+        if (useOpfsWorker) {
+            try {
+                opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
+            } catch (e) {
+                console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
+                useOpfsWorker = false;
+                state.receiveBuffer.push(data);
+            }
+        } else {
+            state.receiveBuffer.push(data);
         }
-    }
 
-    if (state.receivedSize % (4 * 1024 * 1024) < data.byteLength) {
-        console.log('[RECV PROGRESS]', state.receivedSize, '/', state.incomingFileInfo?.size, 'OPFS=', useOpfsWorker);
+        if (state.incomingFileInfo) {
+            const now = Date.now();
+            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
+                state.lastRecvUiTime = now;
+                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = `${percent}%`;
+                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+            }
+        }
     }
 }
 
@@ -419,35 +380,28 @@ export async function sendFileChunks() {
         showToast('通道尚未連線或未選擇檔案', 'error');
         return;
     }
-
     const btnSend = document.getElementById('btn-send');
     if (btnSend) {
         btnSend.disabled = true;
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
-
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
         name: state.selectedFile.name,
         size: state.selectedFile.size
     }));
-
-    const chunkSize = 8192; // 8KB
-    const maxBufferedAmount = 1 * 1024 * 1024; // 1MB
-    const resumeBufferedAmount = 256 * 1024; // 256KB
+    const chunkSize = 65536; // 64KB
+    const maxBufferedAmount = 8 * 1024 * 1024; // 8MB
+    const resumeBufferedAmount = 2 * 1024 * 1024; // 2MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
-
     try {
         const reader = state.selectedFile.stream().getReader();
         let leftover = null;
-
         while (true) {
             const { done, value } = await reader.read();
-
             if (value) {
                 let currentData = value;
-
                 if (leftover && leftover.length > 0) {
                     const combined = new Uint8Array(leftover.length + value.length);
                     combined.set(leftover);
@@ -455,19 +409,14 @@ export async function sendFileChunks() {
                     currentData = combined;
                     leftover = null;
                 }
-
                 let offset = 0;
                 while (offset + chunkSize <= currentData.length) {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
-
                     if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        console.log('[BACKPRESSURE] 等待 bufferedAmount 降低:', state.dataChannel.bufferedAmount);
-
                         await new Promise((resolve, reject) => {
                             let finished = false;
-
                             const cleanup = () => {
                                 if (finished) return;
                                 finished = true;
@@ -475,7 +424,6 @@ export async function sendFileChunks() {
                                 if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
                                 resolve();
                             };
-
                             const checkInterval = setInterval(() => {
                                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                                     cleanup();
@@ -486,7 +434,6 @@ export async function sendFileChunks() {
                                     cleanup();
                                 }
                             }, 50);
-
                             if (state.dataChannel) {
                                 state.dataChannel.onbufferedamountlow = () => {
                                     if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
@@ -494,30 +441,16 @@ export async function sendFileChunks() {
                                     }
                                 };
                             }
-
                             if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                                 cleanup();
                             }
                         });
 
-                        console.log('[BACKPRESSURE] 解除:', state.dataChannel?.bufferedAmount);
                     }
-
                     const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
-                    if (totalSent % (1024 * 1024) < chunkSize) {
-                        console.log(
-                            '[SEND PROGRESS]',
-                            totalSent,
-                            '/',
-                            state.selectedFile.size,
-                            'buffered=',
-                            state.dataChannel.bufferedAmount
-                        );
-                    }
-
                     const now = Date.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
                         lastUiUpdateTime = now;
@@ -526,41 +459,32 @@ export async function sendFileChunks() {
                         document.getElementById('progress-bar').style.width = `${percent}%`;
                     }
                 }
-
                 if (offset < currentData.length) {
                     leftover = currentData.subarray(offset);
                 }
             }
-
             if (done) {
                 if (leftover && leftover.length > 0) {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
-
                     while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        console.log('[BACKPRESSURE] 最後區塊等待:', state.dataChannel.bufferedAmount);
                         await new Promise(resolve => setTimeout(resolve, 50));
                     }
-
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
                 }
                 break;
             }
         }
-
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
-
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
-
         document.getElementById('progress-status').innerText = '傳送完畢';
         document.getElementById('progress-percent').innerText = '100%';
         document.getElementById('progress-bar').style.width = '100%';
         showToast('檔案已完全投遞！', 'success');
-
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
         showToast('傳輸中斷：' + e.message, 'error');
