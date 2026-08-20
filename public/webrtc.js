@@ -259,6 +259,20 @@ export function setupDataChannelListeners() {
             console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
 
+        state.dataChannel.onbufferedamountlow = null;
+
+        state.dataChannel.addEventListener('closing', () => {
+            console.warn('[RTC DC] closing');
+        });
+
+        state.dataChannel.addEventListener('close', () => {
+            console.warn('[RTC DC] close');
+        });
+
+        state.dataChannel.addEventListener('error', (e) => {
+            console.error('[RTC DC] error', e);
+        });
+
         if (window.__rtcStatsTimer) clearInterval(window.__rtcStatsTimer);
         window.__rtcStatsTimer = setInterval(async () => {
             if (!state.peerConnection || state.peerConnection.connectionState !== 'connected') return;
@@ -417,7 +431,7 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 16384; // 16KB
+    const chunkSize = 8192; // 8KB
     const maxBufferedAmount = 1 * 1024 * 1024; // 1MB
     const resumeBufferedAmount = 256 * 1024; // 256KB
     let totalSent = 0;
@@ -492,6 +506,16 @@ export async function sendFileChunks() {
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
+                    if (totalSent % (1024 * 1024) < chunkSize) {
+                        console.log(
+                            '[SEND PROGRESS]',
+                            totalSent,
+                            '/',
+                            state.selectedFile.size,
+                            'buffered=',
+                            state.dataChannel.bufferedAmount
+                        );
+                    }
 
                     const now = Date.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
