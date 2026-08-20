@@ -5,12 +5,10 @@
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
 
-let useServiceWorker = false;
 let currentDownloadId = null;
 let swInitPromise = null;
 let resolveSwInit = null;
 
-const MAX_MEMORY_SIZE = 100 * 1024 * 1024; // 100MB 門檻
 let currentDesiredSize = 16 * 1024 * 1024;
 let swBackpressurePromise = null;
 let swBackpressureResolve = null;
@@ -30,9 +28,12 @@ async function initServiceWorker() {
             }
             useServiceWorker = true;
         } catch (err) {
-            console.warn('[Service Worker] 註冊或控制失敗，降級為記憶體模式:', err);
+            console.error('[Service Worker] 註冊或控制失敗，串流下載功能無法使用:', err);
+            showToast('Service Worker 初始化失敗，無法進行串流傳輸', 'error');
             useServiceWorker = false;
         }
+    } else {
+        showToast('您的瀏覽器不支援 Service Worker 串流傳輸', 'error');
     }
 }
 initServiceWorker();
@@ -277,7 +278,6 @@ export async function handleIncomingData(data) {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
-                state.receiveBuffer = [];
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 currentDesiredSize = 16 * 1024 * 1024;
@@ -293,49 +293,48 @@ export async function handleIncomingData(data) {
                 });
 
                 const swAvailable = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
-                useServiceWorker = swAvailable && (message.size > MAX_MEMORY_SIZE);
-
-                if (useServiceWorker) {
-                    const channel = new MessageChannel();
-                    swPort = channel.port1;
-
-                    swBackpressurePromise = null;
-                    swBackpressureResolve = null;
-
-                    swPort.onmessage = (e) => {
-                        if (e.data.type === 'init-success') {
-                            const downloadUrl = `./sw-download?id=${currentDownloadId}`;
-                            let iframe = document.getElementById('sw-download-iframe');
-                            if (!iframe) {
-                                iframe = document.createElement('iframe');
-                                iframe.id = 'sw-download-iframe';
-                                iframe.style.display = 'none';
-                                document.body.appendChild(iframe);
-                            }
-                            iframe.src = downloadUrl;
-
-                            if (resolveSwInit) resolveSwInit();
-                        } 
-                        else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
-                            // 即時同步 SW 隊列的可用空間狀態
-                            currentDesiredSize = e.data.desiredSize;
-                            if (currentDesiredSize > 0 && swBackpressureResolve) {
-                                swBackpressureResolve();
-                                swBackpressurePromise = null;
-                                swBackpressureResolve = null;
-                            }
-                        }
-                    };
-
-                    navigator.serviceWorker.controller.postMessage({
-                        type: 'init',
-                        downloadId: currentDownloadId,
-                        filename: message.name,
-                        size: message.size
-                    }, [channel.port2]);
-                } else {
-                    if (resolveSwInit) resolveSwInit();
+                if (!swAvailable) {
+                    showToast('Service Worker 未就緒，無法進行串流下載', 'error');
+                    return;
                 }
+
+                const channel = new MessageChannel();
+                swPort = channel.port1;
+
+                swBackpressurePromise = null;
+                swBackpressureResolve = null;
+
+                swPort.onmessage = (e) => {
+                    if (e.data.type === 'init-success') {
+                        const downloadUrl = `./sw-download?id=${currentDownloadId}`;
+                        let iframe = document.getElementById('sw-download-iframe');
+                        if (!iframe) {
+                            iframe = document.createElement('iframe');
+                            iframe.id = 'sw-download-iframe';
+                            iframe.style.display = 'none';
+                            document.body.appendChild(iframe);
+                        }
+                        iframe.src = downloadUrl;
+
+                        if (resolveSwInit) resolveSwInit();
+                    } 
+                    else if (e.data.type === 'write-ack' || e.data.type === 'drain') {
+                        // 即時同步 SW 隊列的可用空間狀態
+                        currentDesiredSize = e.data.desiredSize;
+                        if (currentDesiredSize > 0 && swBackpressureResolve) {
+                            swBackpressureResolve();
+                            swBackpressurePromise = null;
+                            swBackpressureResolve = null;
+                        }
+                    }
+                };
+
+                navigator.serviceWorker.controller.postMessage({
+                    type: 'init',
+                    downloadId: currentDownloadId,
+                    filename: message.name,
+                    size: message.size
+                }, [channel.port2]);
 
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
@@ -349,28 +348,13 @@ export async function handleIncomingData(data) {
             } else if (message.type === 'file-end') {
                 if (swInitPromise) await swInitPromise;
 
-                if (useServiceWorker) {
-                    cleanupSWStream();
+                cleanupSWStream();
 
-                    const recvPercent = document.getElementById('recv-percent');
-                    const recvProgressBar = document.getElementById('recv-progress-bar');
-                    if (recvPercent) recvPercent.innerText = '100% (完成)';
-                    if (recvProgressBar) recvProgressBar.style.width = '100%';
-                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
-                } else {
-                    const blob = new Blob(state.receiveBuffer);
-                    const downloadUrl = URL.createObjectURL(blob);
-                    state.receiveBuffer = [];
-
-                    triggerAutoDownload(downloadUrl, state.incomingFileInfo.name, state.incomingFileInfo.size);
-                    const recvPercent = document.getElementById('recv-percent');
-                    const recvProgressBar = document.getElementById('recv-progress-bar');
-                    if (recvPercent) recvPercent.innerText = '100% (完成)';
-                    if (recvProgressBar) recvProgressBar.style.width = '100%';
-                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
-
-                    setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
-                }
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = '100% (完成)';
+                if (recvProgressBar) recvProgressBar.style.width = '100%';
+                showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
@@ -381,29 +365,29 @@ export async function handleIncomingData(data) {
 
         state.receivedSize += data.byteLength;
 
-        if (useServiceWorker) {
-            // 同步判斷 SW 緩衝空間，若已滿則停止寫入並等待釋放
-            if (currentDesiredSize <= 0) {
-                if (!swBackpressurePromise) {
-                    swBackpressurePromise = new Promise((resolve) => {
-                        swBackpressureResolve = resolve;
-                    });
-                }
-                await swBackpressurePromise;
+        // 同步判斷 SW 緩衝空間，若已滿則停止寫入並等待釋放
+        if (currentDesiredSize <= 0) {
+            if (!swBackpressurePromise) {
+                swBackpressurePromise = new Promise((resolve) => {
+                    swBackpressureResolve = resolve;
+                });
             }
+            await swBackpressurePromise;
+        }
 
-            try {
+        try {
+            if (navigator.serviceWorker?.controller) {
                 navigator.serviceWorker.controller.postMessage({
                     type: 'write',
                     downloadId: currentDownloadId,
                     chunk: data
                 }, [data]);
-            } catch (e) {
-                console.error('[Service Worker] 串流寫入失敗:', e);
-                cleanupSWStream();
+            } else {
+                throw new Error('Service Worker 控制器不存在');
             }
-        } else {
-            state.receiveBuffer.push(data);
+        } catch (e) {
+            console.error('[Service Worker] 串流寫入失敗:', e);
+            cleanupSWStream();
         }
 
         if (state.incomingFileInfo) {
@@ -611,7 +595,7 @@ export async function sendFileChunks() {
 }
 
 export function cleanupSWStream() {
-    if (useServiceWorker && currentDownloadId && navigator.serviceWorker?.controller) {
+    if (currentDownloadId && navigator.serviceWorker?.controller) {
         navigator.serviceWorker.controller.postMessage({
             type: 'close',
             downloadId: currentDownloadId
