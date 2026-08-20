@@ -5,44 +5,28 @@
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
 
-let useOpfsWorker = false;
-let opfsWorkerInitPromise = null;
-let resolveOpfsWorkerInit = null;
-const opfsWorker = new Worker(new URL('./opfs-worker.js', import.meta.url), { type: 'module' });
+let useServiceWorker = false;
+let currentDownloadId = null;
+let swInitPromise = null;
+let resolveSwInit = null;
 
-opfsWorker.onmessage = (e) => {
-    const { type, url, error } = e.data;
-
-    if (type === 'init-success') {
-        useOpfsWorker = true;
-        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
-    } 
-    else if (type === 'init-error') {
-        console.warn("[OPFS Worker] 建立失敗，降級為記憶體模式:", error);
-        useOpfsWorker = false;
-        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
-    } 
-    else if (type === 'complete') {
-        // Worker 寫入完成，觸發下載
-        triggerAutoDownload(url, state.incomingFileInfo.name, state.incomingFileInfo.size);
-        document.getElementById('recv-percent').innerText = '100% (完成)';
-        showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
-
-        // 🚀 自動下載後延遲釋放 Blob URL，防止記憶體洩漏
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
+// 🚀 初始化並註冊 Service Worker
+async function initServiceWorker() {
+    if ('serviceWorker' in navigator) {
+        try {
+            await navigator.serviceWorker.register('./sw.js', { scope: './' });
+            await navigator.serviceWorker.ready;
+            useServiceWorker = true;
+        } catch (err) {
+            console.warn('[Service Worker] 註冊失敗，降級為記憶體模式:', err);
+            useServiceWorker = false;
+        }
     }
-    else if (type === 'error') {
-        console.error("[OPFS Worker 錯誤]:", error);
-        showToast(error, 'error');
-    }
-};
+}
+initServiceWorker();
 
 let localCandidates = [];
-// 🚀 批次寫入緩衝桶（避免 I/O 佇列爆滿）
-let currentBatchSize = 0;
-const BATCH_THRESHOLD = 4 * 1024 * 1024; // 累積滿 4MB 才寫一次硬碟
 let pendingCandidates = [];
-let opfsInitPromise = null;
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -273,42 +257,83 @@ export async function handleIncomingData(data) {
         try {
             const message = JSON.parse(data);
             if (message.type === 'file-meta') {
-                useOpfsWorker = false;
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
                 state.receiveBuffer = [];
+
+                currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
                 let resolved = false;
-                opfsWorkerInitPromise = new Promise((resolve) => {
-                    resolveOpfsWorkerInit = () => {
+                swInitPromise = new Promise((resolve) => {
+                    resolveSwInit = () => {
                         if (!resolved) {
                             resolved = true;
                             resolve();
                         }
                     };
                 });
-                // 🚨 iOS Safari OPFS 初始化最多等待 3 秒，避免永遠卡在 0%
+
+                // 超時保護：若 Service Worker 沒在 3 秒內反應則降級記憶體模式
                 const initTimeout = setTimeout(() => {
                     if (!resolved) {
-                        console.warn('[OPFS] 初始化逾時，降級至記憶體模式');
-                        useOpfsWorker = false;
-                        if (resolveOpfsWorkerInit) resolveOpfsWorkerInit();
+                        console.warn('[Service Worker] 初始化逾時，降級至記憶體模式');
+                        useServiceWorker = false;
+                        if (resolveSwInit) resolveSwInit();
                     }
                 }, 3000);
-                const originalResolve = resolveOpfsWorkerInit;
-                resolveOpfsWorkerInit = () => {
+
+                const originalResolve = resolveSwInit;
+                resolveSwInit = () => {
                     clearTimeout(initTimeout);
                     originalResolve();
                 };
-                opfsWorker.postMessage({ type: 'init', filename: message.name });
+
+                if (useServiceWorker && navigator.serviceWorker.controller) {
+                    const channel = new MessageChannel();
+                    channel.port1.onmessage = (e) => {
+                        if (e.data.type === 'init-success') {
+                            // 🚀 建立隱藏 iframe 觸發瀏覽器原生存流下載
+                            const downloadUrl = `./sw-download?id=${currentDownloadId}`;
+                            let iframe = document.getElementById('sw-download-iframe');
+                            if (!iframe) {
+                                iframe = document.createElement('iframe');
+                                iframe.id = 'sw-download-iframe';
+                                iframe.style.display = 'none';
+                                document.body.appendChild(iframe);
+                            }
+                            iframe.src = downloadUrl;
+
+                            if (resolveSwInit) resolveSwInit();
+                        }
+                    };
+
+                    navigator.serviceWorker.controller.postMessage({
+                        type: 'init',
+                        downloadId: currentDownloadId,
+                        filename: message.name,
+                        size: message.size
+                    }, [channel.port2]);
+                } else {
+                    useServiceWorker = false;
+                    if (resolveSwInit) resolveSwInit();
+                }
+
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
             } else if (message.type === 'file-end') {
-                if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
-                if (useOpfsWorker) {
-                    opfsWorker.postMessage({ type: 'close' });
+                if (swInitPromise) await swInitPromise;
+
+                if (useServiceWorker && navigator.serviceWorker.controller) {
+                    navigator.serviceWorker.controller.postMessage({
+                        type: 'close',
+                        downloadId: currentDownloadId
+                    });
+
+                    document.getElementById('recv-percent').innerText = '100% (完成)';
+                    showToast(`「${state.incomingFileInfo.name}」傳輸成功！`, 'success');
                 } else {
                     const blob = new Blob(state.receiveBuffer);
                     const downloadUrl = URL.createObjectURL(blob);
@@ -325,17 +350,20 @@ export async function handleIncomingData(data) {
             console.error('解析控制訊息失敗:', e);
         }
     } else {
-        // 第一個 binary chunk 到達時，如果 OPFS 還沒完成初始化，最多只等 3 秒
-        if (opfsWorkerInitPromise) await opfsWorkerInitPromise;
+        if (swInitPromise) await swInitPromise;
 
         state.receivedSize += data.byteLength;
 
-        if (useOpfsWorker) {
+        if (useServiceWorker && navigator.serviceWorker.controller) {
             try {
-                opfsWorker.postMessage({ type: 'write', chunk: data }, [data]);
+                navigator.serviceWorker.controller.postMessage({
+                    type: 'write',
+                    downloadId: currentDownloadId,
+                    chunk: data
+                }, [data]);
             } catch (e) {
-                console.error('[OPFS] Worker 傳送失敗，降級記憶體模式:', e);
-                useOpfsWorker = false;
+                console.error('[Service Worker] 傳送失敗，降級記憶體模式:', e);
+                useServiceWorker = false;
                 state.receiveBuffer.push(data);
             }
         } else {
