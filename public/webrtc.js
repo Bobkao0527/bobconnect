@@ -17,11 +17,11 @@ let isWorkerReady = false;
 let isProcessingQueue = false;
 let fileEndPending = false;
 let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
-const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024; // 限制最多 2MB 處於 Worker
+const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 限制最多 8MB 處於 Worker
 
 let unackedBytes = 0;
 let ackResolver = null;
-const MAX_UNACKED_BYTES = 2 * 1024 * 1024; // 發送端最多允許 2MB 在途未確認資料
+const MAX_UNACKED_BYTES = 8 * 1024 * 1024; // 發送端最多允許 8MB 在途未確認資料
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -373,22 +373,25 @@ export async function handleIncomingData(data) {
                     return;
                 }
 
+                let accumulatedAckBytes = 0;
+
                 opfsWorker.onmessage = (e) => {
                     const msg = e.data;
                     if (!msg) return;
 
-                    if (msg.type === 'init-success') {
-                        isWorkerReady = true;
-                        drainRecvQueue();
-                    }
-                    else if (msg.type === 'write-ack') {
+                    if (msg.type === 'write-ack') {
                         const writtenSize = msg.size || 0;
                         inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
+                        accumulatedAckBytes += writtenSize;
 
-                        // 🚀【關鍵修復】：Worker 寫入硬碟後，主動發送 ACK 回發送端，達成完美流量同步
-                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+                        // 🚀 每累積滿 512KB 才發送一次 ACK 封包回發送端
+                        if (accumulatedAckBytes >= 512 * 1024 && state.dataChannel?.readyState === 'open') {
                             try {
-                                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: writtenSize }));
+                                state.dataChannel.send(JSON.stringify({ 
+                                    type: 'ack', 
+                                    bytes: accumulatedAckBytes 
+                                }));
+                                accumulatedAckBytes = 0;
                             } catch (err) {}
                         }
 
@@ -504,14 +507,20 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 保持原 64KB
-    const maxBufferedAmount = 1024 * 1024; // 1MB 物理網卡緩衝區
-    const resumeBufferedAmount = 256 * 1024; // 256KB
+    const maxBufferedAmount = 4 * 1024 * 1024; // 4MB 物理網卡緩衝區
+    const resumeBufferedAmount = 1024 * 1024; // 1MB 緩衝區解鎖
     unackedBytes = 0;
     ackResolver = null;
 
     try {
         state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
     } catch (e) {}
+    state.dataChannel.onbufferedamountlow = () => {
+        if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
+            ackResolver();
+            ackResolver = null;
+        }
+    };
 
     let totalSent = 0;
     let lastUiUpdateTime = 0;
@@ -548,23 +557,22 @@ export async function sendFileChunks() {
                 }
                 let offset = 0;
                 while (offset + chunkSize <= currentData.length) {
-                    if (state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸途中 DataChannel 已關閉');
-                    }
+                    if (state.dataChannel.readyState !== 'open') throw new Error('DataChannel 關閉');
 
-                    // 🚀【修復關鍵 1：雙重流控】：同時檢查本機 SCTP Buffer 與 接收端 ACK 滑動視窗
+                    // 🚀 雙重流控：若超過上限則等待 ACK 或 bufferedamountlow 事件
                     while (
                         state.dataChannel.bufferedAmount > maxBufferedAmount ||
                         unackedBytes >= MAX_UNACKED_BYTES
                     ) {
                         await new Promise((resolve) => {
                             ackResolver = resolve;
-                            const timer = setTimeout(() => {
+                            // 保險逾時縮短為 20ms 防止極端卡死
+                            setTimeout(() => {
                                 if (ackResolver === resolve) {
                                     ackResolver = null;
                                     resolve();
                                 }
-                            }, 50); // 50ms 保險 Timeout，防止 ACK 丟失造成永久死鎖
+                            }, 20);
                         });
                     }
 
@@ -574,9 +582,9 @@ export async function sendFileChunks() {
                     totalSent += chunkSize;
                     unackedBytes += chunkSize;
 
-                    // 🚀【修復關鍵 2：定期讓出主執行緒】：每傳送 16 個 chunk (約 1MB)，強制釋放 Event Loop
+                    // 讓出 CPU 頻率：每發送 32 個切片 (2MB) 釋放一次 Event Loop
                     loopCounter++;
-                    if (loopCounter % 16 === 0) {
+                    if (loopCounter % 32 === 0) {
                         await new Promise((resolve) => setTimeout(resolve, 0));
                     }
 
