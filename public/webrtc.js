@@ -17,17 +17,34 @@ let pendingCandidates = [];
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2秒逾時
+    const endpoints = [
+        { url: 'https://api4.ipify.org?format=json', type: 'json', key: 'ip' },
+        { url: 'https://ip4.seeip.org/json', type: 'json', key: 'ip' },
+        { url: 'https://ipv4.icanhazip.com', type: 'text' }
+    ];
 
-    try {
-        const res = await fetch('https://api4.ipify.org?format=json', { signal: controller.signal });
-        const data = await res.json();
-        state.localIPv4 = data.ip;
-    } catch (e) {
-        console.warn("[IPv4 探針] 取得失敗或逾時，降級處理:", e);
-    } finally {
-        clearTimeout(timeoutId);
+    for (const ep of endpoints) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1500); // 縮短單次逾時至 1.5 秒
+
+        try {
+            const res = await fetch(ep.url, { signal: controller.signal });
+            if (!res.ok) continue;
+
+            if (ep.type === 'json') {
+                const data = await res.json();
+                state.localIPv4 = data[ep.key];
+            } else {
+                const text = await res.text();
+                state.localIPv4 = text.trim();
+            }
+
+            if (state.localIPv4) break; // 成功取得即中斷循環
+        } catch (e) {
+            console.warn(`[IPv4 探針] ${ep.url} 失敗或逾時，切換下一個`);
+        } finally {
+            clearTimeout(timeoutId);
+        }
     }
 }
 
@@ -58,7 +75,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+        state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024; // 4MB
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -180,7 +197,7 @@ export async function initJoinerWithRoom(roomId) {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+            state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
             setupDataChannelListeners();
         };
         state.peerConnection.onicecandidate = (event) => {
@@ -207,7 +224,7 @@ export async function initJoinerWithRoom(roomId) {
 // 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
-    state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+    state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
 
     state.dataChannel.onopen = () => {
         updateStatus('P2P 直連已開通 (加密)', 'green');
@@ -442,9 +459,9 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536;
-    const maxBufferedAmount = 8 * 1024 * 1024;
-    const resumeBufferedAmount = 2 * 1024 * 1024;
+    const chunkSize = 65536; // 64KB
+    const maxBufferedAmount = 16 * 1024 * 1024; // 16MB
+    const resumeBufferedAmount = 4 * 1024 * 1024; // 4MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
