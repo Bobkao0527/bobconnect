@@ -8,6 +8,8 @@ let fileHandle = null;
 let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
+let bytesSinceLastFlush = 0;
+const FLUSH_THRESHOLD = 4 * 1024 * 1024; // 每 4MB 強制 flush 一次釋放 Safari 快取
 
 self.onmessage = async (event) => {
     const data = event.data;
@@ -17,9 +19,14 @@ self.onmessage = async (event) => {
         case 'init': {
             const { downloadId, size, filename } = data;
             targetFilename = filename || 'downloaded_file';
+            bytesSinceLastFlush = 0;
 
             try {
-                // 配額檢查 (Storage Quota Check) 防範 QuotaExceededError
+                // 嘗試請求持久化儲存 (防止 Safari 50MB 配額限制)
+                if (navigator.storage && navigator.storage.persist) {
+                    await navigator.storage.persist();
+                }
+
                 if (navigator.storage && navigator.storage.estimate) {
                     const { quota, usage } = await navigator.storage.estimate();
                     const available = quota - usage;
@@ -30,7 +37,6 @@ self.onmessage = async (event) => {
 
                 rootDir = await navigator.storage.getDirectory();
 
-                // 動態亂數檔名防範 Safari 獨佔鎖與 NoModificationAllowedError
                 tempFilename = `temp_${downloadId || Date.now()}_${Date.now()}.tmp`;
                 fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
                 accessHandle = await fileHandle.createSyncAccessHandle();
@@ -54,6 +60,13 @@ self.onmessage = async (event) => {
                 const view = new Uint8Array(chunk);
                 accessHandle.write(view, { at: offset });
 
+                // 🚀【Safari 46MB 修復關鍵】：定期 flush，防止 Safari 記憶體暫存溢出導致 Worker 假死
+                bytesSinceLastFlush += view.byteLength;
+                if (bytesSinceLastFlush >= FLUSH_THRESHOLD) {
+                    accessHandle.flush();
+                    bytesSinceLastFlush = 0;
+                }
+
                 self.postMessage({ type: 'write-ack', offset: offset + view.byteLength });
             } catch (err) {
                 console.error('[OPFS Worker] 寫入失敗:', err);
@@ -70,6 +83,7 @@ self.onmessage = async (event) => {
                     accessHandle.close();
                     accessHandle = null;
 
+                    // Safari 鎖釋放保護
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
 

@@ -424,9 +424,10 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 64KB
-    const maxBufferedAmount = 12 * 1024 * 1024; // 12MB
-    const resumeBufferedAmount = 4 * 1024 * 1024; // 4MB
+    const chunkSize = 65536; // 保持原 chunkSize
+    const maxBufferedAmount = 2 * 1024 * 1024; // 2MB
+    const resumeBufferedAmount = 512 * 1024;    // 512KB
+
     let totalSent = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
@@ -485,7 +486,8 @@ export async function sendFileChunks() {
                                 if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                                     cleanup();
                                 }
-                            }, 50);
+                            }, 30); // 縮短輪詢間隔為 30ms
+
                             if (state.dataChannel) {
                                 state.dataChannel.onbufferedamountlow = () => {
                                     if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
@@ -540,7 +542,7 @@ export async function sendFileChunks() {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
                     while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise(resolve => setTimeout(resolve, 50));
+                        await new Promise((resolve) => setTimeout(resolve, 30));
                     }
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
@@ -549,7 +551,7 @@ export async function sendFileChunks() {
             }
         }
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
-            await new Promise(resolve => setTimeout(resolve, 50));
+            await new Promise((resolve) => setTimeout(resolve, 30));
         }
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
