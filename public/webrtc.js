@@ -19,32 +19,49 @@ let pendingCandidates = [];
 export async function probeIPv4() {
     const endpoints = [
         { url: 'https://api4.ipify.org?format=json', type: 'json', key: 'ip' },
-        { url: 'https://ip4.seeip.org/json', type: 'json', key: 'ip' },
         { url: 'https://ipv4.icanhazip.com', type: 'text' }
     ];
 
-    for (const ep of endpoints) {
+    const controllers = [];
+
+    // 單一 endpoint 發送邏輯
+    const fetchEndpoint = async (ep) => {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1500); // 縮短單次逾時至 1.5 秒
+        controllers.push(controller);
+
+        // 設定單一請求的極限 2 秒逾時
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
 
         try {
             const res = await fetch(ep.url, { signal: controller.signal });
-            if (!res.ok) continue;
+            clearTimeout(timeoutId);
 
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+            let ip = '';
             if (ep.type === 'json') {
                 const data = await res.json();
-                state.localIPv4 = data[ep.key];
+                ip = data[ep.key];
             } else {
                 const text = await res.text();
-                state.localIPv4 = text.trim();
+                ip = text.trim();
             }
 
-            if (state.localIPv4) break; // 成功取得即中斷循環
-        } catch (e) {
-            console.warn(`[IPv4 探針] ${ep.url} 失敗或逾時，切換下一個`);
-        } finally {
+            if (ip) return ip;
+            throw new Error('解析出空 IP');
+        } catch (err) {
             clearTimeout(timeoutId);
+            throw err;
         }
+    };
+
+    try {
+        const fastestIp = await Promise.any(endpoints.map(ep => fetchEndpoint(ep)));
+        state.localIPv4 = fastestIp;
+    } catch (err) {
+        console.warn('[IPv4 探針] 所有 API 均無回應或連線失敗');
+    } finally {
+        controllers.forEach(c => c.abort());
     }
 }
 
