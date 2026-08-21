@@ -14,18 +14,9 @@ let pendingCandidates = [];
 let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
-let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024; // 提升至 4MB Worker 併發視窗
 
-// 🚀【ACK 聚合機制】避免高頻 JSON 癱瘓 Safari 反向 SCTP 通道
-let accumulatedAckBytes = 0;
-const ACK_BATCH_THRESHOLD = 512 * 1024; // 每累積 512KB 才發送一次 ACK
-
-let unackedBytes = 0;
 let ackResolver = null;
-const MAX_UNACKED_BYTES = 4 * 1024 * 1024; // 允許發送端 4MB 在途資料
 
-let transferAborted = false;
 
 // 探針
 export async function probeIPv4() {
@@ -241,54 +232,16 @@ export function setupDataChannelListeners() {
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
-    while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
+    // 每次消化最多 32 個 chunk 避免主執行緒卡頓
+    let processed = 0;
+    while (recvQueue.length > 0 && processed < 32) {
         const item = recvQueue.shift();
-        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
-        if (chunkSize === 0) continue;
-
-        state.receivedSize += chunkSize;
-        inFlightBytes += chunkSize;
-
-        let bufferToTransfer = null;
-        if (item instanceof ArrayBuffer) {
-            bufferToTransfer = item;
-        } else if (ArrayBuffer.isView(item)) {
-            bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
-        }
-
-        if (bufferToTransfer) {
-            opfsWorker.postMessage({
-                type: 'write',
-                chunk: bufferToTransfer,
-                offset: currentOffset,
-                size: chunkSize
-            }, [bufferToTransfer]);
-
-            currentOffset += chunkSize;
-        }
-
-        if (state.incomingFileInfo) {
-            const now = Date.now();
-            if (now - state.lastRecvUiTime > 150 || state.receivedSize >= state.incomingFileInfo.size) {
-                state.lastRecvUiTime = now;
-                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = `${percent}%`;
-                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
-            }
-        }
+        forwardChunkToWorker(item);
+        processed++;
     }
 
-    if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
+    if (fileEndPending && recvQueue.length === 0 && opfsWorker) {
         fileEndPending = false;
-        // 傳送最終剩餘的 ACK
-        if (accumulatedAckBytes > 0 && state.dataChannel?.readyState === 'open') {
-            try {
-                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: accumulatedAckBytes }));
-                accumulatedAckBytes = 0;
-            } catch (err) {}
-        }
         opfsWorker.postMessage({ type: 'finish' });
     }
 }
@@ -298,36 +251,14 @@ export async function handleIncomingData(data) {
         try {
             const message = JSON.parse(data);
 
-            if (message.type === 'ack') {
-                unackedBytes = Math.max(0, unackedBytes - (message.bytes || 0));
-                if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
-                    ackResolver();
-                    ackResolver = null;
-                }
-                return;
-            }
-
-            if (message.type === 'transfer-error') {
-                transferAborted = true;
-                showToast('傳輸中斷：' + message.message, 'error');
-                if (ackResolver) {
-                    ackResolver();
-                    ackResolver = null;
-                }
-                return;
-            }
-
             if (message.type === 'file-meta') {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
-                accumulatedAckBytes = 0;
-
                 recvQueue = [];
                 isWorkerReady = false;
                 fileEndPending = false;
-                inFlightBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 cleanupOPFSWorker();
@@ -335,7 +266,7 @@ export async function handleIncomingData(data) {
                 try {
                     opfsWorker = new Worker('./opfs-worker.js');
                 } catch (err) {
-                    showToast('無法建立 Worker: ' + err.message, 'error');
+                    showToast('Worker 建立失敗: ' + err.message, 'error');
                     return;
                 }
 
@@ -346,23 +277,10 @@ export async function handleIncomingData(data) {
                     if (msg.type === 'init-success') {
                         isWorkerReady = true;
                         drainRecvQueue();
-                    }
-                    else if (msg.type === 'write-ack') {
-                        const writtenSize = msg.size || 0;
-                        inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                        accumulatedAckBytes += writtenSize;
-
-                        // 🚀【批次 ACK 觸發】：累積到閾值才送出 ACK
-                        if (accumulatedAckBytes >= ACK_BATCH_THRESHOLD && state.dataChannel?.readyState === 'open') {
-                            try {
-                                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: accumulatedAckBytes }));
-                                accumulatedAckBytes = 0;
-                            } catch (err) {}
-                        }
-
+                    } else if (msg.type === 'write-ack') {
+                        // Worker 寫入完成，繼續消化佇列
                         drainRecvQueue();
-                    }
-                    else if (msg.type === 'finish-success') {
+                    } else if (msg.type === 'finish-success') {
                         const { blobUrl, filename } = msg;
                         if (typeof triggerAutoDownload === 'function') {
                             triggerAutoDownload(blobUrl, filename);
@@ -374,25 +292,13 @@ export async function handleIncomingData(data) {
                             a.click();
                             document.body.removeChild(a);
                         }
-                        const recvPercent = document.getElementById('recv-percent');
-                        const recvProgressBar = document.getElementById('recv-progress-bar');
-                        if (recvPercent) recvPercent.innerText = '100% (完成)';
-                        if (recvProgressBar) recvProgressBar.style.width = '100%';
                         showToast(`「${filename}」傳輸成功！`, 'success');
-
                         setTimeout(() => {
                             URL.revokeObjectURL(blobUrl);
                             cleanupOPFSWorker();
-                        }, 30000);
-                    }
-                    else if (msg.type === 'error') {
-                        showToast(msg.message, 'error');
-                        // 🚀【通知發送端中止】：避免發送端卡死
-                        if (state.dataChannel?.readyState === 'open') {
-                            try {
-                                state.dataChannel.send(JSON.stringify({ type: 'transfer-error', message: msg.message }));
-                            } catch (e) {}
-                        }
+                        }, 60000);
+                    } else if (msg.type === 'error') {
+                        showToast('寫入錯誤: ' + msg.message, 'error');
                         cleanupOPFSWorker();
                     }
                 };
@@ -409,22 +315,52 @@ export async function handleIncomingData(data) {
                 document.getElementById('recv-percent').innerText = '0%';
                 document.getElementById('recv-progress-bar').style.width = '0%';
             } else if (message.type === 'file-end') {
-                if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
+                if (!isWorkerReady || recvQueue.length > 0) {
                     fileEndPending = true;
                 } else if (opfsWorker) {
-                    if (accumulatedAckBytes > 0 && state.dataChannel?.readyState === 'open') {
-                        state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: accumulatedAckBytes }));
-                        accumulatedAckBytes = 0;
-                    }
                     opfsWorker.postMessage({ type: 'finish' });
                 }
             }
         } catch (e) {
-            cleanupOPFSWorker();
+            console.error('控制訊息錯誤:', e);
         }
     } else {
-        recvQueue.push(data);
-        if (isWorkerReady) drainRecvQueue();
+        // 收到二進位切片
+        if (isWorkerReady && recvQueue.length === 0) {
+            // 🚀 若 Worker 閒置，直接零拷貝 Transfer 到 Worker
+            forwardChunkToWorker(data);
+        } else {
+            recvQueue.push(data);
+        }
+    }
+}
+
+function forwardChunkToWorker(chunk) {
+    const chunkSize = chunk.byteLength || (chunk.buffer ? chunk.buffer.byteLength : 0);
+    state.receivedSize += chunkSize;
+
+    let bufferToTransfer = chunk instanceof ArrayBuffer ? chunk : chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+
+    opfsWorker.postMessage({
+        type: 'write',
+        chunk: bufferToTransfer,
+        offset: currentOffset,
+        size: chunkSize
+    }, [bufferToTransfer]); // Transferable 零拷貝轉移，釋放主執行緒 RAM
+
+    currentOffset += chunkSize;
+
+    // 更新接收進度條
+    if (state.incomingFileInfo) {
+        const now = Date.now();
+        if (now - state.lastRecvUiTime > 150 || state.receivedSize >= state.incomingFileInfo.size) {
+            state.lastRecvUiTime = now;
+            const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+            const recvPercent = document.getElementById('recv-percent');
+            const recvProgressBar = document.getElementById('recv-progress-bar');
+            if (recvPercent) recvPercent.innerText = `${percent}%`;
+            if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+        }
     }
 }
 
@@ -449,19 +385,18 @@ export async function sendFileChunks() {
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
 
-    transferAborted = false;
-    unackedBytes = 0;
-    ackResolver = null;
-
+    const file = state.selectedFile;
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
-        name: state.selectedFile.name,
-        size: state.selectedFile.size
+        name: file.name,
+        size: file.size
     }));
 
-    const chunkSize = 65536; // 64KB
-    const maxBufferedAmount = 1024 * 1024; // 1MB 網卡發送緩衝區
-    let totalSent = 0;
+    const CHUNK_SIZE = 64 * 1024; // 64KB
+    const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 網卡緩衝區
+    state.dataChannel.bufferedAmountLowThreshold = 512 * 1024; // 512KB 喚醒水位
+
+    let offset = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = 0;
@@ -475,107 +410,88 @@ export async function sendFileChunks() {
         return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     };
 
+    // 等待 DataChannel 緩衝區釋放的 Promise 輔助器
+    const waitForBufferDrain = () => {
+        return new Promise((resolve) => {
+            if (state.dataChannel.bufferedAmount <= state.dataChannel.bufferedAmountLowThreshold) {
+                resolve();
+                return;
+            }
+            const onLow = () => {
+                state.dataChannel.removeEventListener('bufferedamountlow', onLow);
+                resolve();
+            };
+            state.dataChannel.addEventListener('bufferedamountlow', onLow);
+            // 200ms 保險定時器
+            setTimeout(resolve, 200);
+        });
+    };
+
     try {
-        const reader = state.selectedFile.stream().getReader();
-        let leftover = null;
+        // 🚀【關鍵】：使用 slice 分塊讀取，徹底杜絕 Safari file.stream() 記憶體洩漏
+        while (offset < file.size) {
+            if (state.dataChannel.readyState !== 'open') {
+                throw new Error('DataChannel 連線在傳輸中途關閉');
+            }
 
-        while (!transferAborted) {
-            const { done, value } = await reader.read();
-            if (value) {
-                let currentData = value;
-                if (leftover && leftover.length > 0) {
-                    const combined = new Uint8Array(leftover.length + value.length);
-                    combined.set(leftover);
-                    combined.set(value, leftover.length);
-                    currentData = combined;
-                    leftover = null;
-                }
+            // 流控：當瀏覽器 SCTP 緩衝區滿了，暫停讀取與發送
+            if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await waitForBufferDrain();
+            }
 
-                let offset = 0;
-                while (offset + chunkSize <= currentData.length) {
-                    if (transferAborted || state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸已被中斷或對端已關閉');
-                    }
+            const end = Math.min(offset + CHUNK_SIZE, file.size);
+            const sliceBlob = file.slice(offset, end);
+            const chunkBuffer = await sliceBlob.arrayBuffer();
 
-                    // 🚀 雙重流控等待
-                    while (
-                        !transferAborted &&
-                        (state.dataChannel.bufferedAmount > maxBufferedAmount || unackedBytes >= MAX_UNACKED_BYTES)
-                    ) {
-                        await new Promise((resolve) => {
-                            ackResolver = resolve;
-                            setTimeout(() => {
-                                if (ackResolver === resolve) {
-                                    ackResolver = null;
-                                    resolve();
-                                }
-                            }, 50);
-                        });
-                    }
+            state.dataChannel.send(chunkBuffer);
+            offset = end;
 
-                    if (transferAborted) throw new Error('傳輸已被中斷');
+            // 定期更新 UI
+            const now = performance.now();
+            if (now - lastUiUpdateTime > 150 || offset >= file.size) {
+                lastUiUpdateTime = now;
+                const percent = Math.min(100, Math.round((offset / file.size) * 100));
+                document.getElementById('progress-percent').innerText = `${percent}%`;
+                document.getElementById('progress-bar').style.width = `${percent}%`;
 
-                    const chunk = currentData.subarray(offset, offset + chunkSize);
-                    state.dataChannel.send(chunk);
-                    offset += chunkSize;
-                    totalSent += chunkSize;
-                    unackedBytes += chunkSize;
+                const speedElapsed = (now - lastSpeedTime) / 1000;
+                if (speedElapsed > 0) {
+                    const instantSpeed = (offset - lastSpeedBytes) / speedElapsed;
+                    smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                    lastSpeedBytes = offset;
+                    lastSpeedTime = now;
 
-                    const now = performance.now();
-                    if (now - lastUiUpdateTime > 150 || totalSent >= state.selectedFile.size) {
-                        lastUiUpdateTime = now;
-                        const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
-                        document.getElementById('progress-percent').innerText = `${percent}%`;
-                        document.getElementById('progress-bar').style.width = `${percent}%`;
+                    const speedText = document.getElementById('transfer-speed');
+                    if (speedText) speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
 
-                        const speedElapsed = (now - lastSpeedTime) / 1000;
-                        if (speedElapsed > 0) {
-                            const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                            smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
-                            lastSpeedBytes = totalSent;
-                            lastSpeedTime = now;
-                            const speedText = document.getElementById('transfer-speed');
-                            if (speedText) speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-
-                            const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
-                            const timeText = document.getElementById('transfer-time');
-                            if (timeText) timeText.innerText = formatEta(remainingBytes / smoothSpeed);
-                        }
-                    }
-                }
-                if (offset < currentData.length) {
-                    leftover = currentData.subarray(offset);
+                    const remainingBytes = Math.max(0, file.size - offset);
+                    const timeText = document.getElementById('transfer-time');
+                    if (timeText) timeText.innerText = formatEta(remainingBytes / smoothSpeed);
                 }
             }
 
-            if (done) {
-                if (leftover && leftover.length > 0) {
-                    while (!transferAborted && (state.dataChannel.bufferedAmount > maxBufferedAmount || unackedBytes >= MAX_UNACKED_BYTES)) {
-                        await new Promise((r) => setTimeout(r, 20));
-                    }
-                    state.dataChannel.send(leftover);
-                    totalSent += leftover.length;
-                    unackedBytes += leftover.length;
-                }
-                break;
+            // 每發送 2MB 讓出一次 Event Loop 給 WebKit GC
+            if (offset % (2 * 1024 * 1024) === 0) {
+                await new Promise((r) => setTimeout(r, 0));
             }
         }
 
-        // 等待所有在途數據確認完畢
-        while (!transferAborted && (unackedBytes > 0 || state.dataChannel.bufferedAmount > 0)) {
+        // 等待所有網卡底層資料送出完畢
+        while (state.dataChannel.bufferedAmount > 0) {
             if (state.dataChannel.readyState !== 'open') break;
-            await new Promise((r) => setTimeout(r, 30));
+            await new Promise((r) => setTimeout(r, 50));
         }
 
-        if (!transferAborted) {
-            state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
-            document.getElementById('progress-status').innerText = '傳送完畢';
-            document.getElementById('progress-percent').innerText = '100%';
-            document.getElementById('progress-bar').style.width = '100%';
-            showToast('檔案已完全投遞！', 'success');
-        }
+        state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
+
+        document.getElementById('progress-status').innerText = '傳送完畢';
+        document.getElementById('progress-percent').innerText = '100%';
+        document.getElementById('progress-bar').style.width = '100%';
+        showToast('檔案已完全投遞！', 'success');
+
     } catch (e) {
-        showToast('傳輸中斷：' + e.message, 'error');
+        console.error('傳輸錯誤:', e);
+        showToast('傳輸失敗: ' + e.message, 'error');
     } finally {
         if (btnSend) {
             btnSend.disabled = false;
