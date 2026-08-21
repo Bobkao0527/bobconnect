@@ -7,13 +7,15 @@ import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAp
 
 let currentDownloadId = null;
 let opfsWorker = null;
-let opfsInitPromise = null;
-let resolveOpfsInit = null;
-let rejectOpfsInit = null;
 let currentOffset = 0;
 
 let localCandidates = [];
 let pendingCandidates = [];
+
+let recvQueue = [];
+let isWorkerReady = false;
+let isProcessingQueue = false;
+let fileEndPending = false;
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -288,14 +290,15 @@ export async function handleIncomingData(data) {
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
 
+                // 重置佇列與狀態
+                recvQueue = [];
+                isWorkerReady = false;
+                isProcessingQueue = false;
+                fileEndPending = false;
+
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
                 cleanupOPFSWorker();
-
-                opfsInitPromise = new Promise((resolve, reject) => {
-                    resolveOpfsInit = resolve;
-                    rejectOpfsInit = reject;
-                });
 
                 try {
                     opfsWorker = new Worker('./opfs-worker.js');
@@ -309,11 +312,8 @@ export async function handleIncomingData(data) {
                     if (!msg) return;
 
                     if (msg.type === 'init-success') {
-                        if (resolveOpfsInit) {
-                            resolveOpfsInit();
-                            resolveOpfsInit = null;
-                            rejectOpfsInit = null;
-                        }
+                        isWorkerReady = true;
+                        processRecvQueue(); // Worker 初始化完成，啟動排隊切片傳輸
                     }
                     else if (msg.type === 'finish-success') {
                         const { blobUrl, filename } = msg;
@@ -330,26 +330,20 @@ export async function handleIncomingData(data) {
                             document.body.removeChild(a);
                         }
 
-                        // 30秒後釋放 Blob URL 記憶體指標
-                        setTimeout(() => {
-                            URL.revokeObjectURL(blobUrl);
-                        }, 30000);
-
                         const recvPercent = document.getElementById('recv-percent');
                         const recvProgressBar = document.getElementById('recv-progress-bar');
                         if (recvPercent) recvPercent.innerText = '100% (完成)';
                         if (recvProgressBar) recvProgressBar.style.width = '100%';
                         showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
 
-                        cleanupOPFSWorker();
+                        // 🚀【Safari 修復】：延遲 30 秒後再釋放 Worker 與 Blob URL，防止 iOS Safari 下載前 URL 被回收
+                        setTimeout(() => {
+                            URL.revokeObjectURL(blobUrl);
+                            cleanupOPFSWorker();
+                        }, 30000);
                     }
                     else if (msg.type === 'error') {
                         showToast('OPFS 寫入發生錯誤: ' + msg.message, 'error');
-                        if (rejectOpfsInit) {
-                            rejectOpfsInit(new Error(msg.message));
-                            resolveOpfsInit = null;
-                            rejectOpfsInit = null;
-                        }
                         cleanupOPFSWorker();
                     }
                 };
@@ -357,15 +351,9 @@ export async function handleIncomingData(data) {
                 opfsWorker.onerror = (err) => {
                     console.error('[OPFS Worker 錯誤]:', err);
                     showToast('OPFS Worker 發生例外錯誤', 'error');
-                    if (rejectOpfsInit) {
-                        rejectOpfsInit(err);
-                        resolveOpfsInit = null;
-                        rejectOpfsInit = null;
-                    }
                     cleanupOPFSWorker();
                 };
 
-                // 向 Worker 發送初始化命令
                 opfsWorker.postMessage({
                     type: 'init',
                     downloadId: currentDownloadId,
@@ -383,9 +371,9 @@ export async function handleIncomingData(data) {
                 if (recvProgressBar) recvProgressBar.style.width = '0%';
 
             } else if (message.type === 'file-end') {
-                if (opfsInitPromise) await opfsInitPromise;
-
-                if (opfsWorker) {
+                if (!isWorkerReady || isProcessingQueue || recvQueue.length > 0) {
+                    fileEndPending = true;
+                } else if (opfsWorker) {
                     opfsWorker.postMessage({ type: 'finish' });
                 }
             }
@@ -394,50 +382,10 @@ export async function handleIncomingData(data) {
             cleanupOPFSWorker();
         }
     } else {
-        if (opfsInitPromise) await opfsInitPromise;
-
-        const chunkSize = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
-        if (chunkSize === 0) return;
-
-        state.receivedSize += data.byteLength;
-
-        // 零複製 (Zero-Copy) Transferable Objects 傳輸切片給 OPFS Worker
-        if (opfsWorker) {
-            try {
-                let bufferToTransfer = null;
-
-                if (data instanceof ArrayBuffer) {
-                    bufferToTransfer = data;
-                } else if (ArrayBuffer.isView(data)) {
-                    bufferToTransfer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-                }
-
-                if (bufferToTransfer) {
-                    opfsWorker.postMessage({
-                        type: 'write',
-                        chunk: bufferToTransfer,
-                        offset: currentOffset
-                    }, [bufferToTransfer]); // 轉移所有權
-
-                    currentOffset += chunkSize;
-                }
-            } catch (e) {
-                console.error('[OPFS Direct Write] 切片寫入轉送失敗:', e);
-                cleanupOPFSWorker();
-            }
-        }
-
-        if (state.incomingFileInfo) {
-            const now = Date.now();
-            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
-                state.lastRecvUiTime = now;
-                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = `${percent}%`;
-                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
-            }
+        // 將收到的切片放入佇列，確保嚴格按序處理
+        recvQueue.push(data);
+        if (isWorkerReady) {
+            processRecvQueue();
         }
     }
 }
@@ -631,6 +579,66 @@ export async function sendFileChunks() {
     }
 }
 
+// 循序佇列處理引擎 (確保切片按正確順序與 Offset 寫入 Worker)
+async function processRecvQueue() {
+    if (isProcessingQueue || !isWorkerReady || !opfsWorker) return;
+    isProcessingQueue = true;
+
+    while (recvQueue.length > 0) {
+        const item = recvQueue.shift();
+        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
+        if (chunkSize === 0) continue;
+
+        state.receivedSize += chunkSize;
+
+        try {
+            let bufferToTransfer = null;
+            if (item instanceof ArrayBuffer) {
+                bufferToTransfer = item;
+            } else if (ArrayBuffer.isView(item)) {
+                bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
+            }
+
+            if (bufferToTransfer && opfsWorker) {
+                opfsWorker.postMessage({
+                    type: 'write',
+                    chunk: bufferToTransfer,
+                    offset: currentOffset
+                }, [bufferToTransfer]);
+
+                currentOffset += chunkSize;
+            }
+        } catch (e) {
+            console.error('[OPFS Direct Write] 切片寫入轉送失敗:', e);
+            cleanupOPFSWorker();
+            isProcessingQueue = false;
+            return;
+        }
+
+        // 更新 UI
+        if (state.incomingFileInfo) {
+            const now = Date.now();
+            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
+                state.lastRecvUiTime = now;
+                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = `${percent}%`;
+                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+            }
+        }
+    }
+
+    isProcessingQueue = false;
+
+    // 若佇列排空且收到傳輸結束標記，通知 Worker 進行收尾
+    if (fileEndPending && opfsWorker) {
+        fileEndPending = false;
+        opfsWorker.postMessage({ type: 'finish' });
+    }
+}
+
 // 釋放 OPFS Worker 與內部資源
 export function cleanupOPFSWorker() {
     if (opfsWorker) {
@@ -640,8 +648,9 @@ export function cleanupOPFSWorker() {
         opfsWorker.terminate();
         opfsWorker = null;
     }
-    opfsInitPromise = null;
-    resolveOpfsInit = null;
-    rejectOpfsInit = null;
+    recvQueue = [];
+    isWorkerReady = false;
+    isProcessingQueue = false;
+    fileEndPending = false;
     currentOffset = 0;
 }

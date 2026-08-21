@@ -66,10 +66,11 @@ self.onmessage = async (event) => {
         case 'finish': {
             try {
                 if (accessHandle) {
-                    // 顯式呼叫 flush() 確保 WebKit (Safari) 將記憶體緩衝區刷入實體磁碟
                     accessHandle.flush();
                     accessHandle.close();
                     accessHandle = null;
+
+                    await new Promise((resolve) => setTimeout(resolve, 100));
                 }
 
                 if (!fileHandle) {
@@ -84,13 +85,6 @@ self.onmessage = async (event) => {
                     blobUrl: blobUrl,
                     filename: targetFilename
                 });
-
-                // 匯出 Blob URL 後主動刪除 OPFS 內的暫存檔
-                if (rootDir && tempFilename) {
-                    await rootDir.removeEntry(tempFilename).catch(() => {});
-                    tempFilename = null;
-                    fileHandle = null;
-                }
             } catch (err) {
                 console.error('[OPFS Worker] 結束寫入處理解析失敗:', err);
                 await cleanup();
