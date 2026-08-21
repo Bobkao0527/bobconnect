@@ -395,9 +395,10 @@ export async function handleIncomingData(data) {
                         drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
-                        const { blobUrl, filename } = msg;
+                        const { file, filename } = msg;
+                        const blobUrl = URL.createObjectURL(file);
 
-                        if (typeof triggerAutoDownload === 'function') {
+                         if (typeof triggerAutoDownload === 'function') {
                             triggerAutoDownload(blobUrl, filename);
                         } else {
                             const a = document.createElement('a');
@@ -416,8 +417,11 @@ export async function handleIncomingData(data) {
 
                         setTimeout(() => {
                             URL.revokeObjectURL(blobUrl);
+                            if (opfsWorker) {
+                                opfsWorker.postMessage({ type: 'delete-temp' });
+                            }
                             cleanupOPFSWorker();
-                        }, 30000);
+                        }, 15000);
                     }
                     else if (msg.type === 'error') {
                         showToast('OPFS 寫入發生錯誤: ' + msg.message, 'error');
@@ -674,4 +678,30 @@ export function cleanupOPFSWorker() {
     unackedBytes = 0;
     ackResolver = null;
     currentOffset = 0;
+}
+
+export async function cleanOrphanOPFSFiles() {
+    if (!navigator.storage || !navigator.storage.getDirectory) return;
+
+    try {
+        const rootDir = await navigator.storage.getDirectory();
+        
+        // 遍歷 OPFS 根目錄中的所有檔案
+        // (相容於現代瀏覽器的 entries() 異步迭代器)
+        if (rootDir.entries) {
+            for await (const [name, handle] of rootDir.entries()) {
+                // 只要是 temp_ 開頭的暫存檔案就進行清理
+                if (handle.kind === 'file' && name.startsWith('temp_')) {
+                    try {
+                        await rootDir.removeEntry(name);
+                        console.log(`[OPFS 啟動清理] 已清除歷史暫存檔: ${name}`);
+                    } catch (err) {
+                        console.warn(`[OPFS 啟動清理] 刪除 ${name} 失敗:`, err);
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[OPFS 啟動清理] 執行失敗 (可能處於無痕模式):', err);
+    }
 }

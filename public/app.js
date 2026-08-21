@@ -7,7 +7,7 @@
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
 import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4 } from './webrtc.js';
-import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
+import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms, cleanOrphanOPFSFiles } from './scanner.js';
 
 // 全域暴露機制
 window.initHost = initHost;
@@ -26,6 +26,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     // 🚀【強制 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配
     // await 探針以確保下一步自動探測時能夾帶最穩定的 IP 金鑰
     await probeIPv4();
+    cleanOrphanOPFSFiles();
 
     // 解析路徑自動加入
     const urlParams = new URLSearchParams(window.location.search);

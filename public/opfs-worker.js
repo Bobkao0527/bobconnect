@@ -86,32 +86,33 @@ self.onmessage = async (event) => {
                     accessHandle.flush();
                     accessHandle.close();
                     accessHandle = null;
-
-                    // Safari 鎖釋放保護
-                    await new Promise((resolve) => setTimeout(resolve, 100));
+                    await new Promise((resolve) => setTimeout(resolve, 50));
                 }
 
-                if (!fileHandle) {
-                    throw new Error('OPFS 檔案控制桿不存在');
-                }
+                if (!fileHandle) throw new Error('OPFS 檔案控制桿不存在');
 
                 const file = await fileHandle.getFile();
-                const blobUrl = URL.createObjectURL(file);
 
                 self.postMessage({
                     type: 'finish-success',
-                    blobUrl: blobUrl,
-                    filename: targetFilename
+                    file: file,
+                    filename: targetFilename,
+                    tempFilename: tempFilename // 傳回檔名以便後續清理
                 });
             } catch (err) {
-                console.error('[OPFS Worker] 結束寫入處理解析失敗:', err);
+                console.error('[OPFS Worker] 結束寫入失敗:', err);
                 await cleanup();
-                self.postMessage({ type: 'error', message: err.message || 'OPFS 結束寫入處理解析失敗' });
+                self.postMessage({ type: 'error', message: err.message });
             }
             break;
         }
 
         case 'abort': {
+            await cleanup();
+            break;
+        }
+
+        case 'delete-temp': {
             await cleanup();
             break;
         }
