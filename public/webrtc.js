@@ -14,7 +14,6 @@ let pendingCandidates = [];
 
 let recvQueue = [];
 let isWorkerReady = false;
-let isProcessingQueue = false;
 let fileEndPending = false;
 let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
 const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 限制最多 8MB 處於 Worker
@@ -373,25 +372,22 @@ export async function handleIncomingData(data) {
                     return;
                 }
 
-                let accumulatedAckBytes = 0;
-
                 opfsWorker.onmessage = (e) => {
                     const msg = e.data;
                     if (!msg) return;
 
-                    if (msg.type === 'write-ack') {
+                    if (msg.type === 'init-success') {
+                        isWorkerReady = true;
+                        drainRecvQueue();
+                    }
+                    else if (msg.type === 'write-ack') {
                         const writtenSize = msg.size || 0;
                         inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                        accumulatedAckBytes += writtenSize;
 
-                        // 🚀 每累積滿 512KB 才發送一次 ACK 封包回發送端
-                        if (accumulatedAckBytes >= 512 * 1024 && state.dataChannel?.readyState === 'open') {
+                        // 🚀【關鍵修復】：Worker 寫入硬碟後，主動發送 ACK 回發送端，達成完美流量同步
+                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
                             try {
-                                state.dataChannel.send(JSON.stringify({ 
-                                    type: 'ack', 
-                                    bytes: accumulatedAckBytes 
-                                }));
-                                accumulatedAckBytes = 0;
+                                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: writtenSize }));
                             } catch (err) {}
                         }
 
@@ -515,12 +511,6 @@ export async function sendFileChunks() {
     try {
         state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
     } catch (e) {}
-    state.dataChannel.onbufferedamountlow = () => {
-        if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
-            ackResolver();
-            ackResolver = null;
-        }
-    };
 
     let totalSent = 0;
     let lastUiUpdateTime = 0;
@@ -557,22 +547,23 @@ export async function sendFileChunks() {
                 }
                 let offset = 0;
                 while (offset + chunkSize <= currentData.length) {
-                    if (state.dataChannel.readyState !== 'open') throw new Error('DataChannel 關閉');
+                    if (state.dataChannel.readyState !== 'open') {
+                        throw new Error('傳輸途中 DataChannel 已關閉');
+                    }
 
-                    // 🚀 雙重流控：若超過上限則等待 ACK 或 bufferedamountlow 事件
+                    // 🚀【修復關鍵 1：雙重流控】：同時檢查本機 SCTP Buffer 與 接收端 ACK 滑動視窗
                     while (
                         state.dataChannel.bufferedAmount > maxBufferedAmount ||
                         unackedBytes >= MAX_UNACKED_BYTES
                     ) {
                         await new Promise((resolve) => {
                             ackResolver = resolve;
-                            // 保險逾時縮短為 20ms 防止極端卡死
-                            setTimeout(() => {
+                            const timer = setTimeout(() => {
                                 if (ackResolver === resolve) {
                                     ackResolver = null;
                                     resolve();
                                 }
-                            }, 20);
+                            }, 50); // 50ms 保險 Timeout，防止 ACK 丟失造成永久死鎖
                         });
                     }
 
