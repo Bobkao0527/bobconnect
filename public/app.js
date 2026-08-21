@@ -6,8 +6,8 @@
  */
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
-import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4 } from './webrtc.js';
-import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms, cleanOrphanOPFSFiles } from './scanner.js';
+import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4, cleanOrphanOPFSFiles } from './webrtc.js';
+import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
 
 // 全域暴露機制
 window.initHost = initHost;
