@@ -16,6 +16,8 @@ let recvQueue = [];
 let isWorkerReady = false;
 let isProcessingQueue = false;
 let fileEndPending = false;
+let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
+const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024; // 限制最多 2MB 處於 Worker
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -279,6 +281,59 @@ export function setupDataChannelListeners() {
     };
 }
 
+// 具備 Backpressure 控制的佇列消化器
+function drainRecvQueue() {
+    if (!isWorkerReady || !opfsWorker) return;
+
+    // 只要處於途中的資料量小於限制，且佇列中還有資料，就繼續發送
+    while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
+        const item = recvQueue.shift();
+        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
+        if (chunkSize === 0) continue;
+
+        state.receivedSize += chunkSize;
+        inFlightBytes += chunkSize;
+
+        let bufferToTransfer = null;
+        if (item instanceof ArrayBuffer) {
+            bufferToTransfer = item;
+        } else if (ArrayBuffer.isView(item)) {
+            bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
+        }
+
+        if (bufferToTransfer) {
+            opfsWorker.postMessage({
+                type: 'write',
+                chunk: bufferToTransfer,
+                offset: currentOffset,
+                size: chunkSize
+            }, [bufferToTransfer]);
+
+            currentOffset += chunkSize;
+        }
+
+        // 更新 UI
+        if (state.incomingFileInfo) {
+            const now = Date.now();
+            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
+                state.lastRecvUiTime = now;
+                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+
+                const recvPercent = document.getElementById('recv-percent');
+                const recvProgressBar = document.getElementById('recv-progress-bar');
+                if (recvPercent) recvPercent.innerText = `${percent}%`;
+                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+            }
+        }
+    }
+
+    // 當佇列全部消化完畢、Worker 寫入完全 ACK、且發送端已通知結束
+    if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
+        fileEndPending = false;
+        opfsWorker.postMessage({ type: 'finish' });
+    }
+}
+
 // 處理接收資料流 (OPFS Dedicated Web Worker 模式)
 export async function handleIncomingData(data) {
     if (typeof data === 'string') {
@@ -290,11 +345,10 @@ export async function handleIncomingData(data) {
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
 
-                // 重置佇列與狀態
                 recvQueue = [];
                 isWorkerReady = false;
-                isProcessingQueue = false;
                 fileEndPending = false;
+                inFlightBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
@@ -313,12 +367,16 @@ export async function handleIncomingData(data) {
 
                     if (msg.type === 'init-success') {
                         isWorkerReady = true;
-                        processRecvQueue(); // Worker 初始化完成，啟動排隊切片傳輸
+                        drainRecvQueue();
+                    }
+                    // 🚀【Safari 22MB 卡死修復關鍵】：接收 Worker 寫入確認，釋放 In-Flight 額度並繼續排程
+                    else if (msg.type === 'write-ack') {
+                        inFlightBytes = Math.max(0, inFlightBytes - (msg.size || 0));
+                        drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
                         const { blobUrl, filename } = msg;
 
-                        // 觸發原生檔案下載
                         if (typeof triggerAutoDownload === 'function') {
                             triggerAutoDownload(blobUrl, filename);
                         } else {
@@ -336,7 +394,6 @@ export async function handleIncomingData(data) {
                         if (recvProgressBar) recvProgressBar.style.width = '100%';
                         showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
 
-                        // 🚀【Safari 修復】：延遲 30 秒後再釋放 Worker 與 Blob URL，防止 iOS Safari 下載前 URL 被回收
                         setTimeout(() => {
                             URL.revokeObjectURL(blobUrl);
                             cleanupOPFSWorker();
@@ -371,7 +428,7 @@ export async function handleIncomingData(data) {
                 if (recvProgressBar) recvProgressBar.style.width = '0%';
 
             } else if (message.type === 'file-end') {
-                if (!isWorkerReady || isProcessingQueue || recvQueue.length > 0) {
+                if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
                     fileEndPending = true;
                 } else if (opfsWorker) {
                     opfsWorker.postMessage({ type: 'finish' });
@@ -382,10 +439,9 @@ export async function handleIncomingData(data) {
             cleanupOPFSWorker();
         }
     } else {
-        // 將收到的切片放入佇列，確保嚴格按序處理
         recvQueue.push(data);
         if (isWorkerReady) {
-            processRecvQueue();
+            drainRecvQueue();
         }
     }
 }
@@ -424,9 +480,14 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 保持原 chunkSize
-    const maxBufferedAmount = 2 * 1024 * 1024; // 2MB
-    const resumeBufferedAmount = 512 * 1024;    // 512KB
+    const chunkSize = 65536; // 保持原 64KB
+    const maxBufferedAmount = 2 * 1024 * 1024;    // 2MB
+    const resumeBufferedAmount = 512 * 1024;       // 512KB
+
+    // 🚀【重要修復】：將 DataChannel 門檻精確設為 512KB，確保 Safari 能正常觸發事件
+    try {
+        state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
+    } catch (e) {}
 
     let totalSent = 0;
     let lastUiUpdateTime = 0;
@@ -482,11 +543,10 @@ export async function sendFileChunks() {
                                     cleanup();
                                     return;
                                 }
-
                                 if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
                                     cleanup();
                                 }
-                            }, 30); // 縮短輪詢間隔為 30ms
+                            }, 20);
 
                             if (state.dataChannel) {
                                 state.dataChannel.onbufferedamountlow = () => {
@@ -542,7 +602,7 @@ export async function sendFileChunks() {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
                     while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise((resolve) => setTimeout(resolve, 30));
+                        await new Promise((resolve) => setTimeout(resolve, 20));
                     }
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
@@ -551,7 +611,7 @@ export async function sendFileChunks() {
             }
         }
         while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
-            await new Promise((resolve) => setTimeout(resolve, 30));
+            await new Promise((resolve) => setTimeout(resolve, 20));
         }
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
@@ -652,7 +712,7 @@ export function cleanupOPFSWorker() {
     }
     recvQueue = [];
     isWorkerReady = false;
-    isProcessingQueue = false;
     fileEndPending = false;
+    inFlightBytes = 0;
     currentOffset = 0;
 }

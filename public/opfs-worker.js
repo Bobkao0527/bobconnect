@@ -51,7 +51,7 @@ self.onmessage = async (event) => {
         }
 
         case 'write': {
-            const { chunk, offset } = data;
+            const { chunk, offset, size } = data;
             try {
                 if (!accessHandle) {
                     throw new Error('OPFS 寫入句柄未就緒或已關閉');
@@ -60,14 +60,18 @@ self.onmessage = async (event) => {
                 const view = new Uint8Array(chunk);
                 accessHandle.write(view, { at: offset });
 
-                // 🚀【Safari 46MB 修復關鍵】：定期 flush，防止 Safari 記憶體暫存溢出導致 Worker 假死
                 bytesSinceLastFlush += view.byteLength;
                 if (bytesSinceLastFlush >= FLUSH_THRESHOLD) {
                     accessHandle.flush();
                     bytesSinceLastFlush = 0;
                 }
 
-                self.postMessage({ type: 'write-ack', offset: offset + view.byteLength });
+                // 🚀【回傳 size 給主線程做 Backpressure 計算】
+                self.postMessage({
+                    type: 'write-ack',
+                    offset: offset + view.byteLength,
+                    size: size || view.byteLength
+                });
             } catch (err) {
                 console.error('[OPFS Worker] 寫入失敗:', err);
                 await cleanup();
