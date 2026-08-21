@@ -16,11 +16,11 @@ let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
 let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
-const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 限制最多 8MB 處於 Worker
+const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024; // 限制最多 2MB 處於 Worker
 
 let unackedBytes = 0;
 let ackResolver = null;
-const MAX_UNACKED_BYTES = 8 * 1024 * 1024; // 發送端最多允許 8MB 在途未確認資料
+const MAX_UNACKED_BYTES = 2 * 1024 * 1024; // 發送端最多允許 2MB 在途未確認資料
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -503,8 +503,8 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 保持原 64KB
-    const maxBufferedAmount = 4 * 1024 * 1024; // 4MB 物理網卡緩衝區
-    const resumeBufferedAmount = 1024 * 1024; // 1MB 緩衝區解鎖
+    const maxBufferedAmount = 1024 * 1024; // 1MB 物理網卡緩衝區
+    const resumeBufferedAmount = 256 * 1024; // 256KB
     unackedBytes = 0;
     ackResolver = null;
 
@@ -573,9 +573,9 @@ export async function sendFileChunks() {
                     totalSent += chunkSize;
                     unackedBytes += chunkSize;
 
-                    // 讓出 CPU 頻率：每發送 32 個切片 (2MB) 釋放一次 Event Loop
+                    // 🚀【修復關鍵 2：定期讓出主執行緒】：每傳送 16 個 chunk (約 1MB)，強制釋放 Event Loop
                     loopCounter++;
-                    if (loopCounter % 32 === 0) {
+                    if (loopCounter % 16 === 0) {
                         await new Promise((resolve) => setTimeout(resolve, 0));
                     }
 
