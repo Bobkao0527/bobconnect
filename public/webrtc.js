@@ -19,6 +19,10 @@ let fileEndPending = false;
 let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
 const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024; // 限制最多 2MB 處於 Worker
 
+let unackedBytes = 0;
+let ackResolver = null;
+const MAX_UNACKED_BYTES = 2 * 1024 * 1024; // 發送端最多允許 2MB 在途未確認資料
+
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
     const endpoints = [
@@ -285,7 +289,6 @@ export function setupDataChannelListeners() {
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
-    // 只要處於途中的資料量小於限制，且佇列中還有資料，就繼續發送
     while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
         const item = recvQueue.shift();
         const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
@@ -312,7 +315,6 @@ function drainRecvQueue() {
             currentOffset += chunkSize;
         }
 
-        // 更新 UI
         if (state.incomingFileInfo) {
             const now = Date.now();
             if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
@@ -327,7 +329,6 @@ function drainRecvQueue() {
         }
     }
 
-    // 當佇列全部消化完畢、Worker 寫入完全 ACK、且發送端已通知結束
     if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
         fileEndPending = false;
         opfsWorker.postMessage({ type: 'finish' });
@@ -339,6 +340,17 @@ export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
+
+            // 🚀【發送端邏輯】：接收到接收端的寫入確認 (ACK)，釋放發送視窗
+            if (message.type === 'ack') {
+                unackedBytes = Math.max(0, unackedBytes - (message.bytes || 0));
+                if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
+                    ackResolver();
+                    ackResolver = null;
+                }
+                return;
+            }
+
             if (message.type === 'file-meta') {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
@@ -369,9 +381,17 @@ export async function handleIncomingData(data) {
                         isWorkerReady = true;
                         drainRecvQueue();
                     }
-                    // 🚀【Safari 22MB 卡死修復關鍵】：接收 Worker 寫入確認，釋放 In-Flight 額度並繼續排程
                     else if (msg.type === 'write-ack') {
-                        inFlightBytes = Math.max(0, inFlightBytes - (msg.size || 0));
+                        const writtenSize = msg.size || 0;
+                        inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
+
+                        // 🚀【關鍵修復】：Worker 寫入硬碟後，主動發送 ACK 回發送端，達成完美流量同步
+                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+                            try {
+                                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: writtenSize }));
+                            } catch (err) {}
+                        }
+
                         drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
@@ -445,7 +465,6 @@ export async function handleIncomingData(data) {
         }
     }
 }
-
 // 智慧分流引擎評估（純 WebRTC P2P 直連）
 export function evaluateFileRouting(file) {
     const btnSend = document.getElementById('btn-send');
@@ -481,10 +500,11 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 保持原 64KB
-    const maxBufferedAmount = 2 * 1024 * 1024;    // 2MB
-    const resumeBufferedAmount = 512 * 1024;       // 512KB
+    const maxBufferedAmount = 1024 * 1024; // 1MB 物理網卡緩衝區
+    const resumeBufferedAmount = 256 * 1024; // 256KB
+    unackedBytes = 0;
+    ackResolver = null;
 
-    // 🚀【重要修復】：將 DataChannel 門檻精確設為 512KB，確保 Safari 能正常觸發事件
     try {
         state.dataChannel.bufferedAmountLowThreshold = resumeBufferedAmount;
     } catch (e) {}
@@ -494,6 +514,7 @@ export async function sendFileChunks() {
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = 0;
     let smoothSpeed = 0;
+    let loopCounter = 0;
 
     const formatEta = (seconds) => {
         if (!isFinite(seconds) || seconds <= 0) return '--:--';
@@ -526,41 +547,34 @@ export async function sendFileChunks() {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
-                    if (state.dataChannel.bufferedAmount > maxBufferedAmount) {
+
+                    // 🚀【修復關鍵 1：雙重流控】：同時檢查本機 SCTP Buffer 與 接收端 ACK 滑動視窗
+                    while (
+                        state.dataChannel.bufferedAmount > maxBufferedAmount ||
+                        unackedBytes >= MAX_UNACKED_BYTES
+                    ) {
                         await new Promise((resolve) => {
-                            let finished = false;
-                            let checkInterval = null;
-                            const cleanup = () => {
-                                if (finished) return;
-                                finished = true;
-                                if (checkInterval) clearInterval(checkInterval);
-                                if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
-                                resolve();
-                            };
-
-                            checkInterval = setInterval(() => {
-                                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                                    cleanup();
-                                    return;
+                            ackResolver = resolve;
+                            const timer = setTimeout(() => {
+                                if (ackResolver === resolve) {
+                                    ackResolver = null;
+                                    resolve();
                                 }
-                                if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
-                                    cleanup();
-                                }
-                            }, 20);
-
-                            if (state.dataChannel) {
-                                state.dataChannel.onbufferedamountlow = () => {
-                                    if (state.dataChannel.bufferedAmount <= resumeBufferedAmount) {
-                                        cleanup();
-                                    }
-                                };
-                            }
+                            }, 50); // 50ms 保險 Timeout，防止 ACK 丟失造成永久死鎖
                         });
                     }
+
                     const chunk = currentData.subarray(offset, offset + chunkSize);
                     state.dataChannel.send(chunk);
                     offset += chunkSize;
                     totalSent += chunkSize;
+                    unackedBytes += chunkSize;
+
+                    // 🚀【修復關鍵 2：定期讓出主執行緒】：每傳送 16 個 chunk (約 1MB)，強制釋放 Event Loop
+                    loopCounter++;
+                    if (loopCounter % 16 === 0) {
+                        await new Promise((resolve) => setTimeout(resolve, 0));
+                    }
 
                     const now = performance.now();
                     if (now - lastUiUpdateTime > 100 || totalSent >= state.selectedFile.size) {
@@ -601,17 +615,21 @@ export async function sendFileChunks() {
                     if (state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
-                    while (state.dataChannel.bufferedAmount > maxBufferedAmount) {
-                        await new Promise((resolve) => setTimeout(resolve, 20));
+                    while (state.dataChannel.bufferedAmount > maxBufferedAmount || unackedBytes >= MAX_UNACKED_BYTES) {
+                        await new Promise((resolve) => setTimeout(resolve, 30));
                     }
                     state.dataChannel.send(leftover);
                     totalSent += leftover.length;
+                    unackedBytes += leftover.length;
                 }
                 break;
             }
         }
-        while (state.dataChannel.bufferedAmount > resumeBufferedAmount) {
-            await new Promise((resolve) => setTimeout(resolve, 20));
+
+        // 等待接收端將剩餘的所有在途切片全數寫入硬碟並 ACK
+        while (unackedBytes > 0 || state.dataChannel.bufferedAmount > 0) {
+            if (state.dataChannel.readyState !== 'open') break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
         }
 
         state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
@@ -634,70 +652,9 @@ export async function sendFileChunks() {
         showToast('傳輸中斷：' + e.message, 'error');
     } finally {
         if (btnSend) {
-            if (state.dataChannel) state.dataChannel.onbufferedamountlow = null;
             btnSend.disabled = false;
             btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
         }
-    }
-}
-
-// 循序佇列處理引擎 (確保切片按正確順序與 Offset 寫入 Worker)
-async function processRecvQueue() {
-    if (isProcessingQueue || !isWorkerReady || !opfsWorker) return;
-    isProcessingQueue = true;
-
-    while (recvQueue.length > 0) {
-        const item = recvQueue.shift();
-        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
-        if (chunkSize === 0) continue;
-
-        state.receivedSize += chunkSize;
-
-        try {
-            let bufferToTransfer = null;
-            if (item instanceof ArrayBuffer) {
-                bufferToTransfer = item;
-            } else if (ArrayBuffer.isView(item)) {
-                bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
-            }
-
-            if (bufferToTransfer && opfsWorker) {
-                opfsWorker.postMessage({
-                    type: 'write',
-                    chunk: bufferToTransfer,
-                    offset: currentOffset
-                }, [bufferToTransfer]);
-
-                currentOffset += chunkSize;
-            }
-        } catch (e) {
-            console.error('[OPFS Direct Write] 切片寫入轉送失敗:', e);
-            cleanupOPFSWorker();
-            isProcessingQueue = false;
-            return;
-        }
-
-        // 更新 UI
-        if (state.incomingFileInfo) {
-            const now = Date.now();
-            if (now - state.lastRecvUiTime > 100 || state.receivedSize >= state.incomingFileInfo.size) {
-                state.lastRecvUiTime = now;
-                const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
-
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = `${percent}%`;
-                if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
-            }
-        }
-    }
-
-    isProcessingQueue = false;
-
-    // 若佇列排空且收到傳輸結束標記，通知 Worker 進行收尾
-    if (fileEndPending && opfsWorker) {
-        fileEndPending = false;
-        opfsWorker.postMessage({ type: 'finish' });
     }
 }
 
@@ -714,5 +671,7 @@ export function cleanupOPFSWorker() {
     isWorkerReady = false;
     fileEndPending = false;
     inFlightBytes = 0;
+    unackedBytes = 0;
+    ackResolver = null;
     currentOffset = 0;
 }
