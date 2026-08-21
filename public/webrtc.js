@@ -460,7 +460,7 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 64KB
-    const maxBufferedAmount = 16 * 1024 * 1024; // 16MB
+    const maxBufferedAmount = 12 * 1024 * 1024; // 12MB
     const resumeBufferedAmount = 4 * 1024 * 1024; // 4MB
     let totalSent = 0;
     let lastUiUpdateTime = 0;
