@@ -1,6 +1,5 @@
 /**
- * opfs-worker.js - OPFS 高效零記憶體檔案寫入 Worker
- * 採用 Origin Private File System (OPFS) 搭配 createSyncAccessHandle 實作硬碟直寫
+ * opfs-worker.js - OPFS 高效零記憶體檔案寫入 Worker (Safari 穩定優化版)
  */
 
 let accessHandle = null;
@@ -9,7 +8,7 @@ let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
 let bytesSinceLastFlush = 0;
-const FLUSH_THRESHOLD = 4 * 1024 * 1024; // 每 4MB 強制 flush 一次釋放 Safari 快取
+const FLUSH_THRESHOLD = 32 * 1024 * 1024; // 調高至 32MB，降低 fsync 頻率
 
 self.onmessage = async (event) => {
     const data = event.data;
@@ -22,7 +21,6 @@ self.onmessage = async (event) => {
             bytesSinceLastFlush = 0;
 
             try {
-                // 嘗試請求持久化儲存 (防止 Safari 50MB 配額限制)
                 if (navigator.storage && navigator.storage.persist) {
                     await navigator.storage.persist();
                 }
@@ -31,12 +29,11 @@ self.onmessage = async (event) => {
                     const { quota, usage } = await navigator.storage.estimate();
                     const available = quota - usage;
                     if (size && available < size) {
-                        throw new Error(`儲存空間不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，剩餘可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
+                        throw new Error(`Safari 儲存空間配額不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
                     }
                 }
 
                 rootDir = await navigator.storage.getDirectory();
-
                 tempFilename = `temp_${downloadId || Date.now()}_${Date.now()}.tmp`;
                 fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
                 accessHandle = await fileHandle.createSyncAccessHandle();
@@ -66,7 +63,6 @@ self.onmessage = async (event) => {
                     bytesSinceLastFlush = 0;
                 }
 
-                // 🚀【回傳 size 給主線程做 Backpressure 計算】
                 self.postMessage({
                     type: 'write-ack',
                     offset: offset + view.byteLength,
@@ -74,8 +70,12 @@ self.onmessage = async (event) => {
                 });
             } catch (err) {
                 console.error('[OPFS Worker] 寫入失敗:', err);
+                const isQuota = err.name === 'QuotaExceededError' || (err.message && err.message.includes('quota'));
+                const errMsg = isQuota 
+                    ? '寫入中斷：已達到 Safari 瀏覽器單一站點儲存上限 (通常為 1GB)'
+                    : (err.message || 'OPFS 寫入失敗');
                 await cleanup();
-                self.postMessage({ type: 'error', message: err.message || 'OPFS 寫入失敗' });
+                self.postMessage({ type: 'error', message: errMsg });
             }
             break;
         }
@@ -86,8 +86,6 @@ self.onmessage = async (event) => {
                     accessHandle.flush();
                     accessHandle.close();
                     accessHandle = null;
-
-                    // Safari 鎖釋放保護
                     await new Promise((resolve) => setTimeout(resolve, 100));
                 }
 
@@ -104,7 +102,7 @@ self.onmessage = async (event) => {
                     filename: targetFilename
                 });
             } catch (err) {
-                console.error('[OPFS Worker] 結束寫入處理解析失敗:', err);
+                console.error('[OPFS Worker] 結束寫入失敗:', err);
                 await cleanup();
                 self.postMessage({ type: 'error', message: err.message || 'OPFS 結束寫入處理解析失敗' });
             }
@@ -115,10 +113,6 @@ self.onmessage = async (event) => {
             await cleanup();
             break;
         }
-
-        default:
-            console.warn('[OPFS Worker] 接收到未知的訊息類型:', data.type);
-            break;
     }
 };
 
@@ -126,17 +120,13 @@ async function cleanup() {
     if (accessHandle) {
         try {
             accessHandle.close();
-        } catch (e) {
-            console.warn('[OPFS Worker] 關閉 accessHandle 失敗:', e);
-        }
+        } catch (e) {}
         accessHandle = null;
     }
     if (rootDir && tempFilename) {
         try {
             await rootDir.removeEntry(tempFilename);
-        } catch (e) {
-            // 忽略刪除失敗 (例如檔案已被刪除)
-        }
+        } catch (e) {}
         tempFilename = null;
         fileHandle = null;
     }
