@@ -9,7 +9,7 @@ let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
 let bytesSinceLastFlush = 0;
-const FLUSH_THRESHOLD = 32 * 1024 * 1024; // 每 32MB 強制 flush 一次釋放 Safari 快取
+const FLUSH_THRESHOLD = 4 * 1024 * 1024; // 每 4MB 強制 flush 一次釋放 Safari 快取
 
 self.onmessage = async (event) => {
     const data = event.data;
