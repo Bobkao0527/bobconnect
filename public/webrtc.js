@@ -499,7 +499,6 @@ function updateRecvUi() {
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
-    // 將佇列中積壓的 chunk 快速派發給 Worker
     while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
         const item = recvQueue.shift();
         const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
@@ -535,8 +534,9 @@ function drainRecvQueue() {
         }
     }
 
-    // 當所有接收佇列與 Worker 寫入皆已完成，且對端已宣告 file-end，發送 finish 指令
-    if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
+    // 雙重判定：收到 file-end 訊號 或是 接收位元組數已完全達標，且 Worker 均已寫入落盤完畢
+    const isTotalReceived = state.incomingFileInfo && state.receivedSize >= state.incomingFileInfo.size;
+    if ((fileEndPending || isTotalReceived) && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
         fileEndPending = false;
         opfsWorker.postMessage({ type: 'finish' });
     }
@@ -709,7 +709,7 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 64 * 1024; // 64KB 標準 WebRTC MTU 最佳傳輸塊
+    const chunkSize = 64 * 1024; // 64KB 標準 MTU 傳輸塊
     totalSent = 0;
     bufferLowResolver = null;
 
@@ -739,10 +739,16 @@ export async function sendFileChunks() {
                 throw new Error('傳輸途中 DataChannel 已關閉');
             }
 
-            // 純粹依靠 SCTP 的緩衝水位 (無死鎖背壓)
+            // SCTP 緩衝區背壓控制（附帶 50ms 安全逾時防漏接）
             if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                 await new Promise((resolve) => {
                     bufferLowResolver = resolve;
+                    setTimeout(() => {
+                        if (bufferLowResolver === resolve) {
+                            bufferLowResolver = null;
+                            resolve();
+                        }
+                    }, 50);
                 });
             }
 
@@ -790,14 +796,7 @@ export async function sendFileChunks() {
             }
         }
 
-        // 等待底層緩衝區全部送出到網卡
-        while (state.dataChannel && state.dataChannel.bufferedAmount > 0) {
-            if (state.dataChannel.readyState !== 'open') break;
-            await new Promise((resolve) => {
-                bufferLowResolver = resolve;
-            });
-        }
-
+        // 立即發送結尾訊號（SCTP 依序通道會保證所有 binary 送達後才遞交 file-end）
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
             state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
             lastActivityTime = Date.now();
