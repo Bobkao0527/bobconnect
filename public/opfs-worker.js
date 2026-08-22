@@ -7,6 +7,7 @@ let fileHandle = null;
 let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
+let workerWriteCount = 0;
 
 self.addEventListener('error', (err) => {
     console.error('[OPFS Worker 全域錯誤]:', err);
@@ -26,6 +27,9 @@ self.onmessage = async (event) => {
         case 'init': {
             const { downloadId, size, filename, tempFilename: customTempName } = data;
             targetFilename = filename || 'downloaded_file';
+            workerWriteCount = 0;
+
+            console.log(`[OPFS Worker] 收到初始化請求: 檔名="${targetFilename}", 預期大小=${(size / (1024 * 1024)).toFixed(2)} MB`);
 
             try {
                 if (navigator.storage && navigator.storage.persist) {
@@ -36,6 +40,7 @@ self.onmessage = async (event) => {
                     try {
                         const { quota, usage } = await navigator.storage.estimate();
                         const available = quota - usage;
+                        console.log(`[OPFS Worker 空間檢查] 磁碟可用: ${(available / (1024 * 1024)).toFixed(1)} MB / 需使用: ${(size / (1024 * 1024)).toFixed(1)} MB`);
                         if (size && available < size) {
                             throw new Error(`磁碟可用空間不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
                         }
@@ -52,6 +57,7 @@ self.onmessage = async (event) => {
                 fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
                 accessHandle = await fileHandle.createSyncAccessHandle();
 
+                console.log(`[OPFS Worker] 句柄建立成功，暫存檔名: ${tempFilename}`);
                 self.postMessage({ type: 'init-success' });
             } catch (err) {
                 console.error('[OPFS Worker] 初始化失敗:', err);
@@ -68,6 +74,7 @@ self.onmessage = async (event) => {
                     throw new Error('OPFS 寫入句柄未就緒或已關閉');
                 }
 
+                workerWriteCount++;
                 const view = new Uint8Array(chunk);
                 let bytesWritten = 0;
                 
@@ -79,12 +86,16 @@ self.onmessage = async (event) => {
                     bytesWritten += written;
                 }
 
+                if (workerWriteCount % 50 === 1 || workerWriteCount <= 3) {
+                    console.log(`[OPFS Worker 寫入中] 第 ${workerWriteCount} 塊, offset: ${(offset / (1024 * 1024)).toFixed(2)} MB, 本次寫入: ${(bytesWritten / 1024).toFixed(1)} KB`);
+                }
+
                 self.postMessage({
                     type: 'write-ack',
                     size: bytesWritten || size || view.byteLength
                 });
             } catch (err) {
-                console.error('[OPFS Worker] 寫入失敗:', err);
+                console.error(`[OPFS Worker] 寫入第 ${workerWriteCount} 塊時失敗 (offset: ${offset}):`, err);
                 await cleanup();
                 self.postMessage({ type: 'error', message: err.message || 'OPFS 寫入失敗' });
             }
@@ -93,8 +104,11 @@ self.onmessage = async (event) => {
 
         case 'finish': {
             try {
+                console.log(`[OPFS Worker] 收到結束請求，開始 Flush 與關閉檔案 (共寫入 ${workerWriteCount} 個分塊)...`);
+                const startTime = performance.now();
+
                 if (accessHandle) {
-                    accessHandle.flush(); // 僅在檔案傳輸結束時執行一次完整落盤
+                    accessHandle.flush(); // 僅在傳輸結束時落盤
                     accessHandle.close(); // 關閉句柄解鎖
                     accessHandle = null;
                 }
@@ -102,6 +116,8 @@ self.onmessage = async (event) => {
                 if (!fileHandle) throw new Error('OPFS 檔案控制桿不存在');
 
                 const file = await fileHandle.getFile();
+                const cost = (performance.now() - startTime).toFixed(1);
+                console.log(`[OPFS Worker] 檔案封裝完成 (耗時 ${cost}ms)，實體大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
 
                 self.postMessage({
                     type: 'finish-success',
@@ -118,6 +134,7 @@ self.onmessage = async (event) => {
         }
 
         case 'abort': {
+            console.warn('[OPFS Worker] 收到 abort 指令，執行資源清理');
             await cleanup();
             break;
         }
