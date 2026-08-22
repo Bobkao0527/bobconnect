@@ -608,8 +608,8 @@ export async function handleIncomingData(data) {
                         state.receivedSize += writtenSize;
                         lastActivityTime = Date.now();
 
-                        if (workerAckCount % 50 === 1 || workerAckCount <= 3) {
-                            console.log(`[接收端 OPFS Ack #${workerAckCount}] 已寫入磁碟: ${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB | inFlight 佔用: ${(inFlightBytes / 1024).toFixed(1)} KB`);
+                        if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
+                            flushCumulativeAck();
                         }
 
                         updateRecvUi();
@@ -643,6 +643,10 @@ export async function handleIncomingData(data) {
                                 await removeOPFSFile(fileToDelete);
                             }
                         }, 15000);
+                    }
+                    else if (message.type === 'ack') {
+                        lastActivityTime = Date.now(); // 收到接收端的 ACK，證明連線完全正常
+                        return;
                     }
                     else if (msg.type === 'error') {
                         releaseWakeLock();
@@ -688,10 +692,8 @@ export async function handleIncomingData(data) {
         recvQueue.push(data);
         lastActivityTime = Date.now();
 
-        if (recvPacketCount % 50 === 1 || recvPacketCount <= 3) {
-            const chunkByteLen = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
-            console.log(`[接收端 收到封包 #${recvPacketCount}] 大小: ${(chunkByteLen / 1024).toFixed(1)} KB | 佇列待處理: ${recvQueue.length}`);
-        }
+        const chunkByteLen = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
+        console.log(`[接收端 收到封包 #${recvPacketCount}] 大小: ${(chunkByteLen / 1024).toFixed(1)} KB | 佇列待處理: ${recvQueue.length}`);
 
         if (isWorkerReady) {
             drainRecvQueue();
@@ -799,9 +801,7 @@ export async function sendFileChunks() {
             totalSent += bytesSent;
 
             // 每 50 個 chunk 或前 3 個 chunk 輸出一次狀態
-            if (chunkIndex % 50 === 1 || chunkIndex <= 3) {
-                console.log(`[發送端 進行中] 發送 Chunk #${chunkIndex} | 進度: ${(totalSent / (1024 * 1024)).toFixed(2)} / ${(totalSize / (1024 * 1024)).toFixed(2)} MB | 緩衝水位: ${(state.dataChannel.bufferedAmount / 1024).toFixed(1)} KB`);
-            }
+            console.log(`[發送端 進行中] 發送 Chunk #${chunkIndex} | 進度: ${(totalSent / (1024 * 1024)).toFixed(2)} / ${(totalSize / (1024 * 1024)).toFixed(2)} MB | 緩衝水位: ${(state.dataChannel.bufferedAmount / 1024).toFixed(1)} KB`);
 
             const now = performance.now();
             if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {

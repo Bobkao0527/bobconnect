@@ -86,9 +86,7 @@ self.onmessage = async (event) => {
                     bytesWritten += written;
                 }
 
-                if (workerWriteCount % 50 === 1 || workerWriteCount <= 3) {
-                    console.log(`[OPFS Worker 寫入中] 第 ${workerWriteCount} 塊, offset: ${(offset / (1024 * 1024)).toFixed(2)} MB, 本次寫入: ${(bytesWritten / 1024).toFixed(1)} KB`);
-                }
+                console.log(`[OPFS Worker 寫入中] 第 ${workerWriteCount} 塊, offset: ${(offset / (1024 * 1024)).toFixed(2)} MB, 本次寫入: ${(bytesWritten / 1024).toFixed(1)} KB`);
 
                 self.postMessage({
                     type: 'write-ack',
