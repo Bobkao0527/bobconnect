@@ -1,11 +1,11 @@
 /**
  * webrtc.js - WebRTC 直連通道與信令核心 (OPFS Web Worker 重構版)
- * 負責連線握手、ICE 收集、連線狀態維護，並透過 Dedicated Web Worker + OPFS 同步寫入進行零記憶體大檔案接收。
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow } from './ui.js';
 
 let currentDownloadId = null;
+let currentTempFilename = null; // 記錄當前正在接收的暫存檔名
 let opfsWorker = null;
 let currentOffset = 0;
 
@@ -15,12 +15,24 @@ let pendingCandidates = [];
 let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
-let inFlightBytes = 0; // 當前已 postMessage 但 Worker 尚未 ACK 的位元組數
-const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024; // 限制最多 2MB 處於 Worker
+let inFlightBytes = 0;
+const MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024;
 
 let unackedBytes = 0;
 let ackResolver = null;
-const MAX_UNACKED_BYTES = 2 * 1024 * 1024; // 發送端最多允許 2MB 在途未確認資料
+const MAX_UNACKED_BYTES = 2 * 1024 * 1024;
+
+// 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
+async function removeOPFSFile(filename) {
+    if (!filename || !navigator.storage || !navigator.storage.getDirectory) return;
+    try {
+        const rootDir = await navigator.storage.getDirectory();
+        await rootDir.removeEntry(filename);
+        console.log(`[OPFS 清理] 暫存檔已安全刪除: ${filename}`);
+    } catch (e) {
+        // 檔案若已刪除或不存在則忽略
+    }
+}
 
 // 非阻塞式背景 IPv4 探針
 export async function probeIPv4() {
@@ -31,18 +43,14 @@ export async function probeIPv4() {
 
     const controllers = [];
 
-    // 單一 endpoint 發送邏輯
     const fetchEndpoint = async (ep) => {
         const controller = new AbortController();
         controllers.push(controller);
-
-        // 設定單一請求的極限 2 秒逾時
         const timeoutId = setTimeout(() => controller.abort(), 2000);
 
         try {
             const res = await fetch(ep.url, { signal: controller.signal });
             clearTimeout(timeoutId);
-
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
             let ip = '';
@@ -99,7 +107,7 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024; // 4MB
+        state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -143,7 +151,6 @@ export async function initHost() {
     }
 }
 
-// 建立 Durable Object WebSocket 信令轉發通道
 function connectSignalingWS() {
     const workerUrl = getWorkerUrl();
     const wsUrl = workerUrl.replace(/^http/, 'ws') + `/ws/${state.roomId}`;
@@ -156,7 +163,6 @@ function connectSignalingWS() {
             updateStatus('信令通道已就緒，等待連線...', 'yellow');
         }
 
-        // 🚀 補發所有連線建立前搜集到的 Candidate
         while (localCandidates.length > 0) {
             const candMsg = localCandidates.shift();
             state.ws.send(JSON.stringify(candMsg));
@@ -170,7 +176,6 @@ function connectSignalingWS() {
             if (data.type === 'offer' && !state.isHost) {
                 updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
                 await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-                
                 await processPendingCandidates();
 
                 const answer = await state.peerConnection.createAnswer();
@@ -210,7 +215,6 @@ async function processPendingCandidates() {
     }
 }
 
-// 接收端：自動對接
 export async function initJoinerWithRoom(roomId) {
     if (roomId) state.roomId = roomId;
     document.getElementById('setup-view').classList.add('hidden');
@@ -245,7 +249,6 @@ export async function initJoinerWithRoom(roomId) {
     }
 }
 
-// 設定 DataChannel 監聽
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
     state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
@@ -272,7 +275,7 @@ export function setupDataChannelListeners() {
     };
 
     state.dataChannel.onclose = () => {
-        cleanupOPFSWorker(); // 斷線時主動釋放 OPFS Worker 資源
+        cleanupOPFSWorker(); 
         updateStatus('連線已被安全釋放', 'red');
         showToast('連結已釋放斷開', 'error');
         document.getElementById('transfer-panel').classList.add('hidden');
@@ -284,7 +287,6 @@ export function setupDataChannelListeners() {
     };
 }
 
-// 具備 Backpressure 控制的佇列消化器
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
@@ -334,13 +336,11 @@ function drainRecvQueue() {
     }
 }
 
-// 處理接收資料流 (OPFS Dedicated Web Worker 模式)
 export async function handleIncomingData(data) {
     if (typeof data === 'string') {
         try {
             const message = JSON.parse(data);
 
-            // 🚀【發送端邏輯】：接收到接收端的寫入確認 (ACK)，釋放發送視窗
             if (message.type === 'ack') {
                 unackedBytes = Math.max(0, unackedBytes - (message.bytes || 0));
                 if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
@@ -362,8 +362,9 @@ export async function handleIncomingData(data) {
                 inFlightBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+                currentTempFilename = `temp_${currentDownloadId}.tmp`;
 
-                cleanupOPFSWorker();
+                cleanupOPFSWorker(); // 如果有舊的 Worker 先釋放
 
                 try {
                     opfsWorker = new Worker('./opfs-worker.js');
@@ -384,7 +385,6 @@ export async function handleIncomingData(data) {
                         const writtenSize = msg.size || 0;
                         inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
 
-                        // 🚀【關鍵修復】：Worker 寫入硬碟後，主動發送 ACK 回發送端，達成完美流量同步
                         if (state.dataChannel && state.dataChannel.readyState === 'open') {
                             try {
                                 state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: writtenSize }));
@@ -394,10 +394,14 @@ export async function handleIncomingData(data) {
                         drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
-                        const { file, filename } = msg;
+                        const { file, filename, tempFilename } = msg;
+                        const fileToDelete = tempFilename || currentTempFilename;
                         const blobUrl = URL.createObjectURL(file);
 
-                         if (typeof triggerAutoDownload === 'function') {
+                        // 立即關閉 Worker，因為 handle 已經在 Worker 內 close() 了
+                        cleanupOPFSWorker();
+
+                        if (typeof triggerAutoDownload === 'function') {
                             triggerAutoDownload(blobUrl, filename);
                         } else {
                             const a = document.createElement('a');
@@ -414,13 +418,13 @@ export async function handleIncomingData(data) {
                         if (recvProgressBar) recvProgressBar.style.width = '100%';
                         showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
 
-                        setTimeout(() => {
+                        // 🚀 由主線程直接執行刪除，不依賴 Worker
+                        setTimeout(async () => {
                             URL.revokeObjectURL(blobUrl);
-                            if (opfsWorker) {
-                                opfsWorker.postMessage({ type: 'delete-temp' });
+                            if (fileToDelete) {
+                                await removeOPFSFile(fileToDelete);
                             }
-                            cleanupOPFSWorker();
-                        }, 15000);
+                        }, 10000);
                     }
                     else if (msg.type === 'error') {
                         showToast('OPFS 寫入發生錯誤: ' + msg.message, 'error');
@@ -437,6 +441,7 @@ export async function handleIncomingData(data) {
                 opfsWorker.postMessage({
                     type: 'init',
                     downloadId: currentDownloadId,
+                    tempFilename: currentTempFilename,
                     filename: message.name,
                     size: message.size
                 });
@@ -468,24 +473,17 @@ export async function handleIncomingData(data) {
         }
     }
 }
-// 智慧分流引擎評估（純 WebRTC P2P 直連）
+
 export function evaluateFileRouting(file) {
     const btnSend = document.getElementById('btn-send');
-
     if (!btnSend) return;
-    
-    // 確保發送按鈕保持啟用狀態
     btnSend.disabled = false;
     btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
-
-    // 更新 UI 提示文字與進度條樣式
     document.getElementById('progress-status').innerText = '隨時可以發送 (WebRTC P2P 直連)';
     document.getElementById('progress-bar').className = "bg-gradient-to-r from-blue-500 to-emerald-400 h-1 w-0 transition-all duration-75";
-    
     showToast('已啟用 WebRTC P2P 直連傳輸', 'success');
 }
 
-// 發送端：執行 WebRTC 切片傳輸
 export async function sendFileChunks() {
     if (!state.selectedFile || !state.dataChannel || state.dataChannel.readyState !== 'open') {
         showToast('通道尚未連線或未選擇檔案', 'error');
@@ -502,9 +500,9 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 保持原 64KB
-    const maxBufferedAmount = 1024 * 1024; // 1MB 物理網卡緩衝區
-    const resumeBufferedAmount = 256 * 1024; // 256KB
+    const chunkSize = 65536; 
+    const maxBufferedAmount = 1024 * 1024; 
+    const resumeBufferedAmount = 256 * 1024; 
     unackedBytes = 0;
     ackResolver = null;
 
@@ -551,7 +549,6 @@ export async function sendFileChunks() {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
 
-                    // 🚀【修復關鍵 1：雙重流控】：同時檢查本機 SCTP Buffer 與 接收端 ACK 滑動視窗
                     while (
                         state.dataChannel.bufferedAmount > maxBufferedAmount ||
                         unackedBytes >= MAX_UNACKED_BYTES
@@ -563,7 +560,7 @@ export async function sendFileChunks() {
                                     ackResolver = null;
                                     resolve();
                                 }
-                            }, 50); // 50ms 保險 Timeout，防止 ACK 丟失造成永久死鎖
+                            }, 50);
                         });
                     }
 
@@ -573,7 +570,6 @@ export async function sendFileChunks() {
                     totalSent += chunkSize;
                     unackedBytes += chunkSize;
 
-                    // 🚀【修復關鍵 2：定期讓出主執行緒】：每傳送 16 個 chunk (約 1MB)，強制釋放 Event Loop
                     loopCounter++;
                     if (loopCounter % 16 === 0) {
                         await new Promise((resolve) => setTimeout(resolve, 0));
@@ -629,7 +625,6 @@ export async function sendFileChunks() {
             }
         }
 
-        // 等待接收端將剩餘的所有在途切片全數寫入硬碟並 ACK
         while (unackedBytes > 0 || state.dataChannel.bufferedAmount > 0) {
             if (state.dataChannel.readyState !== 'open') break;
             await new Promise((resolve) => setTimeout(resolve, 50));
@@ -661,15 +656,18 @@ export async function sendFileChunks() {
     }
 }
 
-// 釋放 OPFS Worker 與內部資源
+// 釋放 OPFS Worker 與內部資源，並在異常中斷時確保清理未完成的暫存檔
 export function cleanupOPFSWorker() {
     if (opfsWorker) {
-        try {
-            opfsWorker.postMessage({ type: 'abort' });
-        } catch (e) {}
         opfsWorker.terminate();
         opfsWorker = null;
     }
+
+    // 🚀 如果傳輸中途被中止 (未完成狀態)，由主線程確保將暫存檔移除
+    if (currentTempFilename && fileEndPending) {
+        removeOPFSFile(currentTempFilename);
+    }
+
     recvQueue = [];
     isWorkerReady = false;
     fileEndPending = false;
@@ -679,28 +677,21 @@ export function cleanupOPFSWorker() {
     currentOffset = 0;
 }
 
-export async function cleanOrphanOPFSFiles() {
+export async function clearEntireOPFS() {
     if (!navigator.storage || !navigator.storage.getDirectory) return;
 
     try {
         const rootDir = await navigator.storage.getDirectory();
-        
-        // 遍歷 OPFS 根目錄中的所有檔案
-        // (相容於現代瀏覽器的 entries() 異步迭代器)
-        if (rootDir.entries) {
-            for await (const [name, handle] of rootDir.entries()) {
-                // 只要是 temp_ 開頭的暫存檔案就進行清理
-                if (handle.kind === 'file' && name.startsWith('temp_')) {
-                    try {
-                        await rootDir.removeEntry(name);
-                        console.log(`[OPFS 啟動清理] 已清除歷史暫存檔: ${name}`);
-                    } catch (err) {
-                        console.warn(`[OPFS 啟動清理] 刪除 ${name} 失敗:`, err);
-                    }
-                }
+        for await (const [name, handle] of rootDir.entries()) {
+            try {
+                await rootDir.removeEntry(name, { recursive: true });
+                console.log(`[OPFS 清理] 已清除項目: ${name} (${handle.kind})`);
+            } catch (err) {
+                console.warn(`[OPFS 清理] 刪除 ${name} 失敗:`, err);
             }
         }
+        console.log('[OPFS 清理] OPFS 空間已全數清空完成。');
     } catch (err) {
-        console.warn('[OPFS 啟動清理] 執行失敗 (可能處於無痕模式):', err);
+        console.warn('[OPFS 清理] 執行失敗:', err);
     }
 }
