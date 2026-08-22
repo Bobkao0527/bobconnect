@@ -6,7 +6,7 @@
  */
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
-import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4, clearEntireStorage } from './webrtc.js';
+import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4, clearEntireOPFS } from './webrtc.js';
 import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
 
 // 全域暴露機制
@@ -22,11 +22,11 @@ window.hideToast = hideToast;
 // 頁面初始化
 window.addEventListener('DOMContentLoaded', async () => {
     checkInAppBrowser(); // 檢查內嵌瀏覽器防暴走
-    
+
     // 🚀【強制 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配
     // await 探針以確保下一步自動探測時能夾帶最穩定的 IP 金鑰
     await probeIPv4();
-    clearEntireStorage();
+    clearEntireOPFS();
 
     // 解析路徑自動加入
     const urlParams = new URLSearchParams(window.location.search);
@@ -53,7 +53,7 @@ function setupDragAndDrop() {
 
     if (dropZone && fileInput) {
         dropZone.addEventListener('click', () => fileInput.click());
-        
+
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
             dropZone.classList.add('border-blue-500', 'bg-slate-950/90');
@@ -81,7 +81,7 @@ function setupDragAndDrop() {
 
 function handleFileSelect(file) {
     state.selectedFile = file;
-    
+
     let sizeStr = file.size + ' Bytes';
     if (file.size > 1024 * 1024 * 1024) {
         sizeStr = (file.size / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
@@ -94,7 +94,7 @@ function handleFileSelect(file) {
     document.getElementById('file-info-container').classList.remove('hidden');
     document.getElementById('info-file-name').innerText = file.name;
     document.getElementById('info-file-size').innerText = sizeStr;
-    
+
     document.getElementById('progress-percent').innerText = '0%';
     document.getElementById('progress-bar').style.width = '0%';
     const speedText = document.getElementById('transfer-speed');
