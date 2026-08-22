@@ -16,20 +16,20 @@ let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024; // 4MB 接收並發窗口
+const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
 
 let totalSent = 0;
 let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
-const MAX_UNACKED_BYTES = 4 * 1024 * 1024; // 4MB 發送端滑動視窗
-const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB SCTP 緩衝區上限
-const BUFFERED_LOW_THRESHOLD = 256 * 1024; // 256KB 低水位觸發閾值
+const MAX_UNACKED_BYTES = 8 * 1024 * 1024; // 8MB 發送端滑動視窗
+const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 緩衝區上限
+const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 低水位觸發閾值
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
 let ackFlushTimer = null;
-const BATCH_ACK_INTERVAL = 256 * 1024; // 每累積寫入 256KB 發送一次確認
+const BATCH_ACK_INTERVAL = 128 * 1024; // 每累積寫入 128KB (2個 chunk) 即發送一次確認
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -70,7 +70,7 @@ function triggerCumulativeAck() {
     if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
         flushCumulativeAck();
     } else if (!ackFlushTimer) {
-        ackFlushTimer = setTimeout(flushCumulativeAck, 20);
+        ackFlushTimer = setTimeout(flushCumulativeAck, 10);
     }
 }
 
@@ -562,6 +562,12 @@ export async function handleIncomingData(data) {
                 return;
             }
 
+            // 接收到發送端的 ACK 請求探針，立即強制回傳目前累積的 Offset
+            if (message.type === 'ack-request') {
+                flushCumulativeAck();
+                return;
+            }
+
             // 🚀 核心：基於絕對 Offset 的累積確認 (Cumulative ACK)
             if (message.type === 'ack') {
                 const confirmedOffset = message.offset || 0;
@@ -774,15 +780,25 @@ export async function sendFileChunks() {
                             bufferLowResolver = null;
                             resolve();
                         }
-                    }, 20);
+                    }, 15);
                 });
             }
 
-            // 2. 接收端寫入背壓控制 (滑動窗口 4MB)
+            // 2. 接收端寫入背壓控制 (滑動窗口 8MB)
+            let unackedWaitTicks = 0;
             while (unackedBytes >= MAX_UNACKED_BYTES) {
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                     throw new Error('傳輸途中 DataChannel 已關閉');
                 }
+
+                unackedWaitTicks++;
+                // 若等待超過 100ms (5 * 20ms)，主動發送 ACK 請求探針以喚醒接收端回傳 Offset
+                if (unackedWaitTicks % 5 === 0) {
+                    try {
+                        state.dataChannel.send(JSON.stringify({ type: 'ack-request' }));
+                    } catch (e) {}
+                }
+
                 await new Promise((resolve) => {
                     ackResolver = resolve;
                     setTimeout(() => {
@@ -806,7 +822,7 @@ export async function sendFileChunks() {
             unackedBytes += bytesSent;
 
             loopCounter++;
-            if (loopCounter % 16 === 0) {
+            if (loopCounter % 8 === 0) {
                 await new Promise((resolve) => setTimeout(resolve, 0));
             }
 

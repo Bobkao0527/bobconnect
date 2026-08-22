@@ -69,9 +69,9 @@ self.onmessage = async (event) => {
                 }
 
                 const view = new Uint8Array(chunk);
-                accessHandle.write(view, { at: offset });
+                const written = accessHandle.write(view, { at: offset });
 
-                const bytesWritten = size || view.byteLength;
+                const bytesWritten = (typeof written === 'number' && written > 0) ? written : (size || view.byteLength);
                 self.postMessage({
                     type: 'write-ack',
                     size: bytesWritten
