@@ -1,19 +1,19 @@
 /**
- * webrtc.js - WebRTC 直連通道與信令核心 (OPFS Web Worker 重構版 - 支援超大檔案 2GB+ 與累積確認 Cumulative ACK)
+ * webrtc.js - WebRTC 直連通道與信令核心 (IndexedDB 批次暫存 + 自動 GC 清道夫架構)
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
+import { saveChunks, assembleFile, deleteTransfer, clearEntireStorage } from './storage.js';
 
 let currentDownloadId = null;
-let currentTempFilename = null; // 記錄當前正在接收的暫存檔名
-let opfsWorker = null;
+let currentChunkIndex = 0;
 let currentOffset = 0;
 
 let localCandidates = [];
 let pendingCandidates = [];
 
-let recvQueue = [];
-let isWorkerReady = false;
+let writeQueue = [];
+let isWriting = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
@@ -36,18 +36,6 @@ let heartbeatTimer = null;
 let watchdogTimer = null;
 let lastActivityTime = Date.now();
 let isDisconnectHandled = false;
-
-// 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
-async function removeOPFSFile(filename) {
-    if (!filename || !navigator.storage || !navigator.storage.getDirectory) return;
-    try {
-        const rootDir = await navigator.storage.getDirectory();
-        await rootDir.removeEntry(filename);
-        console.log(`[OPFS 清理] 暫存檔已安全刪除: ${filename}`);
-    } catch (e) {
-        // 檔案若已刪除或不存在則忽略
-    }
-}
 
 // 接收端發送累積確認 (Cumulative ACK)
 function flushCumulativeAck() {
@@ -82,7 +70,7 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     console.warn(`[連線中斷觸發]: ${reason}`);
     stopHeartbeatAndWatchdog();
     releaseWakeLock();
-    cleanupOPFSWorker();
+    cleanupTransferStorage();
 
     if (state.dataChannel) {
         try { state.dataChannel.close(); } catch (e) {}
@@ -495,48 +483,74 @@ function updateRecvUi() {
     }
 }
 
-function drainRecvQueue() {
-    if (!isWorkerReady || !opfsWorker) return;
-
-    while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
-        const item = recvQueue.shift();
-        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
-        if (chunkSize === 0) continue;
-
-        inFlightBytes += chunkSize;
-
-        let bufferToTransfer = null;
-        if (item instanceof ArrayBuffer) {
-            bufferToTransfer = item;
-        } else if (ArrayBuffer.isView(item)) {
-            bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
+async function drainWriteQueue() {
+    if (isWriting || writeQueue.length === 0) {
+        if (fileEndPending && writeQueue.length === 0 && !isWriting) {
+            fileEndPending = false;
+            await finishFileDownload();
         }
-
-        if (bufferToTransfer) {
-            try {
-                opfsWorker.postMessage({
-                    type: 'write',
-                    chunk: bufferToTransfer,
-                    offset: currentOffset,
-                    size: chunkSize
-                }, [bufferToTransfer]);
-            } catch (err) {
-                opfsWorker.postMessage({
-                    type: 'write',
-                    chunk: bufferToTransfer,
-                    offset: currentOffset,
-                    size: chunkSize
-                });
-            }
-
-            currentOffset += chunkSize;
-        }
+        return;
     }
 
-    if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
-        fileEndPending = false;
-        flushCumulativeAck();
-        opfsWorker.postMessage({ type: 'finish' });
+    isWriting = true;
+    const batch = writeQueue.splice(0, Math.min(16, writeQueue.length));
+    const batchSize = batch.reduce((sum, item) => sum + item.size, 0);
+
+    try {
+        await saveChunks(currentDownloadId, batch);
+
+        inFlightBytes = Math.max(0, inFlightBytes - batchSize);
+        state.receivedSize += batchSize;
+        lastActivityTime = Date.now();
+
+        triggerCumulativeAck();
+        updateRecvUi();
+    } catch (err) {
+        console.error('[IndexedDB 寫入失敗]:', err);
+        releaseWakeLock();
+        handlePeerDisconnection('接收端寫入錯誤: ' + (err.message || '儲存空間寫入失敗'));
+        return;
+    } finally {
+        isWriting = false;
+    }
+
+    if (writeQueue.length > 0 || fileEndPending) {
+        drainWriteQueue();
+    }
+}
+
+async function finishFileDownload() {
+    releaseWakeLock();
+    flushCumulativeAck();
+
+    try {
+        const filename = state.incomingFileInfo ? state.incomingFileInfo.name : 'downloaded_file';
+        const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : 0;
+
+        const blob = await assembleFile(currentDownloadId);
+        const blobUrl = URL.createObjectURL(blob);
+
+        if (typeof triggerAutoDownload === 'function') {
+            triggerAutoDownload(blobUrl, filename, actualFileSize || blob.size);
+        }
+
+        const recvPercent = document.getElementById('recv-percent');
+        const recvProgressBar = document.getElementById('recv-progress-bar');
+        if (recvPercent) recvPercent.innerText = '100% (完成)';
+        if (recvProgressBar) recvProgressBar.style.width = '100%';
+        showToast(`「${filename}」傳輸成功！`, 'success');
+
+        // 🧹 15 秒後安全釋放 ObjectURL 與觸發 IndexedDB 垃圾回收 (GC)
+        const tid = currentDownloadId;
+        setTimeout(async () => {
+            URL.revokeObjectURL(blobUrl);
+            if (tid) {
+                await deleteTransfer(tid);
+            }
+        }, 15000);
+    } catch (err) {
+        console.error('[組裝檔案失敗]:', err);
+        showToast('檔案組裝失敗: ' + err.message, 'error');
     }
 }
 
@@ -590,91 +604,15 @@ export async function handleIncomingData(data) {
                 lastAckedOffset = 0;
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
+                currentChunkIndex = 0;
 
-                recvQueue = [];
-                isWorkerReady = false;
+                writeQueue = [];
+                isWriting = false;
                 fileEndPending = false;
                 inFlightBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                currentTempFilename = `temp_${currentDownloadId}.tmp`;
-
-                cleanupOPFSWorker(); // 舊的 Worker 先釋放
-
-                try {
-                    opfsWorker = new Worker('./opfs-worker.js');
-                } catch (err) {
-                    showToast('無法建立 OPFS Worker: ' + err.message, 'error');
-                    releaseWakeLock();
-                    return;
-                }
-
-                opfsWorker.onmessage = (e) => {
-                    const msg = e.data;
-                    if (!msg) return;
-
-                    if (msg.type === 'init-success') {
-                        isWorkerReady = true;
-                        drainRecvQueue();
-                    }
-                    else if (msg.type === 'write-ack') {
-                        const writtenSize = msg.size || 0;
-                        inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                        state.receivedSize += writtenSize;
-                        lastActivityTime = Date.now();
-
-                        triggerCumulativeAck();
-                        updateRecvUi();
-                        drainRecvQueue();
-                    }
-                    else if (msg.type === 'finish-success') {
-                        releaseWakeLock(); // 接收完畢釋放螢幕常亮
-                        flushCumulativeAck();
-
-                        const { file, filename, tempFilename } = msg;
-                        const fileToDelete = tempFilename || currentTempFilename;
-                        const blobUrl = URL.createObjectURL(file);
-
-                        cleanupOPFSWorker();
-
-                        const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
-                        if (typeof triggerAutoDownload === 'function') {
-                            triggerAutoDownload(blobUrl, filename, actualFileSize);
-                        }
-
-                        const recvPercent = document.getElementById('recv-percent');
-                        const recvProgressBar = document.getElementById('recv-progress-bar');
-                        if (recvPercent) recvPercent.innerText = '100% (完成)';
-                        if (recvProgressBar) recvProgressBar.style.width = '100%';
-                        showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
-
-                        // 15 秒後安全釋放 ObjectURL 與 OPFS 暫存
-                        setTimeout(async () => {
-                            URL.revokeObjectURL(blobUrl);
-                            if (fileToDelete) {
-                                await removeOPFSFile(fileToDelete);
-                            }
-                        }, 15000);
-                    }
-                    else if (msg.type === 'error') {
-                        releaseWakeLock();
-                        handlePeerDisconnection('接收端寫入錯誤: ' + msg.message);
-                    }
-                };
-
-                opfsWorker.onerror = (err) => {
-                    releaseWakeLock();
-                    console.error('[OPFS Worker 錯誤]:', err);
-                    handlePeerDisconnection('OPFS Worker 內部錯誤');
-                };
-
-                opfsWorker.postMessage({
-                    type: 'init',
-                    downloadId: currentDownloadId,
-                    tempFilename: currentTempFilename,
-                    filename: message.name,
-                    size: message.size
-                });
+                cleanupTransferStorage(); // 清理可能的舊暫存
 
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
@@ -686,23 +624,27 @@ export async function handleIncomingData(data) {
                 if (recvProgressBar) recvProgressBar.style.width = '0%';
 
             } else if (message.type === 'file-end') {
-                if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
-                    fileEndPending = true;
-                } else if (opfsWorker) {
-                    flushCumulativeAck();
-                    opfsWorker.postMessage({ type: 'finish' });
-                }
+                fileEndPending = true;
+                drainWriteQueue();
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
-            cleanupOPFSWorker();
+            cleanupTransferStorage();
         }
     } else {
-        recvQueue.push(data);
+        const chunkSize = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
+        writeQueue.push({
+            index: currentChunkIndex++,
+            data: data,
+            offset: currentOffset,
+            size: chunkSize
+        });
+
+        currentOffset += chunkSize;
+        inFlightBytes += chunkSize;
         lastActivityTime = Date.now();
-        if (isWorkerReady) {
-            drainRecvQueue();
-        }
+
+        drainWriteQueue();
     }
 }
 
@@ -896,24 +838,20 @@ export async function sendFileChunks() {
     }
 }
 
-// 釋放 OPFS Worker 與內部資源，並在異常中斷時確保清理未完成的暫存檔
-export function cleanupOPFSWorker() {
-    if (opfsWorker) {
-        opfsWorker.terminate();
-        opfsWorker = null;
-    }
-
+// 釋放接收暫存資源，並在異常中斷時確保清理未完成的暫存資料
+export async function cleanupTransferStorage() {
     if (ackFlushTimer) {
         clearTimeout(ackFlushTimer);
         ackFlushTimer = null;
     }
 
-    if (currentTempFilename && fileEndPending) {
-        removeOPFSFile(currentTempFilename);
+    const tid = currentDownloadId;
+    if (tid && (fileEndPending || inFlightBytes > 0 || (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size))) {
+        await deleteTransfer(tid);
     }
 
-    recvQueue = [];
-    isWorkerReady = false;
+    writeQueue = [];
+    isWriting = false;
     fileEndPending = false;
     inFlightBytes = 0;
     unackedBytes = 0;
@@ -921,23 +859,9 @@ export function cleanupOPFSWorker() {
     ackResolver = null;
     bufferLowResolver = null;
     currentOffset = 0;
+    currentChunkIndex = 0;
 }
 
-export async function clearEntireOPFS() {
-    if (!navigator.storage || !navigator.storage.getDirectory) return;
-
-    try {
-        const rootDir = await navigator.storage.getDirectory();
-        for await (const [name, handle] of rootDir.entries()) {
-            try {
-                await rootDir.removeEntry(name, { recursive: true });
-                console.log(`[OPFS 清理] 已清除項目: ${name} (${handle.kind})`);
-            } catch (err) {
-                console.warn(`[OPFS 清理] 刪除 ${name} 失敗:`, err);
-            }
-        }
-        console.log('[OPFS 清理] OPFS 空間已全數清空完成。');
-    } catch (err) {
-        console.warn('[OPFS 清理] 執行失敗:', err);
-    }
-}
+// 重新導出全域清理 (雙軌清空 IndexedDB + OPFS)
+export { clearEntireStorage };
+export const clearEntireOPFS = clearEntireStorage;
