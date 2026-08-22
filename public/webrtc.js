@@ -785,7 +785,7 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 64 * 1024; // 64KB 標準傳輸塊
+    const chunkSize = 16 * 1024; // 16KB 標準傳輸塊
     totalSent = 0;
     bufferLowResolver = null;
 
