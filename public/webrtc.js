@@ -117,33 +117,14 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
 function startTransportMonitor() {
     stopTransportMonitor();
 
-    transportMonitorTimer = setInterval(() => {
-        const dc = state.dataChannel;
-        const pc = state.peerConnection;
+    transportMonitorTimer = setInterval(async () => {
+        if (!pc) return;
 
-        if (!dc && !pc) return;
-
-        const bufferedKB = dc
-            ? (dc.bufferedAmount / 1024).toFixed(1)
-            : 'N/A';
-
-        const receivedMB = (state.receivedSize / (1024 * 1024)).toFixed(2);
-
-        const queueLength = recvQueue.length;
-        const inFlightKB = (inFlightBytes / 1024).toFixed(1);
-
-        console.log(
-            `[傳輸監控] ` +
-            `DC=${dc?.readyState ?? 'null'} | ` +
-            `buffered=${bufferedKB} KB | ` +
-            `PC=${pc?.connectionState ?? 'null'} | ` +
-            `ICE=${pc?.iceConnectionState ?? 'null'} | ` +
-            `Send=${(totalSent / (1024 * 1024)).toFixed(2)} MB | ` +
-            `Recv=${receivedMB} MB | ` +
-            `Queue=${queueLength} | ` +
-            `inFlight=${inFlightKB} KB | ` +
-            `lastActivity=${((Date.now() - lastActivityTime) / 1000).toFixed(1)}s`
-        );
+        try {
+            await logWebRTCStats(pc, dataChannel);
+        } catch (err) {
+            console.warn('[WebRTC Stats 監控失敗]', err);
+        }
     }, 1000);
 }
 
@@ -205,10 +186,15 @@ function setupPeerConnectionListeners(pc) {
     pc.onconnectionstatechange = () => {
         console.log(`[WebRTC 連線狀態變更]: ${pc.connectionState}`);
 
-        // disconnected 可能是暫時性的，不要立即中斷傳輸
-        if (['failed', 'closed'].includes(pc.connectionState)) {
+        if (pc.connectionState === 'failed') {
             handlePeerDisconnection(
-                `對端連線狀態已中斷 (${pc.connectionState})`
+                `對端連線狀態已失敗 (failed)`
+            );
+        }
+
+        if (pc.connectionState === 'closed') {
+            handlePeerDisconnection(
+                `對端連線已關閉 (closed)`
             );
         }
     };
@@ -216,14 +202,63 @@ function setupPeerConnectionListeners(pc) {
     pc.oniceconnectionstatechange = () => {
         console.log(`[ICE 狀態變更]: ${pc.iceConnectionState}`);
 
-        // disconnected 可能自行恢復；
-        // 真正 failed / closed 才立即判定連線失敗
-        if (['failed', 'closed'].includes(pc.iceConnectionState)) {
+        if (pc.iceConnectionState === 'failed') {
             handlePeerDisconnection(
-                `網路連線通道已中斷 (${pc.iceConnectionState})`
+                `ICE 連線失敗 (failed)`
+            );
+        }
+
+        if (pc.iceConnectionState === 'closed') {
+            handlePeerDisconnection(
+                `ICE 連線已關閉 (closed)`
             );
         }
     };
+}
+
+async function logWebRTCStats(pc, dc) {
+    if (!pc) return;
+
+    const stats = await pc.getStats();
+
+    let transport = null;
+    let candidatePair = null;
+    let dataChannelStats = null;
+
+    stats.forEach(report => {
+        if (report.type === 'transport') {
+            transport = report;
+        }
+
+        if (
+            report.type === 'candidate-pair' &&
+            report.state === 'succeeded'
+        ) {
+            candidatePair = report;
+        }
+
+        if (report.type === 'data-channel') {
+            dataChannelStats = report;
+        }
+    });
+
+    console.log('[WebRTC Stats]', {
+        dcState: dc?.readyState,
+        bufferedKB: dc ? (dc.bufferedAmount / 1024).toFixed(1) : 'N/A',
+
+        pcState: pc.connectionState,
+        iceState: pc.iceConnectionState,
+
+        pairState: candidatePair?.state,
+        pairBytesSent: candidatePair?.bytesSent,
+        pairBytesReceived: candidatePair?.bytesReceived,
+
+        dcBytesSent: dataChannelStats?.bytesSent,
+        dcBytesReceived: dataChannelStats?.bytesReceived,
+
+        dcMessagesSent: dataChannelStats?.messagesSent,
+        dcMessagesReceived: dataChannelStats?.messagesReceived
+    });
 }
 
 // 監聽視窗卸載主動向對端告警
@@ -785,7 +820,7 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 16 * 1024; // 16KB 標準傳輸塊
+    const chunkSize = 64 * 1024; // 64KB 標準傳輸塊
     totalSent = 0;
     bufferLowResolver = null;
 
