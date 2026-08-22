@@ -20,7 +20,7 @@ const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 8MB 發送端緩衝區低水位觸發閾值
+const BUFFERED_LOW_THRESHOLD = 256 * 1024; // 256KB 累積緩存低水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -33,8 +33,10 @@ let watchdogTimer = null;
 let lastActivityTime = Date.now();
 let isDisconnectHandled = false;
 
+// log監控區
 let recvPacketCount = 0;
 let workerAckCount = 0;
+let transportMonitorTimer = null;
 
 // 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
 async function removeOPFSFile(filename) {
@@ -74,6 +76,7 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     stopHeartbeatAndWatchdog();
     releaseWakeLock();
     cleanupOPFSWorker();
+    stopTransportMonitor();
 
     if (state.dataChannel) {
         try { state.dataChannel.close(); } catch (e) { }
@@ -109,6 +112,46 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     state.incomingFileInfo = null;
     state.receivedSize = 0;
     totalSent = 0;
+}
+
+function startTransportMonitor() {
+    stopTransportMonitor();
+
+    transportMonitorTimer = setInterval(() => {
+        const dc = state.dataChannel;
+        const pc = state.peerConnection;
+
+        if (!dc && !pc) return;
+
+        const bufferedKB = dc
+            ? (dc.bufferedAmount / 1024).toFixed(1)
+            : 'N/A';
+
+        const receivedMB = (state.receivedSize / (1024 * 1024)).toFixed(2);
+
+        const queueLength = recvQueue.length;
+        const inFlightKB = (inFlightBytes / 1024).toFixed(1);
+
+        console.log(
+            `[傳輸監控] ` +
+            `DC=${dc?.readyState ?? 'null'} | ` +
+            `buffered=${bufferedKB} KB | ` +
+            `PC=${pc?.connectionState ?? 'null'} | ` +
+            `ICE=${pc?.iceConnectionState ?? 'null'} | ` +
+            `Send=${(totalSent / (1024 * 1024)).toFixed(2)} MB | ` +
+            `Recv=${receivedMB} MB | ` +
+            `Queue=${queueLength} | ` +
+            `inFlight=${inFlightKB} KB | ` +
+            `lastActivity=${((Date.now() - lastActivityTime) / 1000).toFixed(1)}s`
+        );
+    }, 1000);
+}
+
+function stopTransportMonitor() {
+    if (transportMonitorTimer) {
+        clearInterval(transportMonitorTimer);
+        transportMonitorTimer = null;
+    }
 }
 
 // 啟動心跳探針與傳輸看門狗
@@ -444,6 +487,7 @@ export function setupDataChannelListeners() {
         triggerAppleGlow();
 
         startHeartbeatAndWatchdog();
+        startTransportMonitor();
 
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
