@@ -38,6 +38,8 @@ let recvPacketCount = 0;
 let workerAckCount = 0;
 let transportMonitorTimer = null;
 
+let isFinishSent = false; // 防止重複觸發 finish
+
 // 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
 async function removeOPFSFile(filename) {
     if (!filename || !navigator.storage || !navigator.storage.getDirectory) return;
@@ -141,33 +143,108 @@ function stopTransportMonitor() {
 // 啟動心跳探針與傳輸看門狗
 function startHeartbeatAndWatchdog() {
     stopHeartbeatAndWatchdog();
+
     isDisconnectHandled = false;
     lastActivityTime = Date.now();
 
-    // 心跳機制：通道閒置時發送輕量 Ping
-    heartbeatTimer = setInterval(() => {
-        const isTransferring = (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
-            (state.selectedFile && totalSent < state.selectedFile.size);
+    // 用來記錄上一輪 WebRTC Stats
+    let lastStatsBytesSent = 0;
+    let lastStatsBytesReceived = 0;
 
-        if (!isTransferring && state.dataChannel && state.dataChannel.readyState === 'open') {
-            try {
-                state.dataChannel.send(JSON.stringify({ type: 'ping' }));
-            } catch (e) { }
+    // 心跳
+    heartbeatTimer = setInterval(() => {
+        if (
+            state.dataChannel &&
+            state.dataChannel.readyState === 'open'
+        ) {
+            const isTransferring =
+                (state.incomingFileInfo &&
+                    state.receivedSize < state.incomingFileInfo.size) ||
+                (state.selectedFile &&
+                    totalSent < state.selectedFile.size);
+
+            const idleTime = Date.now() - lastActivityTime;
+
+            if (!isTransferring || idleTime > 5000) {
+                try {
+                    state.dataChannel.send(
+                        JSON.stringify({ type: 'ping' })
+                    );
+                } catch (e) {
+                    console.warn('[Heartbeat] Ping 發送失敗:', e);
+                }
+            }
         }
     }, 3000);
 
-    // 看門狗：傳輸中超過 20 秒毫無網路或寫入活動才判定為逾時
-    watchdogTimer = setInterval(() => {
+    // 看門狗
+    watchdogTimer = setInterval(async () => {
         const now = Date.now();
-        const idleTime = now - lastActivityTime;
 
-        const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
-        const isSending = state.selectedFile && totalSent < state.selectedFile.size;
+        const isReceiving =
+            state.incomingFileInfo &&
+            state.receivedSize < state.incomingFileInfo.size;
 
-        if ((isReceiving || isSending) && idleTime > 20000) {
-            console.error(`[看門狗逾時] 傳輸中超過 ${(idleTime / 1000).toFixed(1)} 秒未收到任何封包`);
-            handlePeerDisconnection('傳輸逾時，對端失去回應');
+        const isSending =
+            state.selectedFile &&
+            totalSent < state.selectedFile.size;
+
+        // 沒有傳輸就不做 watchdog 判定
+        if (!isReceiving && !isSending) {
+            return;
         }
+
+        // DataChannel 已經不是 open，直接交給 connection state / close handler
+        if (
+            !state.dataChannel ||
+            state.dataChannel.readyState !== 'open'
+        ) {
+            return;
+        }
+
+        try {
+            const stats = await state.peerConnection?.getStats();
+            let currentBytesSent = 0;
+            let currentBytesReceived = 0;
+            stats?.forEach(report => {
+                if (report.type === 'candidate-pair') {
+                    if (report.state === 'succeeded') {
+                        currentBytesSent = Math.max(
+                            currentBytesSent,
+                            report.bytesSent || 0
+                        );
+                        currentBytesReceived = Math.max(
+                            currentBytesReceived,
+                            report.bytesReceived || 0
+                        );
+                    }
+                }
+            });
+            const bytesSentChanged = currentBytesSent > lastStatsBytesSent;
+            const bytesReceivedChanged = currentBytesReceived > lastStatsBytesReceived;
+            if (bytesSentChanged || bytesReceivedChanged) {
+                // WebRTC 底層仍然有資料流動，更新活動時間
+                lastActivityTime = now;
+            }
+            lastStatsBytesSent = currentBytesSent;
+            lastStatsBytesReceived = currentBytesReceived;
+        } catch (e) {
+            console.warn('[看門狗] getStats 失敗:', e);
+        }
+
+        const effectiveIdleTime = Date.now() - lastActivityTime;
+
+        // 修復：傳輸中超過 30 秒沒有任何位元組流動或訊息即視為逾時，不被卡住的 send buffer 阻塞
+        if (effectiveIdleTime > 30000) {
+            console.error(
+                `[看門狗逾時] 傳輸中超過 ${(effectiveIdleTime / 1000).toFixed(1)} 秒無任何活動`
+            );
+
+            handlePeerDisconnection(
+                '傳輸逾時，對端失去回應'
+            );
+        }
+
     }, 1000);
 }
 
@@ -615,15 +692,15 @@ function drainRecvQueue() {
         }
     }
 
-    // 當隊列積壓過多時輸出警示
     if (recvQueue.length > 30) {
         console.warn(`[接收端 佇列積壓] 隊列待處理封包: ${recvQueue.length} 個 | Worker 寫入中記憶體 (inFlight): ${(inFlightBytes / 1024).toFixed(1)} KB`);
     }
 
     // 雙重判定：收到 file-end 訊號 或是 接收位元組數已完全達標，且 Worker 均已寫入落盤完畢
     const isTotalReceived = state.incomingFileInfo && state.receivedSize >= state.incomingFileInfo.size;
-    if ((fileEndPending || isTotalReceived) && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
+    if ((fileEndPending || isTotalReceived) && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
         console.log(`[接收端 準備收尾] 總接收已達標 (${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB)，通知 Worker 執行 Finish...`);
+        isFinishSent = true;
         fileEndPending = false;
         opfsWorker.postMessage({ type: 'finish' });
     }
@@ -652,6 +729,12 @@ export async function handleIncomingData(data) {
                 return;
             }
 
+            // 修復：ACK 處理移回 DataChannel 訊息頂層
+            if (message.type === 'ack') {
+                lastActivityTime = Date.now();
+                return;
+            }
+
             if (message.type === 'file-meta') {
                 acquireWakeLock();
                 recvPacketCount = 0;
@@ -665,6 +748,7 @@ export async function handleIncomingData(data) {
                 recvQueue = [];
                 isWorkerReady = false;
                 fileEndPending = false;
+                isFinishSent = false;
                 inFlightBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -672,7 +756,7 @@ export async function handleIncomingData(data) {
 
                 console.log(`[接收端 開始接收] 收到元數據: 檔名="${message.name}", 大小=${(message.size / (1024 * 1024)).toFixed(2)} MB, 暫存檔="${currentTempFilename}"`);
 
-                cleanupOPFSWorker();
+                cleanupOPFSWorker(false);
 
                 try {
                     opfsWorker = new Worker('./opfs-worker.js');
@@ -708,6 +792,7 @@ export async function handleIncomingData(data) {
                     }
                     else if (msg.type === 'finish-success') {
                         releaseWakeLock();
+                        flushCumulativeAck(); // 傳輸完成發送最後一次 ACK
 
                         const { file, filename, tempFilename } = msg;
                         const fileToDelete = tempFilename || currentTempFilename;
@@ -715,7 +800,7 @@ export async function handleIncomingData(data) {
 
                         console.log(`[接收端 傳輸大功告成] 收到 Worker 完成通知，檔案實體大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
 
-                        cleanupOPFSWorker();
+                        cleanupOPFSWorker(true);
 
                         const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
                         if (typeof triggerAutoDownload === 'function') {
@@ -734,10 +819,6 @@ export async function handleIncomingData(data) {
                                 await removeOPFSFile(fileToDelete);
                             }
                         }, 15000);
-                    }
-                    else if (message.type === 'ack') {
-                        lastActivityTime = Date.now(); // 收到接收端的 ACK，證明連線完全正常
-                        return;
                     }
                     else if (msg.type === 'error') {
                         releaseWakeLock();
@@ -776,7 +857,7 @@ export async function handleIncomingData(data) {
             }
         } catch (e) {
             console.error('[接收端] 解析控制訊息失敗:', e);
-            cleanupOPFSWorker();
+            cleanupOPFSWorker(false);
         }
     } else {
         recvPacketCount++;
@@ -784,7 +865,6 @@ export async function handleIncomingData(data) {
         lastActivityTime = Date.now();
 
         const chunkByteLen = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
-        console.log(`[接收端 收到封包 #${recvPacketCount}] 大小: ${(chunkByteLen / 1024).toFixed(1)} KB | 佇列待處理: ${recvQueue.length}`);
 
         if (isWorkerReady) {
             drainRecvQueue();
@@ -960,7 +1040,7 @@ export async function sendFileChunks() {
 }
 
 // 釋放 OPFS Worker 與內部資源，並在異常中斷時確保清理未完成的暫存檔
-export function cleanupOPFSWorker() {
+export function cleanupOPFSWorker(isSuccess = false) {
     if (opfsWorker) {
         opfsWorker.terminate();
         opfsWorker = null;
@@ -971,13 +1051,15 @@ export function cleanupOPFSWorker() {
         ackFlushTimer = null;
     }
 
-    if (currentTempFilename && fileEndPending) {
+    // 修復：非成功完成狀態（如異常中斷），一律清理當前未寫完的暫存檔
+    if (!isSuccess && currentTempFilename) {
         removeOPFSFile(currentTempFilename);
     }
 
     recvQueue = [];
     isWorkerReady = false;
     fileEndPending = false;
+    isFinishSent = false;
     inFlightBytes = 0;
     lastAckedOffset = 0;
     bufferLowResolver = null;
