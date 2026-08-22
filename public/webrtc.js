@@ -19,12 +19,8 @@ let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
 
 let totalSent = 0;
-let unackedBytes = 0;
-let ackResolver = null;
 let bufferLowResolver = null;
-const MAX_UNACKED_BYTES = 24 * 1024 * 1024; // 24MB 發送端滑動視窗
-const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8MB SCTP 緩衝區上限
-const BUFFERED_LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 低水位觸發閾值
+const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 8MB 發送端緩衝區低水位觸發閾值
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -709,7 +705,7 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 64 * 1024; // 64KB 標準 MTU 傳輸塊
+    const chunkSize = 64 * 1024; // 64KB 標準傳輸塊
     totalSent = 0;
     bufferLowResolver = null;
 
@@ -739,8 +735,8 @@ export async function sendFileChunks() {
                 throw new Error('傳輸途中 DataChannel 已關閉');
             }
 
-            // SCTP 緩衝區背壓控制（附帶 50ms 安全逾時防漏接）
-            if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+            // 嚴格背壓控制：若緩衝區高於低水位門檻，循環等待直至降回門檻以下，避免爆倉
+            while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                 await new Promise((resolve) => {
                     bufferLowResolver = resolve;
                     setTimeout(() => {
@@ -750,6 +746,10 @@ export async function sendFileChunks() {
                         }
                     }, 50);
                 });
+
+                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                    throw new Error('傳輸途中 DataChannel 已關閉');
+                }
             }
 
             const nextOffset = Math.min(offset + chunkSize, totalSize);
@@ -796,7 +796,7 @@ export async function sendFileChunks() {
             }
         }
 
-        // 立即發送結尾訊號（SCTP 依序通道會保證所有 binary 送達後才遞交 file-end）
+        // 傳輸完成通知
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
             state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
             lastActivityTime = Date.now();
