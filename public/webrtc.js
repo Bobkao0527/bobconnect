@@ -127,10 +127,10 @@ function startHeartbeatAndWatchdog() {
     isDisconnectHandled = false;
     lastActivityTime = Date.now();
 
-    // 1. 心跳機制：僅在「通道閒置」時每 3 秒發送輕量 Ping，避免干擾高速二進位資料傳輸
+    // 心跳機制：通道閒置時發送輕量 Ping
     heartbeatTimer = setInterval(() => {
         const isTransferring = (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
-            (unackedBytes > 0);
+            (state.selectedFile && totalSent < state.selectedFile.size);
 
         if (!isTransferring && state.dataChannel && state.dataChannel.readyState === 'open') {
             try {
@@ -139,17 +139,16 @@ function startHeartbeatAndWatchdog() {
         }
     }, 3000);
 
-    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 15 秒完全失去活動
+    // 看門狗：傳輸中超過 20 秒毫無網路或寫入活動才判定為逾時
     watchdogTimer = setInterval(() => {
         const now = Date.now();
         const idleTime = now - lastActivityTime;
 
-        // 若正在進行檔案傳輸 (發送或接收)
         const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
-        const isSending = unackedBytes > 0;
+        const isSending = state.selectedFile && totalSent < state.selectedFile.size;
 
-        if ((isReceiving || isSending) && idleTime > 15000) {
-            console.error(`[看門狗逾時] 傳輸中超過 ${(idleTime / 1000).toFixed(1)} 秒未收到任何封包或回應`);
+        if ((isReceiving || isSending) && idleTime > 20000) {
+            console.error(`[看門狗逾時] 傳輸中超過 ${(idleTime / 1000).toFixed(1)} 秒未收到任何封包`);
             handlePeerDisconnection('傳輸逾時，對端失去回應');
         }
     }, 1000);
@@ -457,12 +456,14 @@ export function setupDataChannelListeners() {
             state.ws = null;
             console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
-        document.getElementById('setup-view').classList.add('hidden');
-        document.getElementById('signaling-box').classList.add('hidden');
+        document.getElementById('setup-view')?.classList.add('hidden');
+        document.getElementById('signaling-box')?.classList.add('hidden');
 
         const tfPanel = document.getElementById('transfer-panel');
-        tfPanel.classList.remove('hidden');
-        tfPanel.style.opacity = '1';
+        if (tfPanel) {
+            tfPanel.classList.remove('hidden');
+            tfPanel.style.opacity = '1';
+        }
     };
 
     state.dataChannel.onclose = () => {
@@ -498,6 +499,7 @@ function updateRecvUi() {
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
+    // 將佇列中積壓的 chunk 快速派發給 Worker
     while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
         const item = recvQueue.shift();
         const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
@@ -533,9 +535,9 @@ function drainRecvQueue() {
         }
     }
 
+    // 當所有接收佇列與 Worker 寫入皆已完成，且對端已宣告 file-end，發送 finish 指令
     if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
         fileEndPending = false;
-        flushCumulativeAck();
         opfsWorker.postMessage({ type: 'finish' });
     }
 }
@@ -562,32 +564,11 @@ export async function handleIncomingData(data) {
                 return;
             }
 
-            // 接收到發送端的 ACK 請求探針，立即強制回傳目前累積的 Offset
-            if (message.type === 'ack-request') {
-                flushCumulativeAck();
-                return;
-            }
-
-            // 🚀 核心：基於絕對 Offset 的累積確認 (Cumulative ACK)
-            if (message.type === 'ack') {
-                const confirmedOffset = message.offset || 0;
-                unackedBytes = Math.max(0, totalSent - confirmedOffset);
-                lastActivityTime = Date.now();
-
-                if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
-                    const resolve = ackResolver;
-                    ackResolver = null;
-                    resolve();
-                }
-                return;
-            }
-
             if (message.type === 'file-meta') {
-                acquireWakeLock(); // 啟用螢幕常亮
+                acquireWakeLock();
 
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
-                lastAckedOffset = 0;
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
 
@@ -599,7 +580,7 @@ export async function handleIncomingData(data) {
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 currentTempFilename = `temp_${currentDownloadId}.tmp`;
 
-                cleanupOPFSWorker(); // 舊的 Worker 先釋放
+                cleanupOPFSWorker();
 
                 try {
                     opfsWorker = new Worker('./opfs-worker.js');
@@ -623,13 +604,11 @@ export async function handleIncomingData(data) {
                         state.receivedSize += writtenSize;
                         lastActivityTime = Date.now();
 
-                        triggerCumulativeAck();
                         updateRecvUi();
                         drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
-                        releaseWakeLock(); // 接收完畢釋放螢幕常亮
-                        flushCumulativeAck();
+                        releaseWakeLock();
 
                         const { file, filename, tempFilename } = msg;
                         const fileToDelete = tempFilename || currentTempFilename;
@@ -648,7 +627,6 @@ export async function handleIncomingData(data) {
                         if (recvProgressBar) recvProgressBar.style.width = '100%';
                         showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
 
-                        // 15 秒後安全釋放 ObjectURL 與 OPFS 暫存
                         setTimeout(async () => {
                             URL.revokeObjectURL(blobUrl);
                             if (fileToDelete) {
@@ -686,12 +664,8 @@ export async function handleIncomingData(data) {
                 if (recvProgressBar) recvProgressBar.style.width = '0%';
 
             } else if (message.type === 'file-end') {
-                if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
-                    fileEndPending = true;
-                } else if (opfsWorker) {
-                    flushCumulativeAck();
-                    opfsWorker.postMessage({ type: 'finish' });
-                }
+                fileEndPending = true;
+                drainRecvQueue();
             }
         } catch (e) {
             console.error('解析控制訊息失敗:', e);
@@ -727,7 +701,7 @@ export async function sendFileChunks() {
         btnSend.classList.add('opacity-40', 'cursor-not-allowed');
     }
 
-    await acquireWakeLock(); // 傳送期間保持螢幕常亮
+    await acquireWakeLock();
 
     state.dataChannel.send(JSON.stringify({
         type: 'file-meta',
@@ -735,17 +709,14 @@ export async function sendFileChunks() {
         size: state.selectedFile.size
     }));
 
-    const chunkSize = 65536; // 64KB Chunk
+    const chunkSize = 64 * 1024; // 64KB 標準 WebRTC MTU 最佳傳輸塊
     totalSent = 0;
-    unackedBytes = 0;
-    ackResolver = null;
     bufferLowResolver = null;
 
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = 0;
     let smoothSpeed = 0;
-    let loopCounter = 0;
 
     const formatEta = (seconds) => {
         if (!isFinite(seconds) || seconds <= 0) return '--:--';
@@ -768,45 +739,10 @@ export async function sendFileChunks() {
                 throw new Error('傳輸途中 DataChannel 已關閉');
             }
 
-            // 1. SCTP 緩衝區背壓控制 (利用 onbufferedamountlow 事件)
-            while (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                    throw new Error('傳輸途中 DataChannel 已關閉');
-                }
+            // 純粹依靠 SCTP 的緩衝水位 (無死鎖背壓)
+            if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                 await new Promise((resolve) => {
                     bufferLowResolver = resolve;
-                    setTimeout(() => {
-                        if (bufferLowResolver === resolve) {
-                            bufferLowResolver = null;
-                            resolve();
-                        }
-                    }, 15);
-                });
-            }
-
-            // 2. 接收端寫入背壓控制 (滑動窗口 8MB)
-            let unackedWaitTicks = 0;
-            while (unackedBytes >= MAX_UNACKED_BYTES) {
-                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                    throw new Error('傳輸途中 DataChannel 已關閉');
-                }
-
-                unackedWaitTicks++;
-                // 若等待超過 100ms (5 * 20ms)，主動發送 ACK 請求探針以喚醒接收端回傳 Offset
-                if (unackedWaitTicks % 5 === 0) {
-                    try {
-                        state.dataChannel.send(JSON.stringify({ type: 'ack-request' }));
-                    } catch (e) { }
-                }
-
-                await new Promise((resolve) => {
-                    ackResolver = resolve;
-                    setTimeout(() => {
-                        if (ackResolver === resolve) {
-                            ackResolver = null;
-                            resolve();
-                        }
-                    }, 20);
                 });
             }
 
@@ -816,23 +752,20 @@ export async function sendFileChunks() {
 
             state.dataChannel.send(chunkBuffer);
             lastActivityTime = Date.now();
+
             const bytesSent = chunkBuffer.byteLength;
             offset += bytesSent;
             totalSent += bytesSent;
-            unackedBytes += bytesSent;
-
-            loopCounter++;
-            if (loopCounter % 8 === 0) {
-                await new Promise((resolve) => setTimeout(resolve, 0));
-            }
 
             const now = performance.now();
             if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
                 lastUiUpdateTime = now;
 
                 const percent = Math.min(100, Math.round((totalSent / totalSize) * 100));
-                document.getElementById('progress-percent').innerText = `${percent}%`;
-                document.getElementById('progress-bar').style.width = `${percent}%`;
+                const progPercent = document.getElementById('progress-percent');
+                const progBar = document.getElementById('progress-bar');
+                if (progPercent) progPercent.innerText = `${percent}%`;
+                if (progBar) progBar.style.width = `${percent}%`;
 
                 const speedElapsed = (now - lastSpeedTime) / 1000;
                 if (speedElapsed > 0) {
@@ -857,13 +790,12 @@ export async function sendFileChunks() {
             }
         }
 
-        // 等待剩餘未確認 ACK 清空
-        let waitCount = 0;
-        while (unackedBytes > 0 || (state.dataChannel && state.dataChannel.bufferedAmount > 0)) {
-            if (!state.dataChannel || state.dataChannel.readyState !== 'open') break;
-            await new Promise((resolve) => setTimeout(resolve, 25));
-            waitCount++;
-            if (waitCount > 200) break; // 超過 5 秒強制送出 file-end
+        // 等待底層緩衝區全部送出到網卡
+        while (state.dataChannel && state.dataChannel.bufferedAmount > 0) {
+            if (state.dataChannel.readyState !== 'open') break;
+            await new Promise((resolve) => {
+                bufferLowResolver = resolve;
+            });
         }
 
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
@@ -871,14 +803,12 @@ export async function sendFileChunks() {
             lastActivityTime = Date.now();
         }
 
-        document.getElementById('progress-status').innerText = '傳送完畢';
-        document.getElementById('progress-percent').innerText = '100%';
-        document.getElementById('progress-bar').style.width = '100%';
-
-        const speedText = document.getElementById('transfer-speed');
-        if (speedText && smoothSpeed > 0) {
-            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-        }
+        const progStatus = document.getElementById('progress-status');
+        const progPercent = document.getElementById('progress-percent');
+        const progBar = document.getElementById('progress-bar');
+        if (progStatus) progStatus.innerText = '傳送完畢';
+        if (progPercent) progPercent.innerText = '100%';
+        if (progBar) progBar.style.width = '100%';
 
         const timeText = document.getElementById('transfer-time');
         if (timeText) timeText.innerText = '00:00';
