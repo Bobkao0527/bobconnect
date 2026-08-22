@@ -40,6 +40,15 @@ let transportMonitorTimer = null;
 
 let isFinishSent = false; // 防止重複觸發 finish
 
+// 斷線重連區
+let isReconnecting = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 15;
+
+let isSendingInProgress = false; // 防止發送端重複進入發送迴圈
+let lastConfirmedAckOffset = 0;  // 發送端記錄對端已寫入落盤的確認點
+
 // 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
 async function removeOPFSFile(filename) {
     if (!filename || !navigator.storage || !navigator.storage.getDirectory) return;
@@ -69,17 +78,19 @@ function flushCumulativeAck() {
     }
 }
 
-// 統一的斷線處理器
-export function handlePeerDisconnection(reason = '連線已斷開') {
-    if (isDisconnectHandled) return;
-    isDisconnectHandled = true;
+/**
+ * 統一的斷線處理器 (支援短暫中斷重連與致命斷線區分)
+ * @param {string} reason 斷線原因
+ * @param {boolean} isFatal 是否為致命斷線 (如對端主動離線/使用者手動取消)
+ */
+export function handlePeerDisconnection(reason = '連線已斷開', isFatal = false) {
+    if (isDisconnectHandled && !isFatal) return;
 
-    console.warn(`[連線中斷觸發]: ${reason}`);
+    console.warn(`[連線中斷觸發]: ${reason} (isFatal=${isFatal})`);
     stopHeartbeatAndWatchdog();
-    releaseWakeLock();
-    cleanupOPFSWorker();
     stopTransportMonitor();
 
+    // 釋放 DataChannel 與 PeerConnection
     if (state.dataChannel) {
         try { state.dataChannel.close(); } catch (e) { }
         state.dataChannel = null;
@@ -92,6 +103,24 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
         try { state.ws.close(); } catch (e) { }
         state.ws = null;
     }
+
+    if (bufferLowResolver) {
+        const resolve = bufferLowResolver;
+        bufferLowResolver = null;
+        resolve();
+    }
+
+    // 若非致命斷線且正在傳輸中或已有房間，啟動自動重連與斷點續傳
+    const hasActiveSession = state.roomId && (state.incomingFileInfo || state.selectedFile);
+    if (!isFatal && hasActiveSession) {
+        attemptReconnection(reason);
+        return;
+    }
+
+    // 致命斷線或無傳輸任務，徹底清理
+    isDisconnectHandled = true;
+    releaseWakeLock();
+    cleanupOPFSWorker(false, true); // 強制刪除未完成暫存檔
 
     updateStatus('連線已中斷', 'red');
     showToast(reason, 'error');
@@ -114,6 +143,96 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     state.incomingFileInfo = null;
     state.receivedSize = 0;
     totalSent = 0;
+    isSendingInProgress = false;
+    isReconnecting = false;
+}
+
+/**
+ * 自動重連控制器
+ */
+async function attemptReconnection(reason) {
+    if (isReconnecting) return;
+    isReconnecting = true;
+    reconnectAttempts++;
+
+    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        console.error('[自動重連] 超過最大重試次數，宣告連線失敗');
+        handlePeerDisconnection('連線逾時且無法自動恢復', true);
+        return;
+    }
+
+    const backoffDelay = Math.min(1000 * Math.pow(1.3, reconnectAttempts - 1), 5000);
+    console.log(`[自動重連] 第 ${reconnectAttempts} 次嘗試，${(backoffDelay / 1000).toFixed(1)} 秒後重敲信令伺服器... 原因: ${reason}`);
+
+    updateStatus(`網路波動，正在自動重連 (第 ${reconnectAttempts} 次)...`, 'yellow');
+    showToast(`網路中斷，正在嘗試續傳 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'warning');
+
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(async () => {
+        try {
+            await restartSignalingAndPeerConnection();
+        } catch (err) {
+            console.warn('[自動重連] 本次握手失敗，排程下次重試:', err);
+            isReconnecting = false;
+            attemptReconnection(err.message);
+        }
+    }, backoffDelay);
+}
+
+/**
+ * 重建信令與 WebRTC 連線通道
+ */
+async function restartSignalingAndPeerConnection() {
+    localCandidates = [];
+    pendingCandidates = [];
+
+    state.peerConnection = new RTCPeerConnection(state.rtcConfig);
+    setupPeerConnectionListeners(state.peerConnection);
+
+    state.peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+            const payload = {
+                type: 'candidate',
+                candidate: event.candidate,
+                roomId: state.roomId
+            };
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify(payload));
+            } else {
+                localCandidates.push(payload);
+            }
+        }
+    };
+
+    if (state.isHost) {
+        state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
+        setupDataChannelListeners();
+
+        connectSignalingWS();
+
+        const offer = await state.peerConnection.createOffer();
+        await state.peerConnection.setLocalDescription(offer);
+
+        const ipKey = state.localIPv4 ? `ipv4:${state.localIPv4}` : null;
+        const offerPayload = {
+            type: 'offer',
+            offer: state.peerConnection.localDescription,
+            roomId: state.roomId,
+            ipKey: ipKey
+        };
+
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+            state.ws.send(JSON.stringify(offerPayload));
+        } else {
+            state.pendingOffer = offerPayload;
+        }
+    } else {
+        state.peerConnection.ondatachannel = (event) => {
+            state.dataChannel = event.channel;
+            setupDataChannelListeners();
+        };
+        connectSignalingWS();
+    }
 }
 
 function startTransportMonitor() {
@@ -147,58 +266,36 @@ function startHeartbeatAndWatchdog() {
     isDisconnectHandled = false;
     lastActivityTime = Date.now();
 
-    // 用來記錄上一輪 WebRTC Stats
     let lastStatsBytesSent = 0;
     let lastStatsBytesReceived = 0;
 
-    // 心跳
     heartbeatTimer = setInterval(() => {
-        if (
-            state.dataChannel &&
-            state.dataChannel.readyState === 'open'
-        ) {
+        if (state.dataChannel && state.dataChannel.readyState === 'open') {
             const isTransferring =
-                (state.incomingFileInfo &&
-                    state.receivedSize < state.incomingFileInfo.size) ||
-                (state.selectedFile &&
-                    totalSent < state.selectedFile.size);
+                (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
+                (state.selectedFile && totalSent < state.selectedFile.size);
 
             const idleTime = Date.now() - lastActivityTime;
 
-            if (!isTransferring || idleTime > 5000) {
+            if (!isTransferring || idleTime > 3000) {
                 try {
-                    state.dataChannel.send(
-                        JSON.stringify({ type: 'ping' })
-                    );
+                    state.dataChannel.send(JSON.stringify({ type: 'ping' }));
                 } catch (e) {
                     console.warn('[Heartbeat] Ping 發送失敗:', e);
                 }
             }
         }
-    }, 3000);
+    }, 2000);
 
-    // 看門狗
     watchdogTimer = setInterval(async () => {
         const now = Date.now();
 
-        const isReceiving =
-            state.incomingFileInfo &&
-            state.receivedSize < state.incomingFileInfo.size;
+        const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
+        const isSending = state.selectedFile && totalSent < state.selectedFile.size;
 
-        const isSending =
-            state.selectedFile &&
-            totalSent < state.selectedFile.size;
+        if (!isReceiving && !isSending) return;
 
-        // 沒有傳輸就不做 watchdog 判定
-        if (!isReceiving && !isSending) {
-            return;
-        }
-
-        // DataChannel 已經不是 open，直接交給 connection state / close handler
-        if (
-            !state.dataChannel ||
-            state.dataChannel.readyState !== 'open'
-        ) {
+        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
             return;
         }
 
@@ -207,44 +304,27 @@ function startHeartbeatAndWatchdog() {
             let currentBytesSent = 0;
             let currentBytesReceived = 0;
             stats?.forEach(report => {
-                if (report.type === 'candidate-pair') {
-                    if (report.state === 'succeeded') {
-                        currentBytesSent = Math.max(
-                            currentBytesSent,
-                            report.bytesSent || 0
-                        );
-                        currentBytesReceived = Math.max(
-                            currentBytesReceived,
-                            report.bytesReceived || 0
-                        );
-                    }
+                if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+                    currentBytesSent = Math.max(currentBytesSent, report.bytesSent || 0);
+                    currentBytesReceived = Math.max(currentBytesReceived, report.bytesReceived || 0);
                 }
             });
             const bytesSentChanged = currentBytesSent > lastStatsBytesSent;
             const bytesReceivedChanged = currentBytesReceived > lastStatsBytesReceived;
             if (bytesSentChanged || bytesReceivedChanged) {
-                // WebRTC 底層仍然有資料流動，更新活動時間
                 lastActivityTime = now;
             }
             lastStatsBytesSent = currentBytesSent;
             lastStatsBytesReceived = currentBytesReceived;
-        } catch (e) {
-            console.warn('[看門狗] getStats 失敗:', e);
-        }
+        } catch (e) { }
 
         const effectiveIdleTime = Date.now() - lastActivityTime;
 
-        // 修復：傳輸中超過 30 秒沒有任何位元組流動或訊息即視為逾時，不被卡住的 send buffer 阻塞
-        if (effectiveIdleTime > 30000) {
-            console.error(
-                `[看門狗逾時] 傳輸中超過 ${(effectiveIdleTime / 1000).toFixed(1)} 秒無任何活動`
-            );
-
-            handlePeerDisconnection(
-                '傳輸逾時，對端失去回應'
-            );
+        // 傳輸中超過 15 秒無資料流動即判定為卡死，觸發重連
+        if (effectiveIdleTime > 15000) {
+            console.error(`[看門狗逾時] 傳輸中超過 ${(effectiveIdleTime / 1000).toFixed(1)} 秒無回應，嘗試重新連線續傳...`);
+            handlePeerDisconnection('傳輸逾時，正在重新連線...', false);
         }
-
     }, 1000);
 }
 
@@ -266,32 +346,28 @@ function setupPeerConnectionListeners(pc) {
     pc.onconnectionstatechange = () => {
         console.log(`[WebRTC 連線狀態變更]: ${pc.connectionState}`);
 
-        if (pc.connectionState === 'failed') {
-            handlePeerDisconnection(
-                `對端連線狀態已失敗 (failed)`
-            );
-        }
-
-        if (pc.connectionState === 'closed') {
-            handlePeerDisconnection(
-                `對端連線已關閉 (closed)`
-            );
+        if (pc.connectionState === 'disconnected') {
+            // 短暫波動：等待 ICE 自動復原，不立刻銷毀
+            console.warn('[WebRTC 狀態] 連線短暫中斷 (disconnected)，等待底層 ICE 復原...');
+            updateStatus('網路連線波動中，等待恢復...', 'yellow');
+        } else if (pc.connectionState === 'failed') {
+            handlePeerDisconnection('對端連線狀態失敗 (failed)', false);
+        } else if (pc.connectionState === 'closed') {
+            handlePeerDisconnection('對端連線已關閉 (closed)', false);
+        } else if (pc.connectionState === 'connected') {
+            updateStatus('P2P 直連已開通 (加密)', 'green');
         }
     };
 
     pc.oniceconnectionstatechange = () => {
         console.log(`[ICE 狀態變更]: ${pc.iceConnectionState}`);
 
-        if (pc.iceConnectionState === 'failed') {
-            handlePeerDisconnection(
-                `ICE 連線失敗 (failed)`
-            );
-        }
-
-        if (pc.iceConnectionState === 'closed') {
-            handlePeerDisconnection(
-                `ICE 連線已關閉 (closed)`
-            );
+        if (pc.iceConnectionState === 'disconnected') {
+            console.warn('[ICE 狀態] ICE 暫時中斷，等待重連...');
+        } else if (pc.iceConnectionState === 'failed') {
+            handlePeerDisconnection('ICE 連線失敗 (failed)', false);
+        } else if (pc.iceConnectionState === 'closed') {
+            handlePeerDisconnection('ICE 連線已關閉 (closed)', false);
         }
     };
 }
@@ -583,6 +659,9 @@ export async function initJoinerWithRoom(roomId) {
     }
 }
 
+/**
+ * 設定 DataChannel 事件監聽 (更新：通道建立後自動發起續傳協商)
+ */
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
     state.dataChannel.bufferedAmountLowThreshold = BUFFERED_LOW_THRESHOLD;
@@ -597,8 +676,11 @@ export function setupDataChannelListeners() {
 
     state.dataChannel.onopen = () => {
         isDisconnectHandled = false;
+        isReconnecting = false;
+        reconnectAttempts = 0;
+
         updateStatus('P2P 直連已開通 (加密)', 'green');
-        showToast('極速 P2P 連結就緒', 'success');
+        showToast('P2P 直連通道就緒', 'success');
         triggerAppleGlow();
 
         startHeartbeatAndWatchdog();
@@ -612,25 +694,34 @@ export function setupDataChannelListeners() {
         if (state.ws) {
             state.ws.close();
             state.ws = null;
-            console.log("[DO 信令] 握手成功，已主動關閉 WebSocket 連線");
         }
+
         document.getElementById('setup-view')?.classList.add('hidden');
         document.getElementById('signaling-box')?.classList.add('hidden');
-
         const tfPanel = document.getElementById('transfer-panel');
         if (tfPanel) {
             tfPanel.classList.remove('hidden');
             tfPanel.style.opacity = '1';
         }
+
+        // 續傳協商：若身為接收端且有未完成檔案，主動向發送端請求斷點續傳
+        if (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) {
+            console.log(`[續傳協商] 接收端連線重開，向發送端要求從 Offset ${state.receivedSize} 續傳`);
+            state.dataChannel.send(JSON.stringify({
+                type: 'resume-request',
+                name: state.incomingFileInfo.name,
+                receivedOffset: state.receivedSize
+            }));
+        }
     };
 
     state.dataChannel.onclose = () => {
-        handlePeerDisconnection('直連通道已關閉');
+        handlePeerDisconnection('直連通道中斷', false);
     };
 
     state.dataChannel.onerror = (err) => {
         console.error('[DataChannel 異常]:', err);
-        handlePeerDisconnection('傳輸通道發生異常錯誤');
+        handlePeerDisconnection('傳輸通道異常', false);
     };
 
     state.dataChannel.onmessage = (event) => {
@@ -724,14 +815,39 @@ export async function handleIncomingData(data) {
             }
 
             if (message.type === 'peer-leave') {
-                console.warn('[接收端] 收到對端主動離線通知 (peer-leave)');
-                handlePeerDisconnection('對端已主動離開房間');
+                console.warn('[接收端] 收到對端主動離線通知');
+                handlePeerDisconnection('對端已主動離開房間', true);
                 return;
             }
 
-            // 修復：ACK 處理移回 DataChannel 訊息頂層
             if (message.type === 'ack') {
                 lastActivityTime = Date.now();
+                if (typeof message.offset === 'number') {
+                    lastConfirmedAckOffset = message.offset;
+                }
+                return;
+            }
+
+            // 發送端收到接收端的斷點續傳請求
+            if (message.type === 'resume-request') {
+                console.log(`[發送端] 收到續傳請求，對端已完成: ${(message.receivedOffset / (1024 * 1024)).toFixed(2)} MB`);
+                showToast(`正在從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復傳輸...`, 'info');
+                
+                // 確認續傳起點並重啟傳送迴圈
+                state.dataChannel.send(JSON.stringify({
+                    type: 'resume-ack',
+                    startOffset: message.receivedOffset
+                }));
+                sendFileChunks(message.receivedOffset);
+                return;
+            }
+
+            // 接收端收到發送端的續傳確認
+            if (message.type === 'resume-ack') {
+                console.log(`[接收端] 發送端已確認從 Offset ${message.startOffset} 續傳`);
+                currentOffset = message.startOffset;
+                isWorkerReady = true;
+                drainRecvQueue();
                 return;
             }
 
@@ -740,131 +856,144 @@ export async function handleIncomingData(data) {
                 recvPacketCount = 0;
                 workerAckCount = 0;
 
-                state.incomingFileInfo = { name: message.name, size: message.size };
-                state.receivedSize = 0;
-                state.lastRecvUiTime = 0;
-                currentOffset = 0;
+                // 若為全新檔案或不同檔案，重置暫存檔名與進度
+                const isSameFile = state.incomingFileInfo &&
+                    state.incomingFileInfo.name === message.name &&
+                    state.incomingFileInfo.size === message.size &&
+                    currentTempFilename;
 
+                if (!isSameFile) {
+                    cleanupOPFSWorker(false, true); // 清理舊檔案
+                    currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+                    currentTempFilename = `temp_${currentDownloadId}.tmp`;
+                    state.receivedSize = 0;
+                    currentOffset = 0;
+                }
+
+                state.incomingFileInfo = { name: message.name, size: message.size };
+                state.lastRecvUiTime = 0;
                 recvQueue = [];
                 isWorkerReady = false;
                 fileEndPending = false;
                 isFinishSent = false;
                 inFlightBytes = 0;
 
-                currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                currentTempFilename = `temp_${currentDownloadId}.tmp`;
+                console.log(`[接收端] 收到檔案資訊: 檔名="${message.name}", 總大小=${(message.size / (1024 * 1024)).toFixed(2)} MB, 目前進度=${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB`);
 
-                console.log(`[接收端 開始接收] 收到元數據: 檔名="${message.name}", 大小=${(message.size / (1024 * 1024)).toFixed(2)} MB, 暫存檔="${currentTempFilename}"`);
+                // 啟動 OPFS Worker
+                if (!opfsWorker) {
+                    try {
+                        opfsWorker = new Worker('./opfs-worker.js');
+                    } catch (err) {
+                        console.error('[接收端] 建立 OPFS Worker 失敗:', err);
+                        showToast('無法建立 OPFS Worker: ' + err.message, 'error');
+                        releaseWakeLock();
+                        return;
+                    }
 
-                cleanupOPFSWorker(false);
+                    opfsWorker.onmessage = (e) => {
+                        const msg = e.data;
+                        if (!msg) return;
 
-                try {
-                    opfsWorker = new Worker('./opfs-worker.js');
-                } catch (err) {
-                    console.error('[接收端] 建立 OPFS Worker 失敗:', err);
-                    showToast('無法建立 OPFS Worker: ' + err.message, 'error');
-                    releaseWakeLock();
-                    return;
+                        if (msg.type === 'init-success') {
+                            console.log('[接收端] OPFS Worker 就緒');
+                            isWorkerReady = true;
+                            drainRecvQueue();
+                        }
+                        else if (msg.type === 'write-ack') {
+                            workerAckCount++;
+                            const writtenSize = msg.size || 0;
+                            inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
+                            state.receivedSize += writtenSize;
+                            lastActivityTime = Date.now();
+
+                            if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
+                                flushCumulativeAck();
+                            }
+
+                            updateRecvUi();
+                            drainRecvQueue();
+                        }
+                        else if (msg.type === 'finish-success') {
+                            releaseWakeLock();
+                            flushCumulativeAck();
+
+                            const { file, filename, tempFilename } = msg;
+                            const fileToDelete = tempFilename || currentTempFilename;
+                            const blobUrl = URL.createObjectURL(file);
+
+                            console.log(`[接收端 傳輸完成] 檔案大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
+
+                            cleanupOPFSWorker(true, false);
+
+                            const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
+                            if (typeof triggerAutoDownload === 'function') {
+                                triggerAutoDownload(blobUrl, filename, actualFileSize);
+                            }
+
+                            const recvPercent = document.getElementById('recv-percent');
+                            const recvProgressBar = document.getElementById('recv-progress-bar');
+                            if (recvPercent) recvPercent.innerText = '100% (完成)';
+                            if (recvProgressBar) recvProgressBar.style.width = '100%';
+                            showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
+
+                            setTimeout(async () => {
+                                URL.revokeObjectURL(blobUrl);
+                                if (fileToDelete) {
+                                    await removeOPFSFile(fileToDelete);
+                                }
+                            }, 15000);
+                        }
+                        else if (msg.type === 'error') {
+                            releaseWakeLock();
+                            console.error('[接收端] Worker 錯誤:', msg.message);
+                            handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
+                        }
+                    };
+
+                    opfsWorker.onerror = (err) => {
+                        releaseWakeLock();
+                        console.error('[接收端 OPFS Worker 異常]:', err);
+                        handlePeerDisconnection('OPFS Worker 內部錯誤', true);
+                    };
+
+                    opfsWorker.postMessage({
+                        type: 'init',
+                        downloadId: currentDownloadId,
+                        tempFilename: currentTempFilename,
+                        filename: message.name,
+                        size: message.size
+                    });
+                } else {
+                    isWorkerReady = true;
+                    drainRecvQueue();
                 }
 
-                opfsWorker.onmessage = (e) => {
-                    const msg = e.data;
-                    if (!msg) return;
-
-                    if (msg.type === 'init-success') {
-                        console.log('[接收端] OPFS Worker 初始化就緒，開始接收佇列注入');
-                        isWorkerReady = true;
-                        drainRecvQueue();
-                    }
-                    else if (msg.type === 'write-ack') {
-                        workerAckCount++;
-                        const writtenSize = msg.size || 0;
-                        inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                        state.receivedSize += writtenSize;
-                        lastActivityTime = Date.now();
-
-                        if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
-                            flushCumulativeAck();
-                        }
-
-                        updateRecvUi();
-                        drainRecvQueue();
-                    }
-                    else if (msg.type === 'finish-success') {
-                        releaseWakeLock();
-                        flushCumulativeAck(); // 傳輸完成發送最後一次 ACK
-
-                        const { file, filename, tempFilename } = msg;
-                        const fileToDelete = tempFilename || currentTempFilename;
-                        const blobUrl = URL.createObjectURL(file);
-
-                        console.log(`[接收端 傳輸大功告成] 收到 Worker 完成通知，檔案實體大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
-
-                        cleanupOPFSWorker(true);
-
-                        const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
-                        if (typeof triggerAutoDownload === 'function') {
-                            triggerAutoDownload(blobUrl, filename, actualFileSize);
-                        }
-
-                        const recvPercent = document.getElementById('recv-percent');
-                        const recvProgressBar = document.getElementById('recv-progress-bar');
-                        if (recvPercent) recvPercent.innerText = '100% (完成)';
-                        if (recvProgressBar) recvProgressBar.style.width = '100%';
-                        showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
-
-                        setTimeout(async () => {
-                            URL.revokeObjectURL(blobUrl);
-                            if (fileToDelete) {
-                                await removeOPFSFile(fileToDelete);
-                            }
-                        }, 15000);
-                    }
-                    else if (msg.type === 'error') {
-                        releaseWakeLock();
-                        console.error('[接收端] Worker 回報錯誤:', msg.message);
-                        handlePeerDisconnection('接收端寫入錯誤: ' + msg.message);
-                    }
-                };
-
-                opfsWorker.onerror = (err) => {
-                    releaseWakeLock();
-                    console.error('[接收端 OPFS Worker 異常]:', err);
-                    handlePeerDisconnection('OPFS Worker 內部錯誤');
-                };
-
-                opfsWorker.postMessage({
-                    type: 'init',
-                    downloadId: currentDownloadId,
-                    tempFilename: currentTempFilename,
-                    filename: message.name,
-                    size: message.size
-                });
+                // 若之前已經接收了部分資料，回覆目前斷點
+                if (state.receivedSize > 0) {
+                    state.dataChannel.send(JSON.stringify({
+                        type: 'resume-request',
+                        name: message.name,
+                        receivedOffset: state.receivedSize
+                    }));
+                }
 
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
 
-                const recvPercent = document.getElementById('recv-percent');
-                const recvProgressBar = document.getElementById('recv-progress-bar');
-                if (recvPercent) recvPercent.innerText = '0%';
-                if (recvProgressBar) recvProgressBar.style.width = '0%';
-
             } else if (message.type === 'file-end') {
-                console.log(`[接收端] 收到對端發送的 file-end 信號 (目前網路已收 ${recvPacketCount} 封包, Worker 寫入確認 ${workerAckCount} 次)`);
+                console.log(`[接收端] 收到 file-end 信號 (已收 ${recvPacketCount} 包, 寫入 ${workerAckCount} 次)`);
                 fileEndPending = true;
                 drainRecvQueue();
             }
         } catch (e) {
             console.error('[接收端] 解析控制訊息失敗:', e);
-            cleanupOPFSWorker(false);
         }
     } else {
         recvPacketCount++;
         recvQueue.push(data);
         lastActivityTime = Date.now();
-
-        const chunkByteLen = data.byteLength || (data.buffer ? data.buffer.byteLength : 0);
 
         if (isWorkerReady) {
             drainRecvQueue();
@@ -882,11 +1011,27 @@ export function evaluateFileRouting(file) {
     showToast('已啟用 WebRTC P2P 直連傳輸', 'success');
 }
 
-export async function sendFileChunks() {
-    if (!state.selectedFile || !state.dataChannel || state.dataChannel.readyState !== 'open') {
-        showToast('通道尚未連線或未選擇檔案', 'error');
+/**
+ * 發送檔案分塊 (更新：支援從指定 Offset 斷點續傳，並於中斷時自動暫停等待重連)
+ * @param {number|null} startOffset 指定開始傳輸的 Offset (續傳使用)
+ */
+export async function sendFileChunks(startOffset = null) {
+    if (!state.selectedFile) {
+        showToast('未選擇檔案', 'error');
         return;
     }
+
+    if (isSendingInProgress && startOffset === null) {
+        console.warn('[發送端] 傳輸已在進行中，略過重複調用');
+        return;
+    }
+
+    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+        console.warn('[發送端] 通道尚未就緒，等待連線建立...');
+        return;
+    }
+
+    isSendingInProgress = true;
     const btnSend = document.getElementById('btn-send');
     if (btnSend) {
         btnSend.disabled = true;
@@ -895,23 +1040,30 @@ export async function sendFileChunks() {
 
     await acquireWakeLock();
 
-    console.log(`[發送端 開始傳輸] 檔名: ${state.selectedFile.name}, 總大小: ${(state.selectedFile.size / (1024 * 1024)).toFixed(2)} MB`);
+    let offset = typeof startOffset === 'number' ? startOffset : 0;
+    totalSent = offset;
+    lastConfirmedAckOffset = offset;
 
-    state.dataChannel.send(JSON.stringify({
-        type: 'file-meta',
-        name: state.selectedFile.name,
-        size: state.selectedFile.size
-    }));
+    // 若從 0 開始，發送元數據宣告
+    if (offset === 0) {
+        console.log(`[發送端 開始新傳輸] 檔名: ${state.selectedFile.name}, 總大小: ${(state.selectedFile.size / (1024 * 1024)).toFixed(2)} MB`);
+        state.dataChannel.send(JSON.stringify({
+            type: 'file-meta',
+            name: state.selectedFile.name,
+            size: state.selectedFile.size
+        }));
+    } else {
+        console.log(`[發送端 斷點續傳] 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
+    }
 
-    const chunkSize = 64 * 1024; // 64KB 標準傳輸塊
-    totalSent = 0;
+    const chunkSize = 64 * 1024;
     bufferLowResolver = null;
 
-    let chunkIndex = 0;
+    let chunkIndex = Math.floor(offset / chunkSize);
     let backpressureCount = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
-    let lastSpeedBytes = 0;
+    let lastSpeedBytes = offset;
     let smoothSpeed = 0;
 
     const formatEta = (seconds) => {
@@ -927,20 +1079,19 @@ export async function sendFileChunks() {
     };
 
     try {
-        let offset = 0;
         const totalSize = state.selectedFile.size;
 
         while (offset < totalSize) {
+            // 若傳輸中途 DataChannel 斷開，退出迴圈並保留進度，等待自動重連機制續傳
             if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                throw new Error('傳輸途中 DataChannel 已關閉');
+                console.warn(`[發送端 中斷暫停] 通道中斷，傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB，等待自動重連恢復...`);
+                isSendingInProgress = false;
+                return;
             }
 
-            // 背壓控制：監控 SCTP 發送佇列水位
+            // 背壓控制
             if (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                 backpressureCount++;
-                const curBufKB = (state.dataChannel.bufferedAmount / 1024).toFixed(1);
-                const thresKB = (BUFFERED_LOW_THRESHOLD / 1024).toFixed(1);
-                console.warn(`[發送端 觸發背壓 #${backpressureCount}] Chunk #${chunkIndex}，當前緩衝佇列: ${curBufKB} KB > 門檻: ${thresKB} KB，暫停注入...`);
             }
 
             while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
@@ -955,7 +1106,9 @@ export async function sendFileChunks() {
                 });
 
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                    throw new Error('傳輸途中 DataChannel 已關閉');
+                    console.warn(`[發送端 背壓等待時中斷] 傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB`);
+                    isSendingInProgress = false;
+                    return;
                 }
             }
 
@@ -969,10 +1122,7 @@ export async function sendFileChunks() {
 
             const bytesSent = chunkBuffer.byteLength;
             offset += bytesSent;
-            totalSent += bytesSent;
-
-            // 每 50 個 chunk 或前 3 個 chunk 輸出一次狀態
-            console.log(`[發送端 進行中] 發送 Chunk #${chunkIndex} | 進度: ${(totalSent / (1024 * 1024)).toFixed(2)} / ${(totalSize / (1024 * 1024)).toFixed(2)} MB | 緩衝水位: ${(state.dataChannel.bufferedAmount / 1024).toFixed(1)} KB`);
+            totalSent = offset;
 
             const now = performance.now();
             if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
@@ -1007,13 +1157,11 @@ export async function sendFileChunks() {
             }
         }
 
-        console.log(`[發送端 完成全部注入] 共發送 ${chunkIndex} 個 Chunk，觸發背壓暫停共 ${backpressureCount} 次。等待對端確認並發送 file-end...`);
+        console.log(`[發送端 完成全數發送] 發送 file-end 信號...`);
 
-        // 傳輸完成通知
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
             state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
             lastActivityTime = Date.now();
-            console.log('[發送端] file-end 信號已發出');
         }
 
         const progStatus = document.getElementById('progress-status');
@@ -1027,20 +1175,24 @@ export async function sendFileChunks() {
         if (timeText) timeText.innerText = '00:00';
 
         showToast('檔案已完全投遞！', 'success');
+        isSendingInProgress = false;
     } catch (e) {
-        console.error('[發送端 傳輸異常中斷]:', e);
-        handlePeerDisconnection('傳輸中斷：' + e.message);
+        console.error('[發送端 異常]:', e);
+        isSendingInProgress = false;
+        handlePeerDisconnection('傳輸中斷: ' + e.message, false);
     } finally {
         releaseWakeLock();
-        if (btnSend) {
+        if (btnSend && !isSendingInProgress) {
             btnSend.disabled = false;
             btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
         }
     }
 }
 
-// 釋放 OPFS Worker 與內部資源，並在異常中斷時確保清理未完成的暫存檔
-export function cleanupOPFSWorker(isSuccess = false) {
+/**
+ * 釋放 OPFS Worker 與內部資源 (更新：增加 forceDelete 參數，斷線續傳期間保留暫存檔)
+ */
+export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
     if (opfsWorker) {
         opfsWorker.terminate();
         opfsWorker = null;
@@ -1051,9 +1203,10 @@ export function cleanupOPFSWorker(isSuccess = false) {
         ackFlushTimer = null;
     }
 
-    // 修復：非成功完成狀態（如異常中斷），一律清理當前未寫完的暫存檔
-    if (!isSuccess && currentTempFilename) {
+    // 只有在強制刪除 (取消/完全離開) 時才刪除暫存檔；重連中斷期間保留檔案以便續傳
+    if (forceDelete && currentTempFilename) {
         removeOPFSFile(currentTempFilename);
+        currentTempFilename = null;
     }
 
     recvQueue = [];
@@ -1061,9 +1214,7 @@ export function cleanupOPFSWorker(isSuccess = false) {
     fileEndPending = false;
     isFinishSent = false;
     inFlightBytes = 0;
-    lastAckedOffset = 0;
     bufferLowResolver = null;
-    currentOffset = 0;
 }
 
 export async function clearEntireOPFS() {
