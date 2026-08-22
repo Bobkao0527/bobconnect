@@ -21,14 +21,14 @@ let totalSent = 0;
 let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
-const MAX_UNACKED_BYTES = 16 * 1024 * 1024; // 16MB 發送端滑動視窗
-const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 緩衝區上限
-const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 低水位觸發閾值
+const MAX_UNACKED_BYTES = 24 * 1024 * 1024; // 24MB 發送端滑動視窗
+const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024; // 4MB SCTP 緩衝區上限
+const BUFFERED_LOW_THRESHOLD = 1024 * 1024; // 1MB 低水位觸發閾值
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
 let ackFlushTimer = null;
-const BATCH_ACK_INTERVAL = 128 * 1024; // 每累積寫入 128KB (2個 chunk) 即發送一次確認
+const BATCH_ACK_INTERVAL = 512 * 1024; // 每累積寫入 512KB 即發送一次確認
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -127,7 +127,7 @@ function startHeartbeatAndWatchdog() {
         }
     }, 3000);
 
-    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 15 秒完全失去活動
+    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 35 秒完全失去活動
     watchdogTimer = setInterval(() => {
         const now = Date.now();
         const idleTime = now - lastActivityTime;
@@ -136,7 +136,7 @@ function startHeartbeatAndWatchdog() {
         const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
         const isSending = unackedBytes > 0;
 
-        if ((isReceiving || isSending) && idleTime > 15000) {
+        if ((isReceiving || isSending) && idleTime > 35000) {
             console.error(`[看門狗逾時] 傳輸中超過 ${(idleTime / 1000).toFixed(1)} 秒未收到任何封包或回應`);
             handlePeerDisconnection('傳輸逾時，對端失去回應');
         }
@@ -496,7 +496,7 @@ async function drainWriteQueue() {
     }
 
     isWriting = true;
-    const batch = writeQueue.splice(0, Math.min(48, writeQueue.length));
+    const batch = writeQueue.splice(0, Math.min(64, writeQueue.length));
     const batchSize = batch.reduce((sum, item) => sum + item.size, 0);
 
     try {
@@ -518,6 +518,8 @@ async function drainWriteQueue() {
     }
 
     if (writeQueue.length > 0 || fileEndPending) {
+        // 微小讓步，讓瀏覽器處理 UI 更新、WebRTC 訊息接收與 ACK 發送
+        await new Promise((resolve) => setTimeout(resolve, 0));
         drainWriteQueue();
     }
 }
@@ -713,6 +715,7 @@ export async function sendFileChunks() {
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                     throw new Error('傳輸途中 DataChannel 已關閉');
                 }
+                lastActivityTime = Date.now();
                 await new Promise((resolve) => {
                     bufferLowResolver = resolve;
                     setTimeout(() => {
@@ -724,7 +727,7 @@ export async function sendFileChunks() {
                 });
             }
 
-            // 2. 接收端寫入背壓控制 (滑動窗口 8MB)
+            // 2. 接收端寫入背壓控制 (滑動窗口 24MB)
             let unackedWaitTicks = 0;
             while (unackedBytes >= MAX_UNACKED_BYTES) {
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
@@ -732,12 +735,14 @@ export async function sendFileChunks() {
                 }
 
                 unackedWaitTicks++;
-                // 若等待超過 100ms (5 * 20ms)，主動發送 ACK 請求探針以喚醒接收端回傳 Offset
-                if (unackedWaitTicks % 5 === 0) {
+                // 若等待超過 40ms (2 * 20ms)，主動發送 ACK 請求探針以喚醒接收端回傳最新 Offset
+                if (unackedWaitTicks % 2 === 0) {
                     try {
                         state.dataChannel.send(JSON.stringify({ type: 'ack-request' }));
                     } catch (e) {}
                 }
+
+                lastActivityTime = Date.now(); // 傳輸等待中持續重設活躍時間，防看門狗誤判
 
                 await new Promise((resolve) => {
                     ackResolver = resolve;

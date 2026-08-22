@@ -1,10 +1,10 @@
 /**
- * storage.js - 模組化本地儲存與垃圾回收 (IndexedDB + OPFS 雙軌清理架構)
- * 解決 OPFS 在 Safari/行動端的同步寫入鎖定與訊息過載問題，提供全平台 100% 相容的檔案暫存。
+ * storage.js - 模組化本地儲存與垃圾回收 (IndexedDB 複合主鍵 + Service Worker 串流架構)
+ * 100% 循序保證、零記憶體堆疊、極速磁碟暫存與全自動垃圾回收 (GC)。
  */
 
 const DB_NAME = 'BobConnect_Storage';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const CHUNK_STORE = 'transfer_chunks';
 const META_STORE = 'transfer_meta';
 
@@ -21,10 +21,12 @@ export async function getDB() {
 
         request.onupgradeneeded = (event) => {
             const db = event.target.result;
-            if (!db.objectStoreNames.contains(CHUNK_STORE)) {
-                const chunkStore = db.createObjectStore(CHUNK_STORE, { keyPath: ['transferId', 'index'] });
-                chunkStore.createIndex('transferId', 'transferId', { unique: false });
+            // 升級或建立 Chunk 儲存庫：以 [transferId, index] 作為複合主鍵，天生具備 index 遞增順序
+            if (db.objectStoreNames.contains(CHUNK_STORE)) {
+                db.deleteObjectStore(CHUNK_STORE);
             }
+            db.createObjectStore(CHUNK_STORE, { keyPath: ['transferId', 'index'] });
+
             if (!db.objectStoreNames.contains(META_STORE)) {
                 db.createObjectStore(META_STORE, { keyPath: 'transferId' });
             }
@@ -99,11 +101,12 @@ export async function saveMeta(transferId, meta) {
  * @param {number} fileSize 
  */
 export async function assembleFile(transferId, fileName = 'downloaded_file', fileSize = 0) {
-    triggerStreamDownload(transferId, fileName, fileSize);
+    await triggerStreamDownload(transferId, fileName, fileSize);
 }
 
 /**
  * 🧹 垃圾回收 (GC)：刪除特定傳輸的所有暫存 Chunks 與中繼資料
+ * 使用主鍵範圍快速清理，無需遍歷次級索引
  * @param {string} transferId 
  */
 export async function deleteTransfer(transferId) {
@@ -118,10 +121,9 @@ export async function deleteTransfer(transferId) {
             // 刪除 Meta
             metaStore.delete(transferId);
 
-            // 透過 Index 遍歷刪除所有 Chunks
-            const index = chunkStore.index('transferId');
-            const range = IDBKeyRange.only(transferId);
-            const request = index.openKeyCursor(range);
+            // 透過複合主鍵範圍刪除所有關聯 Chunks
+            const range = IDBKeyRange.bound([transferId, 0], [transferId, Infinity]);
+            const request = chunkStore.openKeyCursor(range);
 
             request.onsuccess = (event) => {
                 const cursor = event.target.result;
@@ -199,9 +201,9 @@ export async function clearEntireStorage() {
 export async function initServiceWorker() {
     if ('serviceWorker' in navigator) {
         try {
-            const reg = await navigator.serviceWorker.register('./sw.js');
+            const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
             await navigator.serviceWorker.ready;
-            console.log('[Service Worker] 串流下載服務已就緒');
+            console.log('[Service Worker] 串流下載服務已就緒 (Active)');
             return reg;
         } catch (err) {
             console.error('[Service Worker 註冊失敗]:', err);
@@ -215,7 +217,14 @@ export async function initServiceWorker() {
  * @param {string} fileName 
  * @param {number} fileSize 
  */
-export function triggerStreamDownload(transferId, fileName = 'downloaded_file', fileSize = 0) {
+export async function triggerStreamDownload(transferId, fileName = 'downloaded_file', fileSize = 0) {
+    // 確保 Service Worker 就緒
+    if ('serviceWorker' in navigator) {
+        try {
+            await navigator.serviceWorker.ready;
+        } catch (e) {}
+    }
+
     const downloadUrl = `./sw-download?transferId=${encodeURIComponent(transferId)}&name=${encodeURIComponent(fileName)}&size=${fileSize}`;
     
     const a = document.createElement('a');
@@ -223,5 +232,9 @@ export function triggerStreamDownload(transferId, fileName = 'downloaded_file', 
     a.download = fileName;
     document.body.appendChild(a);
     a.click();
-    document.body.removeChild(a);
+    setTimeout(() => {
+        if (a.parentNode) {
+            document.body.removeChild(a);
+        }
+    }, 1000);
 }

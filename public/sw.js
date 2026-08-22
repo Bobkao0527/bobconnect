@@ -1,9 +1,9 @@
 /**
- * sw.js - Service Worker 模擬串流下載器 (Cursor 穩定串流版)
+ * sw.js - Service Worker 模擬串流下載器 (複合主鍵嚴格循序版)
  */
 
 const DB_NAME = 'BobConnect_Storage';
-const DB_VERSION = 2; // 升級版號刷新 Schema
+const DB_VERSION = 3; // 升級版號刷新 Schema
 const CHUNK_STORE = 'transfer_chunks';
 
 self.addEventListener('install', (event) => {
@@ -20,8 +20,7 @@ function openDB() {
         req.onupgradeneeded = (event) => {
             const db = event.target.result;
             if (!db.objectStoreNames.contains(CHUNK_STORE)) {
-                const chunkStore = db.createObjectStore(CHUNK_STORE, { keyPath: ['transferId', 'index'] });
-                chunkStore.createIndex('transferId', 'transferId', { unique: false });
+                db.createObjectStore(CHUNK_STORE, { keyPath: ['transferId', 'index'] });
             }
         };
         req.onsuccess = () => resolve(req.result);
@@ -55,11 +54,11 @@ async function handleStreamDownload(transferId, fileName, fileSize) {
                 try {
                     const tx = db.transaction(CHUNK_STORE, 'readonly');
                     const store = tx.objectStore(CHUNK_STORE);
-                    const index = store.index('transferId');
-                    const range = IDBKeyRange.only(transferId);
-
-                    // 使用 Cursor 循序遍歷該 transferId 的所有 chunks，防止中途中斷
-                    const request = index.openCursor(range);
+                    
+                    // 🚀 核心優化：直接使用複合主鍵範圍 [transferId, 0] ~ [transferId, Infinity]
+                    // 保證游標 100% 依 index 嚴格遞增 (0, 1, 2...) 循序讀取，無需次級索引
+                    const range = IDBKeyRange.bound([transferId, 0], [transferId, Infinity]);
+                    const request = store.openCursor(range);
 
                     await new Promise((resolve, reject) => {
                         request.onsuccess = (event) => {
