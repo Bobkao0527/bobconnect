@@ -23,7 +23,7 @@ let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
 const MAX_UNACKED_BYTES = 24 * 1024 * 1024; // 24MB 發送端滑動視窗
-const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 緩衝區上限
+const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8MB SCTP 緩衝區上限
 const BUFFERED_LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 低水位觸發閾值
 
 // 接收端累積確認 (Cumulative ACK) 機制

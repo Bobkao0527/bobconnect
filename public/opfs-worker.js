@@ -69,12 +69,19 @@ self.onmessage = async (event) => {
                 }
 
                 const view = new Uint8Array(chunk);
-                const written = accessHandle.write(view, { at: offset });
+                let bytesWritten = 0;
+                
+                // 確保循環寫滿，防止 Partial Write
+                while (bytesWritten < view.byteLength) {
+                    const subView = view.subarray(bytesWritten);
+                    const written = accessHandle.write(subView, { at: offset + bytesWritten });
+                    if (written === 0) break;
+                    bytesWritten += written;
+                }
 
-                const bytesWritten = (typeof written === 'number' && written > 0) ? written : (size || view.byteLength);
                 self.postMessage({
                     type: 'write-ack',
-                    size: bytesWritten
+                    size: bytesWritten || size || view.byteLength
                 });
             } catch (err) {
                 console.error('[OPFS Worker] 寫入失敗:', err);
