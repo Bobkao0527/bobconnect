@@ -62,14 +62,6 @@ function flushCumulativeAck() {
     }
 }
 
-function triggerCumulativeAck() {
-    if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
-        flushCumulativeAck();
-    } else if (!ackFlushTimer) {
-        ackFlushTimer = setTimeout(flushCumulativeAck, 10);
-    }
-}
-
 // 統一的斷線處理器
 export function handlePeerDisconnection(reason = '連線已斷開') {
     if (isDisconnectHandled) return;
@@ -114,7 +106,6 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     state.incomingFileInfo = null;
     state.receivedSize = 0;
     totalSent = 0;
-    unackedBytes = 0;
 }
 
 // 啟動心跳探針與傳輸看門狗
@@ -845,9 +836,7 @@ export function cleanupOPFSWorker() {
     isWorkerReady = false;
     fileEndPending = false;
     inFlightBytes = 0;
-    unackedBytes = 0;
     lastAckedOffset = 0;
-    ackResolver = null;
     bufferLowResolver = null;
     currentOffset = 0;
 }
