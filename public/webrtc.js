@@ -2,8 +2,8 @@
  * webrtc.js - WebRTC 直連通道與信令核心 (IndexedDB 批次暫存 + 自動 GC 清道夫架構)
  */
 import { state, getWorkerUrl } from './state.js';
-import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
-import { saveChunks, assembleFile, deleteTransfer, clearEntireStorage, initServiceWorker, triggerStreamDownload } from './storage.js';
+import { showToast, updateStatus, generateQRCode, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
+import { saveChunks, deleteTransfer, clearEntireStorage, initServiceWorker, triggerStreamDownload } from './storage.js';
 
 let currentDownloadId = null;
 let currentChunkIndex = 0;
@@ -16,7 +16,6 @@ let writeQueue = [];
 let isWriting = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let unackedBytes = 0;
