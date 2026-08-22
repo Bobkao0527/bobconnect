@@ -82,11 +82,12 @@ self.onmessage = async (event) => {
                 while (bytesWritten < view.byteLength) {
                     const subView = view.subarray(bytesWritten);
                     const written = accessHandle.write(subView, { at: offset + bytesWritten });
-                    if (written === 0) break;
+                    // 修復：寫入量為 0 時拋出異常，防止磁碟已滿導致靜默損毀
+                    if (written === 0) {
+                        throw new Error(`OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`);
+                    }
                     bytesWritten += written;
                 }
-
-                console.log(`[OPFS Worker 寫入中] 第 ${workerWriteCount} 塊, offset: ${(offset / (1024 * 1024)).toFixed(2)} MB, 本次寫入: ${(bytesWritten / 1024).toFixed(1)} KB`);
 
                 self.postMessage({
                     type: 'write-ack',

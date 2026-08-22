@@ -7,6 +7,7 @@ let fileHandle = null;
 let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
+let targetFileSize = 0;
 let workerWriteCount = 0;
 
 self.addEventListener('error', (err) => {
@@ -27,6 +28,7 @@ self.onmessage = async (event) => {
         case 'init': {
             const { downloadId, size, filename, tempFilename: customTempName } = data;
             targetFilename = filename || 'downloaded_file';
+            targetFileSize = size || 0;
             workerWriteCount = 0;
 
             console.log(`[OPFS Worker] 收到初始化請求: 檔名="${targetFilename}", 預期大小=${(size / (1024 * 1024)).toFixed(2)} MB`);
@@ -82,7 +84,6 @@ self.onmessage = async (event) => {
                 while (bytesWritten < view.byteLength) {
                     const subView = view.subarray(bytesWritten);
                     const written = accessHandle.write(subView, { at: offset + bytesWritten });
-                    // 修復：寫入量為 0 時拋出異常，防止磁碟已滿導致靜默損毀
                     if (written === 0) {
                         throw new Error(`OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`);
                     }
@@ -107,8 +108,15 @@ self.onmessage = async (event) => {
                 const startTime = performance.now();
 
                 if (accessHandle) {
-                    accessHandle.flush(); // 僅在傳輸結束時落盤
-                    accessHandle.close(); // 關閉句柄解鎖
+                    if (targetFileSize > 0) {
+                        try {
+                            accessHandle.truncate(targetFileSize);
+                        } catch (e) {
+                            console.warn('[OPFS Worker] Truncate 失敗，使用原檔案大小:', e);
+                        }
+                    }
+                    accessHandle.flush();
+                    accessHandle.close();
                     accessHandle = null;
                 }
 
