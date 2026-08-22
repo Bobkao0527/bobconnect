@@ -97,11 +97,41 @@ export function triggerAppleGlow() {
     }, 1000);
 }
 
+// 螢幕防休眠鎖 (Wake Lock)
+let wakeLockSentinel = null;
+
+export async function acquireWakeLock() {
+    if ('wakeLock' in navigator) {
+        try {
+            if (!wakeLockSentinel) {
+                wakeLockSentinel = await navigator.wakeLock.request('screen');
+                wakeLockSentinel.addEventListener('release', () => {
+                    wakeLockSentinel = null;
+                });
+                console.log('[系統狀態] 螢幕保持常亮 (Wake Lock 已啟用)');
+            }
+        } catch (err) {
+            console.warn('[系統狀態] 無法取得 Wake Lock:', err);
+        }
+    }
+}
+
+export function releaseWakeLock() {
+    if (wakeLockSentinel) {
+        try {
+            wakeLockSentinel.release();
+        } catch (err) {}
+        wakeLockSentinel = null;
+        console.log('[系統狀態] 螢幕常亮鎖已安全釋放');
+    }
+}
+
 // 行動端原生分享或背景傳統下載
 export async function triggerAutoDownload(url, filename, fileSize = 0) {
     const sizeLimit = 50 * 1024 * 1024; // 50MB 限制
     
-    if (state.localIsMobile && fileSize < sizeLimit && navigator.canShare && navigator.share) {
+    // 只有在明確已知檔案小於 50MB 時，才嘗試走行動端原生 Web Share API，防止大檔案 OOM 崩潰
+    if (state.localIsMobile && fileSize > 0 && fileSize < sizeLimit && navigator.canShare && navigator.share) {
         try {
             const response = await fetch(url);
             const blob = await response.blob();
@@ -120,6 +150,7 @@ export async function triggerAutoDownload(url, filename, fileSize = 0) {
         }
     }
 
+    // 瀏覽器傳統下載觸發
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
@@ -127,7 +158,25 @@ export async function triggerAutoDownload(url, filename, fileSize = 0) {
     document.body.appendChild(a);
     a.click();
     
+    // 同步綁定備用手動下載按鈕，提供使用者 100% 可手動補救路徑
+    const manualContainer = document.getElementById('manual-download-container');
+    const manualBtn = document.getElementById('btn-manual-download');
+    if (manualContainer && manualBtn) {
+        manualContainer.classList.remove('hidden');
+        manualBtn.onclick = () => {
+            const manualLink = document.createElement('a');
+            manualLink.href = url;
+            manualLink.download = filename;
+            manualLink.target = '_blank';
+            document.body.appendChild(manualLink);
+            manualLink.click();
+            setTimeout(() => document.body.removeChild(manualLink), 150);
+        };
+    }
+
     setTimeout(() => {
-        document.body.removeChild(a);
-    }, 150);
+        if (document.body.contains(a)) {
+            document.body.removeChild(a);
+        }
+    }, 300);
 }

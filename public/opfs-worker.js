@@ -8,7 +8,17 @@ let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
 let bytesSinceLastFlush = 0;
-const FLUSH_THRESHOLD = 4 * 1024 * 1024;
+const FLUSH_THRESHOLD = 8 * 1024 * 1024; // 8MB 批次 Flush，降低大檔案磁碟 I/O 阻塞
+
+self.addEventListener('error', (err) => {
+    console.error('[OPFS Worker 全域錯誤]:', err);
+    self.postMessage({ type: 'error', message: err.message || 'Worker 內部例外錯誤' });
+});
+
+self.addEventListener('unhandledrejection', (event) => {
+    console.error('[OPFS Worker 未捕捉 Promise 例外]:', event.reason);
+    self.postMessage({ type: 'error', message: event.reason ? (event.reason.message || String(event.reason)) : '非預期異步錯誤' });
+});
 
 self.onmessage = async (event) => {
     const data = event.data;
@@ -81,7 +91,7 @@ self.onmessage = async (event) => {
             try {
                 if (accessHandle) {
                     accessHandle.flush();
-                    accessHandle.close(); // 🚀 關鍵：寫入完成後立刻關閉 handle 解鎖
+                    accessHandle.close(); // 寫入完成後立刻關閉 handle 解鎖
                     accessHandle = null;
                 }
 
