@@ -16,13 +16,13 @@ let writeQueue = [];
 let isWriting = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
+const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
-const MAX_UNACKED_BYTES = 8 * 1024 * 1024; // 8MB 發送端滑動視窗
+const MAX_UNACKED_BYTES = 16 * 1024 * 1024; // 16MB 發送端滑動視窗
 const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 緩衝區上限
 const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 低水位觸發閾值
 
@@ -38,12 +38,13 @@ let lastActivityTime = Date.now();
 let isDisconnectHandled = false;
 
 // 接收端發送累積確認 (Cumulative ACK)
-function flushCumulativeAck() {
+function flushCumulativeAck(force = false) {
     if (ackFlushTimer) {
         clearTimeout(ackFlushTimer);
         ackFlushTimer = null;
     }
-    if (state.receivedSize > lastAckedOffset && state.dataChannel && state.dataChannel.readyState === 'open') {
+
+    if ((force || state.receivedSize > lastAckedOffset) && state.dataChannel && state.dataChannel.readyState === 'open') {
         try {
             state.dataChannel.send(JSON.stringify({
                 type: 'ack',
@@ -493,7 +494,7 @@ async function drainWriteQueue() {
     }
 
     isWriting = true;
-    const batch = writeQueue.splice(0, Math.min(16, writeQueue.length));
+    const batch = writeQueue.splice(0, Math.min(48, writeQueue.length));
     const batchSize = batch.reduce((sum, item) => sum + item.size, 0);
 
     try {
@@ -578,7 +579,7 @@ export async function handleIncomingData(data) {
 
             // 接收到發送端的 ACK 請求探針，立即強制回傳目前累積的 Offset
             if (message.type === 'ack-request') {
-                flushCumulativeAck();
+                flushCumulativeAck(true);
                 return;
             }
 
