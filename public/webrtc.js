@@ -118,10 +118,13 @@ function startTransportMonitor() {
     stopTransportMonitor();
 
     transportMonitorTimer = setInterval(async () => {
+        const pc = state.peerConnection;
+        const dc = state.dataChannel;
+
         if (!pc) return;
 
         try {
-            await logWebRTCStats(pc, dataChannel);
+            await logWebRTCStats(pc, dc);
         } catch (err) {
             console.warn('[WebRTC Stats 監控失敗]', err);
         }
