@@ -1,5 +1,5 @@
 /**
- * webrtc.js - WebRTC 直連通道與信令核心 (OPFS Web Worker 重構版 - 支援超大檔案 2GB+ 與斷線心跳看門狗)
+ * webrtc.js - WebRTC 直連通道與信令核心 (OPFS Web Worker 重構版 - 支援超大檔案 2GB+ 與累積確認 Cumulative ACK)
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
@@ -18,6 +18,7 @@ let fileEndPending = false;
 let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024; // 4MB 接收並發窗口
 
+let totalSent = 0;
 let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
@@ -25,10 +26,10 @@ const MAX_UNACKED_BYTES = 4 * 1024 * 1024; // 4MB 發送端滑動視窗
 const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB SCTP 緩衝區上限
 const BUFFERED_LOW_THRESHOLD = 256 * 1024; // 256KB 低水位觸發閾值
 
-// 接收端批次 ACK 聚合器 (兼顧超低通訊負載與 0 死鎖保證)
-let pendingAckBytes = 0;
+// 接收端累積確認 (Cumulative ACK) 機制
+let lastAckedOffset = 0;
 let ackFlushTimer = null;
-const BATCH_ACK_BYTES = 256 * 1024; // 每 256KB 批次發送一次 ACK
+const BATCH_ACK_INTERVAL = 256 * 1024; // 每累積寫入 256KB 發送一次確認
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -48,26 +49,28 @@ async function removeOPFSFile(filename) {
     }
 }
 
-// 接收端 ACK 立即/定時 Flush
-function flushPendingAck() {
+// 接收端發送累積確認 (Cumulative ACK)
+function flushCumulativeAck() {
     if (ackFlushTimer) {
         clearTimeout(ackFlushTimer);
         ackFlushTimer = null;
     }
-    if (pendingAckBytes > 0 && state.dataChannel && state.dataChannel.readyState === 'open') {
+    if (state.receivedSize > lastAckedOffset && state.dataChannel && state.dataChannel.readyState === 'open') {
         try {
-            state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: pendingAckBytes }));
-            pendingAckBytes = 0;
+            state.dataChannel.send(JSON.stringify({
+                type: 'ack',
+                offset: state.receivedSize
+            }));
+            lastAckedOffset = state.receivedSize;
         } catch (e) {}
     }
 }
 
-function addPendingAck(bytes) {
-    pendingAckBytes += bytes;
-    if (pendingAckBytes >= BATCH_ACK_BYTES) {
-        flushPendingAck();
+function triggerCumulativeAck() {
+    if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
+        flushCumulativeAck();
     } else if (!ackFlushTimer) {
-        ackFlushTimer = setTimeout(flushPendingAck, 20);
+        ackFlushTimer = setTimeout(flushCumulativeAck, 20);
     }
 }
 
@@ -114,6 +117,8 @@ export function handlePeerDisconnection(reason = '連線已斷開') {
     state.roomId = null;
     state.incomingFileInfo = null;
     state.receivedSize = 0;
+    totalSent = 0;
+    unackedBytes = 0;
 }
 
 // 啟動心跳探針與傳輸看門狗
@@ -134,7 +139,7 @@ function startHeartbeatAndWatchdog() {
         }
     }, 3000);
 
-    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 15 秒完全失去活動 (給予大檔磁碟與網路足夠緩衝)
+    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 15 秒完全失去活動
     watchdogTimer = setInterval(() => {
         const now = Date.now();
         const idleTime = now - lastActivityTime;
@@ -508,12 +513,21 @@ function drainRecvQueue() {
         }
 
         if (bufferToTransfer) {
-            opfsWorker.postMessage({
-                type: 'write',
-                chunk: bufferToTransfer,
-                offset: currentOffset,
-                size: chunkSize
-            }, [bufferToTransfer]);
+            try {
+                opfsWorker.postMessage({
+                    type: 'write',
+                    chunk: bufferToTransfer,
+                    offset: currentOffset,
+                    size: chunkSize
+                }, [bufferToTransfer]);
+            } catch (err) {
+                opfsWorker.postMessage({
+                    type: 'write',
+                    chunk: bufferToTransfer,
+                    offset: currentOffset,
+                    size: chunkSize
+                });
+            }
 
             currentOffset += chunkSize;
         }
@@ -521,7 +535,7 @@ function drainRecvQueue() {
 
     if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
         fileEndPending = false;
-        flushPendingAck();
+        flushCumulativeAck();
         opfsWorker.postMessage({ type: 'finish' });
     }
 }
@@ -548,9 +562,12 @@ export async function handleIncomingData(data) {
                 return;
             }
 
+            // 🚀 核心：基於絕對 Offset 的累積確認 (Cumulative ACK)
             if (message.type === 'ack') {
-                unackedBytes = Math.max(0, unackedBytes - (message.bytes || 0));
+                const confirmedOffset = message.offset || 0;
+                unackedBytes = Math.max(0, totalSent - confirmedOffset);
                 lastActivityTime = Date.now();
+
                 if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
                     const resolve = ackResolver;
                     ackResolver = null;
@@ -564,6 +581,7 @@ export async function handleIncomingData(data) {
 
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.receivedSize = 0;
+                lastAckedOffset = 0;
                 state.lastRecvUiTime = 0;
                 currentOffset = 0;
 
@@ -571,7 +589,6 @@ export async function handleIncomingData(data) {
                 isWorkerReady = false;
                 fileEndPending = false;
                 inFlightBytes = 0;
-                pendingAckBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 currentTempFilename = `temp_${currentDownloadId}.tmp`;
@@ -600,13 +617,13 @@ export async function handleIncomingData(data) {
                         state.receivedSize += writtenSize;
                         lastActivityTime = Date.now();
 
-                        addPendingAck(writtenSize);
+                        triggerCumulativeAck();
                         updateRecvUi();
                         drainRecvQueue();
                     }
                     else if (msg.type === 'finish-success') {
                         releaseWakeLock(); // 接收完畢釋放螢幕常亮
-                        flushPendingAck();
+                        flushCumulativeAck();
 
                         const { file, filename, tempFilename } = msg;
                         const fileToDelete = tempFilename || currentTempFilename;
@@ -666,7 +683,7 @@ export async function handleIncomingData(data) {
                 if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
                     fileEndPending = true;
                 } else if (opfsWorker) {
-                    flushPendingAck();
+                    flushCumulativeAck();
                     opfsWorker.postMessage({ type: 'finish' });
                 }
             }
@@ -713,11 +730,11 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 64KB Chunk
+    totalSent = 0;
     unackedBytes = 0;
     ackResolver = null;
     bufferLowResolver = null;
 
-    let totalSent = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = 0;
@@ -884,7 +901,7 @@ export function cleanupOPFSWorker() {
     fileEndPending = false;
     inFlightBytes = 0;
     unackedBytes = 0;
-    pendingAckBytes = 0;
+    lastAckedOffset = 0;
     ackResolver = null;
     bufferLowResolver = null;
     currentOffset = 0;
