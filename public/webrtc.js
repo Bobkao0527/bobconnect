@@ -161,15 +161,24 @@ function setupPeerConnectionListeners(pc) {
 
     pc.onconnectionstatechange = () => {
         console.log(`[WebRTC 連線狀態變更]: ${pc.connectionState}`);
-        if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
-            handlePeerDisconnection(`對端連線狀態已中斷 (${pc.connectionState})`);
+
+        // disconnected 可能是暫時性的，不要立即中斷傳輸
+        if (['failed', 'closed'].includes(pc.connectionState)) {
+            handlePeerDisconnection(
+                `對端連線狀態已中斷 (${pc.connectionState})`
+            );
         }
     };
 
     pc.oniceconnectionstatechange = () => {
         console.log(`[ICE 狀態變更]: ${pc.iceConnectionState}`);
-        if (['disconnected', 'failed', 'closed'].includes(pc.iceConnectionState)) {
-            handlePeerDisconnection(`網路連線通道已中斷 (${pc.iceConnectionState})`);
+
+        // disconnected 可能自行恢復；
+        // 真正 failed / closed 才立即判定連線失敗
+        if (['failed', 'closed'].includes(pc.iceConnectionState)) {
+            handlePeerDisconnection(
+                `網路連線通道已中斷 (${pc.iceConnectionState})`
+            );
         }
     };
 }
