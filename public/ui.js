@@ -8,12 +8,12 @@ import { state } from './state.js';
 // 內嵌瀏覽器 (LINE, FB, Google App) 偵測
 export function checkInAppBrowser() {
     const ua = navigator.userAgent || navigator.vendor || window.opera;
-    const isInApp = (ua.indexOf("FBAN") > -1) || 
-                    (ua.indexOf("FBAV") > -1) || 
-                    (ua.indexOf("Line") > -1) || 
-                    (ua.indexOf("Messenger") > -1) ||
-                    (ua.indexOf("Instagram") > -1);
-    
+    const isInApp = (ua.indexOf("FBAN") > -1) ||
+        (ua.indexOf("FBAV") > -1) ||
+        (ua.indexOf("Line") > -1) ||
+        (ua.indexOf("Messenger") > -1) ||
+        (ua.indexOf("Instagram") > -1);
+
     if (isInApp) {
         const overlay = document.getElementById('inapp-warning-overlay');
         if (overlay) overlay.classList.remove('hidden');
@@ -28,7 +28,7 @@ export function showToast(msg, type = 'info') {
 
     toastMsg.innerText = msg;
     toast.className = `fixed bottom-6 right-6 z-50 p-4 rounded-xl border shadow-2xl flex items-center justify-between transition-all duration-300 max-w-sm w-full`;
-    
+
     if (type === 'success') {
         toast.classList.add('bg-emerald-950/90', 'border-emerald-500/40', 'text-emerald-300');
     } else if (type === 'error') {
@@ -37,8 +37,8 @@ export function showToast(msg, type = 'info') {
         toast.classList.add('bg-slate-900/90', 'border-slate-800', 'text-slate-300');
     }
     toast.classList.remove('hidden');
-    
-    setTimeout(hideToast, 5000); 
+
+    setTimeout(hideToast, 5000);
 }
 
 // 隱藏 Toast
@@ -67,7 +67,7 @@ export function updateStatus(text, color) {
 
     statusText.innerText = text;
     indicator.className = "w-1.5 h-1.5 rounded-full";
-    
+
     if (color === 'green') {
         indicator.classList.add('bg-emerald-500', 'animate-pulse');
         statusText.className = "text-[10px] font-medium tracking-widest text-emerald-400";
@@ -120,8 +120,63 @@ export function releaseWakeLock() {
     if (wakeLockSentinel) {
         try {
             wakeLockSentinel.release();
-        } catch (err) {}
+        } catch (err) { }
         wakeLockSentinel = null;
         console.log('[系統狀態] 螢幕常亮鎖已安全釋放');
     }
+}
+
+// 行動端原生分享或背景傳統下載
+export async function triggerAutoDownload(url, filename, fileSize = 0) {
+    const sizeLimit = 50 * 1024 * 1024; // 50MB 限制
+
+    // 只有在明確已知檔案小於 50MB 時，才嘗試走行動端原生 Web Share API，防止大檔案 OOM 崩潰
+    if (state.localIsMobile && fileSize > 0 && fileSize < sizeLimit && navigator.canShare && navigator.share) {
+        try {
+            const response = await fetch(url);
+            const blob = await response.blob();
+            const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+
+            if (navigator.canShare({ files: [file] })) {
+                await navigator.share({
+                    files: [file],
+                    title: filename,
+                    text: `Bob 檔案傳輸系統成功接收：${filename}`
+                });
+                return;
+            }
+        } catch (err) {
+            console.warn("[系統提示] 原生分享未成功，將降級走瀏覽器預設下載機制。", err);
+        }
+    }
+
+    // 瀏覽器傳統下載觸發
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+
+    // 同步綁定備用手動下載按鈕，提供使用者 100% 可手動補救路徑
+    const manualContainer = document.getElementById('manual-download-container');
+    const manualBtn = document.getElementById('btn-manual-download');
+    if (manualContainer && manualBtn) {
+        manualContainer.classList.remove('hidden');
+        manualBtn.onclick = () => {
+            const manualLink = document.createElement('a');
+            manualLink.href = url;
+            manualLink.download = filename;
+            manualLink.target = '_blank';
+            document.body.appendChild(manualLink);
+            manualLink.click();
+            setTimeout(() => document.body.removeChild(manualLink), 150);
+        };
+    }
+
+    setTimeout(() => {
+        if (document.body.contains(a)) {
+            document.body.removeChild(a);
+        }
+    }, 300);
 }
