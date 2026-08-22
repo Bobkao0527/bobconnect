@@ -1,10 +1,9 @@
 /**
- * sw.js - Service Worker 模擬串流下載器
- * 攔截 /sw-download 請求，從 IndexedDB 循序讀取 chunks 並透過 ReadableStream 串流輸出給瀏覽器下載，避免記憶體爆破 (OOM)。
+ * sw.js - Service Worker 模擬串流下載器 (Cursor 穩定串流版)
  */
 
 const DB_NAME = 'BobConnect_Storage';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // 升級版號刷新 Schema
 const CHUNK_STORE = 'transfer_chunks';
 
 self.addEventListener('install', (event) => {
@@ -15,22 +14,17 @@ self.addEventListener('activate', (event) => {
     event.waitUntil(self.clients.claim());
 });
 
-// 開啟 IndexedDB 連線
 function openDB() {
     return new Promise((resolve, reject) => {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            if (!db.objectStoreNames.contains(CHUNK_STORE)) {
+                const chunkStore = db.createObjectStore(CHUNK_STORE, { keyPath: ['transferId', 'index'] });
+                chunkStore.createIndex('transferId', 'transferId', { unique: false });
+            }
+        };
         req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
-    });
-}
-
-// 根據 [transferId, index] 複合主鍵讀取單一 Chunk
-function getChunk(db, transferId, chunkIndex) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(CHUNK_STORE, 'readonly');
-        const store = tx.objectStore(CHUNK_STORE);
-        const req = store.get([transferId, chunkIndex]);
-        req.onsuccess = () => resolve(req.result ? req.result.data : null);
         req.onerror = () => reject(req.error);
     });
 }
@@ -38,7 +32,6 @@ function getChunk(db, transferId, chunkIndex) {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
 
-    // 攔截模擬串流下載請求
     if (url.pathname.endsWith('/sw-download')) {
         const transferId = url.searchParams.get('transferId');
         const fileName = url.searchParams.get('name') || 'downloaded_file';
@@ -56,21 +49,37 @@ self.addEventListener('fetch', (event) => {
 async function handleStreamDownload(transferId, fileName, fileSize) {
     try {
         const db = await openDB();
-        let chunkIndex = 0;
 
-        // 建立 ReadableStream 實現 Zero-Copy 低記憶體串流
         const stream = new ReadableStream({
-            async pull(controller) {
+            async start(controller) {
                 try {
-                    const chunkData = await getChunk(db, transferId, chunkIndex);
-                    if (chunkData) {
-                        controller.enqueue(new Uint8Array(chunkData));
-                        chunkIndex++;
-                    } else {
-                        controller.close();
-                    }
+                    const tx = db.transaction(CHUNK_STORE, 'readonly');
+                    const store = tx.objectStore(CHUNK_STORE);
+                    const index = store.index('transferId');
+                    const range = IDBKeyRange.only(transferId);
+
+                    // 使用 Cursor 循序遍歷該 transferId 的所有 chunks，防止中途中斷
+                    const request = index.openCursor(range);
+
+                    await new Promise((resolve, reject) => {
+                        request.onsuccess = (event) => {
+                            const cursor = event.target.result;
+                            if (cursor) {
+                                if (cursor.value && cursor.value.data) {
+                                    controller.enqueue(new Uint8Array(cursor.value.data));
+                                }
+                                cursor.continue(); // 移動至下一個 chunk
+                            } else {
+                                resolve(); // 所有 chunks 讀取完畢
+                            }
+                        };
+                        request.onerror = (e) => reject(e.target.error);
+                        tx.onerror = (e) => reject(e.target.error);
+                    });
+
+                    controller.close();
                 } catch (err) {
-                    console.error('[SW Stream] 讀取 Chunk 失敗:', err);
+                    console.error('[SW Stream] 串流讀取失敗:', err);
                     controller.error(err);
                 }
             }
@@ -82,7 +91,7 @@ async function handleStreamDownload(transferId, fileName, fileSize) {
             'Content-Disposition': `attachment; filename="${encodedFilename}"; filename*=UTF-8''${encodedFilename}`
         });
 
-        if (fileSize) {
+        if (fileSize && parseInt(fileSize) > 0) {
             headers.set('Content-Length', fileSize.toString());
         }
 

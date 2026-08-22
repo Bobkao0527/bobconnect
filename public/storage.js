@@ -4,7 +4,7 @@
  */
 
 const DB_NAME = 'BobConnect_Storage';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const CHUNK_STORE = 'transfer_chunks';
 const META_STORE = 'transfer_meta';
 
