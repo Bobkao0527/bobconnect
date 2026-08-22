@@ -1,6 +1,5 @@
 /**
  * opfs-worker.js - OPFS 高效零記憶體檔案寫入 Worker
- * 設計：極速同步寫入，即時確認以保證主線程 Byte 窗口 100% 精準無殘留
  */
 
 let accessHandle = null;
@@ -30,14 +29,20 @@ self.onmessage = async (event) => {
 
             try {
                 if (navigator.storage && navigator.storage.persist) {
-                    await navigator.storage.persist();
+                    await navigator.storage.persist().catch(() => {});
                 }
 
                 if (navigator.storage && navigator.storage.estimate) {
-                    const { quota, usage } = await navigator.storage.estimate();
-                    const available = quota - usage;
-                    if (size && available < size) {
-                        throw new Error(`儲存空間不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，剩餘可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
+                    try {
+                        const { quota, usage } = await navigator.storage.estimate();
+                        const available = quota - usage;
+                        if (size && available < size) {
+                            throw new Error(`磁碟可用空間不足 (需要 ${(size / (1024 * 1024)).toFixed(1)} MB，可用 ${(available / (1024 * 1024)).toFixed(1)} MB)`);
+                        }
+                    } catch (quotaErr) {
+                        if (quotaErr.message && quotaErr.message.includes('空間不足')) {
+                            throw quotaErr;
+                        }
                     }
                 }
 
@@ -82,7 +87,7 @@ self.onmessage = async (event) => {
         case 'finish': {
             try {
                 if (accessHandle) {
-                    accessHandle.flush(); // 僅在檔案接收完畢時執行落盤
+                    accessHandle.flush(); // 僅在檔案傳輸結束時執行一次完整落盤
                     accessHandle.close(); // 關閉句柄解鎖
                     accessHandle = null;
                 }

@@ -16,16 +16,16 @@ let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 6 * 1024 * 1024; // 6MB 接收並發窗口
+const MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024; // 4MB 接收並發窗口
 
 let unackedBytes = 0;
 let ackResolver = null;
 let bufferLowResolver = null;
-const MAX_UNACKED_BYTES = 6 * 1024 * 1024; // 6MB 發送端滑動視窗
-const MAX_BUFFERED_AMOUNT = 1.5 * 1024 * 1024; // 1.5MB SCTP 緩衝區上限
-const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 低水位觸發閾值
+const MAX_UNACKED_BYTES = 4 * 1024 * 1024; // 4MB 發送端滑動視窗
+const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1MB SCTP 緩衝區上限
+const BUFFERED_LOW_THRESHOLD = 256 * 1024; // 256KB 低水位觸發閾值
 
-// 接收端批次 ACK 聚合器 (兼顧低通訊負載與 0 死鎖保證)
+// 接收端批次 ACK 聚合器 (兼顧超低通訊負載與 0 死鎖保證)
 let pendingAckBytes = 0;
 let ackFlushTimer = null;
 const BATCH_ACK_BYTES = 256 * 1024; // 每 256KB 批次發送一次 ACK
@@ -67,7 +67,7 @@ function addPendingAck(bytes) {
     if (pendingAckBytes >= BATCH_ACK_BYTES) {
         flushPendingAck();
     } else if (!ackFlushTimer) {
-        ackFlushTimer = setTimeout(flushPendingAck, 25);
+        ackFlushTimer = setTimeout(flushPendingAck, 20);
     }
 }
 
@@ -635,16 +635,14 @@ export async function handleIncomingData(data) {
                     }
                     else if (msg.type === 'error') {
                         releaseWakeLock();
-                        showToast('OPFS 寫入發生錯誤: ' + msg.message, 'error');
-                        cleanupOPFSWorker();
+                        handlePeerDisconnection('接收端寫入錯誤: ' + msg.message);
                     }
                 };
 
                 opfsWorker.onerror = (err) => {
                     releaseWakeLock();
                     console.error('[OPFS Worker 錯誤]:', err);
-                    showToast('OPFS Worker 發生例外錯誤', 'error');
-                    cleanupOPFSWorker();
+                    handlePeerDisconnection('OPFS Worker 內部錯誤');
                 };
 
                 opfsWorker.postMessage({
@@ -739,117 +737,90 @@ export async function sendFileChunks() {
     };
 
     try {
-        const reader = state.selectedFile.stream().getReader();
-        let leftover = null;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (value) {
-                let currentData = value;
-                if (leftover && leftover.length > 0) {
-                    const combined = new Uint8Array(leftover.length + value.length);
-                    combined.set(leftover);
-                    combined.set(value, leftover.length);
-                    currentData = combined;
-                    leftover = null;
-                }
-                let offset = 0;
-                while (offset + chunkSize <= currentData.length) {
-                    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸途中 DataChannel 已關閉');
-                    }
+        let offset = 0;
+        const totalSize = state.selectedFile.size;
 
-                    // 1. SCTP 緩衝區背壓控制 (利用 onbufferedamountlow 事件)
-                    while (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                            throw new Error('傳輸途中 DataChannel 已關閉');
-                        }
-                        await new Promise((resolve) => {
-                            bufferLowResolver = resolve;
-                            setTimeout(() => {
-                                if (bufferLowResolver === resolve) {
-                                    bufferLowResolver = null;
-                                    resolve();
-                                }
-                            }, 25);
-                        });
-                    }
-
-                    // 2. 接收端寫入背壓控制 (滑動窗口 6MB)
-                    while (unackedBytes >= MAX_UNACKED_BYTES) {
-                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                            throw new Error('傳輸途中 DataChannel 已關閉');
-                        }
-                        await new Promise((resolve) => {
-                            ackResolver = resolve;
-                            setTimeout(() => {
-                                if (ackResolver === resolve) {
-                                    ackResolver = null;
-                                    resolve();
-                                }
-                            }, 25);
-                        });
-                    }
-
-                    const chunk = currentData.subarray(offset, offset + chunkSize);
-                    state.dataChannel.send(chunk);
-                    lastActivityTime = Date.now();
-                    offset += chunkSize;
-                    totalSent += chunkSize;
-                    unackedBytes += chunkSize;
-
-                    loopCounter++;
-                    if (loopCounter % 8 === 0) {
-                        await new Promise((resolve) => setTimeout(resolve, 0));
-                    }
-
-                    const now = performance.now();
-                    if (now - lastUiUpdateTime > 80 || totalSent >= state.selectedFile.size) {
-                        lastUiUpdateTime = now;
-
-                        const percent = Math.min(100, Math.round((totalSent / state.selectedFile.size) * 100));
-                        document.getElementById('progress-percent').innerText = `${percent}%`;
-                        document.getElementById('progress-bar').style.width = `${percent}%`;
-
-                        const speedElapsed = (now - lastSpeedTime) / 1000;
-                        if (speedElapsed > 0) {
-                            const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                            smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
-                            lastSpeedBytes = totalSent;
-                            lastSpeedTime = now;
-
-                            const speedText = document.getElementById('transfer-speed');
-                            if (speedText) {
-                                speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-                            }
-
-                            const remainingBytes = Math.max(0, state.selectedFile.size - totalSent);
-                            const etaSeconds = remainingBytes / smoothSpeed;
-
-                            const timeText = document.getElementById('transfer-time');
-                            if (timeText) {
-                                timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
-                            }
-                        }
-                    }
-                }
-                if (offset < currentData.length) {
-                    leftover = currentData.subarray(offset);
-                }
+        while (offset < totalSize) {
+            if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                throw new Error('傳輸途中 DataChannel 已關閉');
             }
-            if (done) {
-                if (leftover && leftover.length > 0) {
-                    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                        throw new Error('傳輸途中 DataChannel 已關閉');
-                    }
-                    while (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                        await new Promise((resolve) => setTimeout(resolve, 25));
-                    }
-                    state.dataChannel.send(leftover);
-                    lastActivityTime = Date.now();
-                    totalSent += leftover.length;
-                    unackedBytes += leftover.length;
+
+            // 1. SCTP 緩衝區背壓控制 (利用 onbufferedamountlow 事件)
+            while (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                    throw new Error('傳輸途中 DataChannel 已關閉');
                 }
-                break;
+                await new Promise((resolve) => {
+                    bufferLowResolver = resolve;
+                    setTimeout(() => {
+                        if (bufferLowResolver === resolve) {
+                            bufferLowResolver = null;
+                            resolve();
+                        }
+                    }, 20);
+                });
+            }
+
+            // 2. 接收端寫入背壓控制 (滑動窗口 4MB)
+            while (unackedBytes >= MAX_UNACKED_BYTES) {
+                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                    throw new Error('傳輸途中 DataChannel 已關閉');
+                }
+                await new Promise((resolve) => {
+                    ackResolver = resolve;
+                    setTimeout(() => {
+                        if (ackResolver === resolve) {
+                            ackResolver = null;
+                            resolve();
+                        }
+                    }, 20);
+                });
+            }
+
+            const nextOffset = Math.min(offset + chunkSize, totalSize);
+            const slice = state.selectedFile.slice(offset, nextOffset);
+            const chunkBuffer = await slice.arrayBuffer();
+
+            state.dataChannel.send(chunkBuffer);
+            lastActivityTime = Date.now();
+            const bytesSent = chunkBuffer.byteLength;
+            offset += bytesSent;
+            totalSent += bytesSent;
+            unackedBytes += bytesSent;
+
+            loopCounter++;
+            if (loopCounter % 16 === 0) {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+
+            const now = performance.now();
+            if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
+                lastUiUpdateTime = now;
+
+                const percent = Math.min(100, Math.round((totalSent / totalSize) * 100));
+                document.getElementById('progress-percent').innerText = `${percent}%`;
+                document.getElementById('progress-bar').style.width = `${percent}%`;
+
+                const speedElapsed = (now - lastSpeedTime) / 1000;
+                if (speedElapsed > 0) {
+                    const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
+                    smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                    lastSpeedBytes = totalSent;
+                    lastSpeedTime = now;
+
+                    const speedText = document.getElementById('transfer-speed');
+                    if (speedText) {
+                        speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                    }
+
+                    const remainingBytes = Math.max(0, totalSize - totalSent);
+                    const etaSeconds = remainingBytes / smoothSpeed;
+
+                    const timeText = document.getElementById('transfer-time');
+                    if (timeText) {
+                        timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                    }
+                }
             }
         }
 
@@ -857,9 +828,9 @@ export async function sendFileChunks() {
         let waitCount = 0;
         while (unackedBytes > 0 || (state.dataChannel && state.dataChannel.bufferedAmount > 0)) {
             if (!state.dataChannel || state.dataChannel.readyState !== 'open') break;
-            await new Promise((resolve) => setTimeout(resolve, 30));
+            await new Promise((resolve) => setTimeout(resolve, 25));
             waitCount++;
-            if (waitCount > 200) break; // 超過 6 秒強制送出 file-end
+            if (waitCount > 200) break; // 超過 5 秒強制送出 file-end
         }
 
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
