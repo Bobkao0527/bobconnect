@@ -16,14 +16,14 @@ let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 4 * 1024 * 1024; // 4MB 傳輸窗口
+const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
 
 let unackedBytes = 0;
 let ackResolver = null;
-const MAX_UNACKED_BYTES = 4 * 1024 * 1024; // 4MB 發送端滑動窗口
-
-const BATCH_ACK_THRESHOLD = 512 * 1024; // 每累積 512KB 批次送出一次 ACK，減少 88% 的 JSON 負載
-let pendingAckBytes = 0;
+let bufferLowResolver = null;
+const MAX_UNACKED_BYTES = 8 * 1024 * 1024; // 8MB 發送端滑動視窗
+const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2MB SCTP 緩衝區上限
+const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 低水位觸發閾值
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -94,16 +94,19 @@ function startHeartbeatAndWatchdog() {
     isDisconnectHandled = false;
     lastActivityTime = Date.now();
 
-    // 1. 每 2.5 秒發送輕量 Ping
+    // 1. 心跳機制：僅在「通道閒置」時每 3 秒發送輕量 Ping，避免干擾高速二進位資料傳輸
     heartbeatTimer = setInterval(() => {
-        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+        const isTransferring = (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
+                               (unackedBytes > 0);
+
+        if (!isTransferring && state.dataChannel && state.dataChannel.readyState === 'open') {
             try {
                 state.dataChannel.send(JSON.stringify({ type: 'ping' }));
             } catch (e) {}
         }
-    }, 2500);
+    }, 3000);
 
-    // 2. 傳輸看門狗：每 1 秒檢查是否有傳輸卡死凍結
+    // 2. 傳輸看門狗：每 1 秒檢查是否有超過 15 秒完全失去活動 (給予大檔磁碟與網路足夠緩衝)
     watchdogTimer = setInterval(() => {
         const now = Date.now();
         const idleTime = now - lastActivityTime;
@@ -112,7 +115,7 @@ function startHeartbeatAndWatchdog() {
         const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
         const isSending = unackedBytes > 0;
 
-        if ((isReceiving || isSending) && idleTime > 8000) {
+        if ((isReceiving || isSending) && idleTime > 15000) {
             console.error(`[看門狗逾時] 傳輸中超過 ${(idleTime / 1000).toFixed(1)} 秒未收到任何封包或回應`);
             handlePeerDisconnection('傳輸逾時，對端失去回應');
         }
@@ -241,7 +244,6 @@ export async function initHost() {
         setupPeerConnectionListeners(state.peerConnection);
 
         state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
         setupDataChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -369,7 +371,6 @@ export async function initJoinerWithRoom(roomId) {
 
         state.peerConnection.ondatachannel = (event) => {
             state.dataChannel = event.channel;
-            state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
             setupDataChannelListeners();
         };
         state.peerConnection.onicecandidate = (event) => {
@@ -395,7 +396,15 @@ export async function initJoinerWithRoom(roomId) {
 
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
-    state.dataChannel.bufferedAmountLowThreshold = 2 * 1024 * 1024;
+    state.dataChannel.bufferedAmountLowThreshold = BUFFERED_LOW_THRESHOLD;
+
+    state.dataChannel.onbufferedamountlow = () => {
+        if (bufferLowResolver) {
+            const resolve = bufferLowResolver;
+            bufferLowResolver = null;
+            resolve();
+        }
+    };
 
     state.dataChannel.onopen = () => {
         isDisconnectHandled = false;
@@ -436,15 +445,6 @@ export function setupDataChannelListeners() {
         lastActivityTime = Date.now();
         handleIncomingData(event.data);
     };
-}
-
-function sendBatchAck() {
-    if (pendingAckBytes > 0 && state.dataChannel && state.dataChannel.readyState === 'open') {
-        try {
-            state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: pendingAckBytes }));
-            pendingAckBytes = 0;
-        } catch (err) {}
-    }
 }
 
 function drainRecvQueue() {
@@ -492,7 +492,6 @@ function drainRecvQueue() {
 
     if (fileEndPending && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker) {
         fileEndPending = false;
-        sendBatchAck();
         opfsWorker.postMessage({ type: 'finish' });
     }
 }
@@ -522,8 +521,9 @@ export async function handleIncomingData(data) {
             if (message.type === 'ack') {
                 unackedBytes = Math.max(0, unackedBytes - (message.bytes || 0));
                 if (ackResolver && unackedBytes < MAX_UNACKED_BYTES) {
-                    ackResolver();
+                    const resolve = ackResolver;
                     ackResolver = null;
+                    resolve();
                 }
                 return;
             }
@@ -540,7 +540,6 @@ export async function handleIncomingData(data) {
                 isWorkerReady = false;
                 fileEndPending = false;
                 inFlightBytes = 0;
-                pendingAckBytes = 0;
 
                 currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                 currentTempFilename = `temp_${currentDownloadId}.tmp`;
@@ -566,10 +565,12 @@ export async function handleIncomingData(data) {
                     else if (msg.type === 'write-ack') {
                         const writtenSize = msg.size || 0;
                         inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                        pendingAckBytes += writtenSize;
 
-                        if (pendingAckBytes >= BATCH_ACK_THRESHOLD) {
-                            sendBatchAck();
+                        // Worker 批次回傳確認時，直接將 ACK 傳回給發送端
+                        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+                            try {
+                                state.dataChannel.send(JSON.stringify({ type: 'ack', bytes: writtenSize }));
+                            } catch (err) {}
                         }
 
                         drainRecvQueue();
@@ -637,7 +638,6 @@ export async function handleIncomingData(data) {
                 if (!isWorkerReady || recvQueue.length > 0 || inFlightBytes > 0) {
                     fileEndPending = true;
                 } else if (opfsWorker) {
-                    sendBatchAck();
                     opfsWorker.postMessage({ type: 'finish' });
                 }
             }
@@ -647,6 +647,7 @@ export async function handleIncomingData(data) {
         }
     } else {
         recvQueue.push(data);
+        lastActivityTime = Date.now();
         if (isWorkerReady) {
             drainRecvQueue();
         }
@@ -683,9 +684,9 @@ export async function sendFileChunks() {
     }));
 
     const chunkSize = 65536; // 64KB Chunk
-    const maxBufferedAmount = 2 * 1024 * 1024; // 2MB
     unackedBytes = 0;
     ackResolver = null;
+    bufferLowResolver = null;
 
     let totalSent = 0;
     let lastUiUpdateTime = 0;
@@ -726,22 +727,29 @@ export async function sendFileChunks() {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
 
-                    while (
-                        state.dataChannel.bufferedAmount > maxBufferedAmount ||
-                        unackedBytes >= MAX_UNACKED_BYTES
-                    ) {
-                        if (state.dataChannel.readyState !== 'open') {
-                            throw new Error('傳輸途中 DataChannel 已關閉');
-                        }
+                    // 1. SCTP 緩衝區背壓控制 (利用 onbufferedamountlow 事件)
+                    if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                        await new Promise((resolve) => {
+                            bufferLowResolver = resolve;
+                            setTimeout(() => {
+                                if (bufferLowResolver === resolve) {
+                                    bufferLowResolver = null;
+                                    resolve();
+                                }
+                            }, 50);
+                        });
+                    }
 
+                    // 2. 接收端寫入背壓控制 (滑動窗口 8MB)
+                    if (unackedBytes >= MAX_UNACKED_BYTES) {
                         await new Promise((resolve) => {
                             ackResolver = resolve;
-                            const timer = setTimeout(() => {
+                            setTimeout(() => {
                                 if (ackResolver === resolve) {
                                     ackResolver = null;
                                     resolve();
                                 }
-                            }, 30);
+                            }, 50);
                         });
                     }
 
@@ -753,7 +761,7 @@ export async function sendFileChunks() {
                     unackedBytes += chunkSize;
 
                     loopCounter++;
-                    if (loopCounter % 16 === 0) {
+                    if (loopCounter % 8 === 0) {
                         await new Promise((resolve) => setTimeout(resolve, 0));
                     }
 
@@ -796,7 +804,7 @@ export async function sendFileChunks() {
                     if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                         throw new Error('傳輸途中 DataChannel 已關閉');
                     }
-                    while (state.dataChannel.bufferedAmount > maxBufferedAmount || unackedBytes >= MAX_UNACKED_BYTES) {
+                    if (state.dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                         await new Promise((resolve) => setTimeout(resolve, 30));
                     }
                     state.dataChannel.send(leftover);
@@ -814,7 +822,7 @@ export async function sendFileChunks() {
             if (!state.dataChannel || state.dataChannel.readyState !== 'open') break;
             await new Promise((resolve) => setTimeout(resolve, 40));
             waitCount++;
-            if (waitCount > 100) break; // 超過 4 秒強制送出 file-end
+            if (waitCount > 150) break; // 超過 6 秒強制送出 file-end
         }
 
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
@@ -837,7 +845,7 @@ export async function sendFileChunks() {
         showToast('檔案已完全投遞！', 'success');
     } catch (e) {
         console.error('傳輸發生錯誤:', e);
-        showToast('傳輸中斷：' + e.message, 'error');
+        handlePeerDisconnection('傳輸中斷：' + e.message);
     } finally {
         releaseWakeLock();
         if (btnSend) {
@@ -863,8 +871,8 @@ export function cleanupOPFSWorker() {
     fileEndPending = false;
     inFlightBytes = 0;
     unackedBytes = 0;
-    pendingAckBytes = 0;
     ackResolver = null;
+    bufferLowResolver = null;
     currentOffset = 0;
 }
 

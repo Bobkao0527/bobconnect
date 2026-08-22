@@ -1,5 +1,6 @@
 /**
  * opfs-worker.js - OPFS 高效零記憶體檔案寫入 Worker
+ * 優化版：移除頻繁磁碟 fsync 阻塞，改採批次 512KB 確認回報，傳輸結束時一次性 Flush
  */
 
 let accessHandle = null;
@@ -7,8 +8,8 @@ let fileHandle = null;
 let rootDir = null;
 let tempFilename = null;
 let targetFilename = '';
-let bytesSinceLastFlush = 0;
-const FLUSH_THRESHOLD = 8 * 1024 * 1024; // 8MB 批次 Flush，降低大檔案磁碟 I/O 阻塞
+let unackedWrittenBytes = 0;
+const ACK_THRESHOLD = 512 * 1024; // 512KB 批次回報一次，大幅減少 Worker 與主線程間通訊
 
 self.addEventListener('error', (err) => {
     console.error('[OPFS Worker 全域錯誤]:', err);
@@ -28,7 +29,7 @@ self.onmessage = async (event) => {
         case 'init': {
             const { downloadId, size, filename, tempFilename: customTempName } = data;
             targetFilename = filename || 'downloaded_file';
-            bytesSinceLastFlush = 0;
+            unackedWrittenBytes = 0;
 
             try {
                 if (navigator.storage && navigator.storage.persist) {
@@ -68,17 +69,17 @@ self.onmessage = async (event) => {
                 const view = new Uint8Array(chunk);
                 accessHandle.write(view, { at: offset });
 
-                bytesSinceLastFlush += view.byteLength;
-                if (bytesSinceLastFlush >= FLUSH_THRESHOLD) {
-                    accessHandle.flush();
-                    bytesSinceLastFlush = 0;
-                }
+                const bytesWritten = size || view.byteLength;
+                unackedWrittenBytes += bytesWritten;
 
-                self.postMessage({
-                    type: 'write-ack',
-                    offset: offset + view.byteLength,
-                    size: size || view.byteLength
-                });
+                // 累積滿 512KB 回傳一次確認，避免高頻 postMessage 塞爆主線程 Event Loop
+                if (unackedWrittenBytes >= ACK_THRESHOLD) {
+                    self.postMessage({
+                        type: 'write-ack',
+                        size: unackedWrittenBytes
+                    });
+                    unackedWrittenBytes = 0;
+                }
             } catch (err) {
                 console.error('[OPFS Worker] 寫入失敗:', err);
                 await cleanup();
@@ -89,9 +90,18 @@ self.onmessage = async (event) => {
 
         case 'finish': {
             try {
+                // 若還有殘留未確認的寫入量，立刻回報
+                if (unackedWrittenBytes > 0) {
+                    self.postMessage({
+                        type: 'write-ack',
+                        size: unackedWrittenBytes
+                    });
+                    unackedWrittenBytes = 0;
+                }
+
                 if (accessHandle) {
-                    accessHandle.flush();
-                    accessHandle.close(); // 寫入完成後立刻關閉 handle 解鎖
+                    accessHandle.flush(); // 僅在整個檔案寫入結束時執行一次完整落盤
+                    accessHandle.close(); // 關閉句柄解鎖
                     accessHandle = null;
                 }
 
@@ -103,7 +113,7 @@ self.onmessage = async (event) => {
                     type: 'finish-success',
                     file: file,
                     filename: targetFilename,
-                    tempFilename: tempFilename // 回傳檔名給主線程刪除
+                    tempFilename: tempFilename
                 });
             } catch (err) {
                 console.error('[OPFS Worker] 結束寫入失敗:', err);
