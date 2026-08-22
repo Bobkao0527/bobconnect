@@ -3,7 +3,7 @@
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAutoDownload, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
-import { saveChunks, assembleFile, deleteTransfer, clearEntireStorage } from './storage.js';
+import { saveChunks, assembleFile, deleteTransfer, clearEntireStorage, initServiceWorker, triggerStreamDownload } from './storage.js';
 
 let currentDownloadId = null;
 let currentChunkIndex = 0;
@@ -428,11 +428,14 @@ export function setupDataChannelListeners() {
         }
     };
 
-    state.dataChannel.onopen = () => {
+    state.dataChannel.onopen = async () => {
         isDisconnectHandled = false;
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('極速 P2P 連結就緒', 'success');
         triggerAppleGlow();
+
+        // 預先準備 Service Worker 串流環境
+        await initServiceWorker();
 
         startHeartbeatAndWatchdog();
 
@@ -528,30 +531,25 @@ async function finishFileDownload() {
         const filename = state.incomingFileInfo ? state.incomingFileInfo.name : 'downloaded_file';
         const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : 0;
 
-        const blob = await assembleFile(currentDownloadId);
-        const blobUrl = URL.createObjectURL(blob);
-
-        if (typeof triggerAutoDownload === 'function') {
-            triggerAutoDownload(blobUrl, filename, actualFileSize || blob.size);
-        }
+        // 🚀 核心修改：觸發 Service Worker 模擬串流下載，直寫磁碟不留記憶體
+        triggerStreamDownload(currentDownloadId, filename, actualFileSize);
 
         const recvPercent = document.getElementById('recv-percent');
         const recvProgressBar = document.getElementById('recv-progress-bar');
         if (recvPercent) recvPercent.innerText = '100% (完成)';
         if (recvProgressBar) recvProgressBar.style.width = '100%';
-        showToast(`「${filename}」傳輸成功！`, 'success');
+        showToast(`「${filename}」傳輸成功，已開始串流下載！`, 'success');
 
-        // 🧹 15 秒後安全釋放 ObjectURL 與觸發 IndexedDB 垃圾回收 (GC)
+        // 🧹 延遲 60 秒確保 SW 完成從 IndexedDB 讀取串流後，再執行 GC 清理暫存
         const tid = currentDownloadId;
         setTimeout(async () => {
-            URL.revokeObjectURL(blobUrl);
             if (tid) {
                 await deleteTransfer(tid);
             }
-        }, 15000);
+        }, 60000);
     } catch (err) {
-        console.error('[組裝檔案失敗]:', err);
-        showToast('檔案組裝失敗: ' + err.message, 'error');
+        console.error('[串流下載失敗]:', err);
+        showToast('檔案串流下載失敗: ' + err.message, 'error');
     }
 }
 

@@ -93,39 +93,13 @@ export async function saveMeta(transferId, meta) {
 }
 
 /**
- * 將指定傳輸的所有 Chunks 循序組裝為單一 Blob
+ * 舊版相容介面：改為直接觸發 SW 串流下載
  * @param {string} transferId 
- * @param {string} mimeType 
- * @returns {Promise<Blob>}
+ * @param {string} fileName 
+ * @param {number} fileSize 
  */
-export async function assembleFile(transferId, mimeType = 'application/octet-stream') {
-    const db = await getDB();
-
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction([CHUNK_STORE], 'readonly');
-        const store = tx.objectStore(CHUNK_STORE);
-        const index = store.index('transferId');
-        const range = IDBKeyRange.only(transferId);
-
-        const chunks = [];
-        const request = index.openCursor(range);
-
-        request.onsuccess = (event) => {
-            const cursor = event.target.result;
-            if (cursor) {
-                chunks.push(cursor.value);
-                cursor.continue();
-            } else {
-                // 確保按照 index 順序排序
-                chunks.sort((a, b) => a.index - b.index);
-                const dataBuffers = chunks.map(c => c.data);
-                const blob = new Blob(dataBuffers, { type: mimeType });
-                resolve(blob);
-            }
-        };
-
-        request.onerror = (e) => reject(e.target.error);
-    });
+export async function assembleFile(transferId, fileName = 'downloaded_file', fileSize = 0) {
+    triggerStreamDownload(transferId, fileName, fileSize);
 }
 
 /**
@@ -217,4 +191,37 @@ export async function clearEntireStorage() {
             console.warn('[OPFS 清理] 執行失敗:', err);
         }
     }
+}
+
+/**
+ * 註冊 Service Worker 以支援大檔案串流下載
+ */
+export async function initServiceWorker() {
+    if ('serviceWorker' in navigator) {
+        try {
+            const reg = await navigator.serviceWorker.register('./sw.js');
+            await navigator.serviceWorker.ready;
+            console.log('[Service Worker] 串流下載服務已就緒');
+            return reg;
+        } catch (err) {
+            console.error('[Service Worker 註冊失敗]:', err);
+        }
+    }
+}
+
+/**
+ * 透過 Service Worker 觸發模擬串流下載，避免組裝 Blob 導致記憶體溢出 (OOM)
+ * @param {string} transferId 
+ * @param {string} fileName 
+ * @param {number} fileSize 
+ */
+export function triggerStreamDownload(transferId, fileName = 'downloaded_file', fileSize = 0) {
+    const downloadUrl = `./sw-download?transferId=${encodeURIComponent(transferId)}&name=${encodeURIComponent(fileName)}&size=${fileSize}`;
+    
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 }
