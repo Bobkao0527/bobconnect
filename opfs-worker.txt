@@ -25,13 +25,15 @@ self.onmessage = async (event) => {
     if (!data || !data.type) return;
 
     switch (data.type) {
-        case 'init': {
+        case 'init':
+        case 'init-resume': {
             const { downloadId, size, filename, tempFilename: customTempName } = data;
+            const isResume = data.type === 'init-resume';
             targetFilename = filename || 'downloaded_file';
             targetFileSize = size || 0;
             workerWriteCount = 0;
 
-            console.log(`[OPFS Worker] 收到初始化請求: 檔名="${targetFilename}", 預期大小=${(size / (1024 * 1024)).toFixed(2)} MB`);
+            console.log(`[OPFS Worker] 收到初始化請求 (${data.type}): 檔名="${targetFilename}", 預期大小=${(size / (1024 * 1024)).toFixed(2)} MB`);
 
             try {
                 if (navigator.storage && navigator.storage.persist) {
@@ -56,10 +58,33 @@ self.onmessage = async (event) => {
                 rootDir = await navigator.storage.getDirectory();
                 tempFilename = customTempName || `temp_${downloadId || Date.now()}.tmp`;
 
-                fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
-                accessHandle = await fileHandle.createSyncAccessHandle();
+                try {
+                    // 續傳模式時不建立全新空白檔案，而是打開已存在的暫存檔
+                    fileHandle = await rootDir.getFileHandle(tempFilename, { create: !isResume });
+                } catch (e) {
+                    if (isResume) {
+                        console.warn(`[OPFS Worker] 續傳檔案 ${tempFilename} 不存在，fallback 建立新檔`);
+                        fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
+                    } else {
+                        throw e;
+                    }
+                }
 
-                console.log(`[OPFS Worker] 句柄建立成功，暫存檔名: ${tempFilename}`);
+                // 增加 createSyncAccessHandle 重試邏輯，避免鎖定衝突
+                let retries = 5;
+                while (retries > 0) {
+                    try {
+                        accessHandle = await fileHandle.createSyncAccessHandle();
+                        break;
+                    } catch (handleErr) {
+                        retries--;
+                        if (retries === 0) throw handleErr;
+                        console.warn(`[OPFS Worker] createSyncAccessHandle 失敗，正在重試 (${retries} 次殘餘)...`, handleErr);
+                        await new Promise(resolve => setTimeout(resolve, 200));
+                    }
+                }
+
+                console.log(`[OPFS Worker] 句柄建立成功 (${isResume ? '續傳' : '全新'})，暫存檔名: ${tempFilename}`);
                 self.postMessage({ type: 'init-success' });
             } catch (err) {
                 console.error('[OPFS Worker] 初始化失敗:', err);
