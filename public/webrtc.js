@@ -1202,14 +1202,13 @@ export async function sendFileChunks(startOffset = null) {
                 }
 
                 const nextBlockOffset = Math.min(blockOffset + CHUNK_SIZE, blockLength);
-                const chunkBuffer = blockBuffer.slice(blockOffset, nextBlockOffset);
+                const chunkSize = nextBlockOffset - blockOffset;
+                const chunkView = new Uint8Array(blockBuffer, blockOffset, chunkSize);
 
-                state.dataChannel.send(chunkBuffer);
-                lastActivityTime = Date.now();
+                state.dataChannel.send(chunkView);
 
-                const bytesSent = chunkBuffer.byteLength;
-                blockOffset += bytesSent;
-                offset += bytesSent;
+                blockOffset += chunkSize;
+                offset += chunkSize;
                 totalSent = offset;
 
                 const now = performance.now();
