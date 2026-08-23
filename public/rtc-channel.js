@@ -32,17 +32,17 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     stopTransportMonitor();
 
     // 釋放 DataChannel 與 PeerConnection
+    if (state.controlChannel) {
+        try { state.controlChannel.close(); } catch (e) { }
+        state.controlChannel = null;
+    }
+    if (state.fileChannel) {
+        try { state.fileChannel.close(); } catch (e) { }
+        state.fileChannel = null;
+    }
     if (state.dataChannel) {
         try { state.dataChannel.close(); } catch (e) { }
         state.dataChannel = null;
-    }
-    if (state.peerConnection) {
-        try { state.peerConnection.close(); } catch (e) { }
-        state.peerConnection = null;
-    }
-    if (state.ws) {
-        try { state.ws.close(); } catch (e) { }
-        state.ws = null;
     }
 
     // 重置傳輸內部狀態
@@ -392,8 +392,11 @@ export async function restartSignalingAndPeerConnection() {
     };
 
     if (state.isHost) {
-        state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        setupDataChannelListeners();
+        state.controlChannel = state.peerConnection.createDataChannel('controlChannel', { ordered: true });
+        setupControlChannelListeners();
+
+        state.fileChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
+        setupFileChannelListeners();
 
         connectSignalingWS();
 
@@ -415,8 +418,14 @@ export async function restartSignalingAndPeerConnection() {
         }
     } else {
         state.peerConnection.ondatachannel = (event) => {
-            state.dataChannel = event.channel;
-            setupDataChannelListeners();
+            const channel = event.channel;
+            if (channel.label === 'controlChannel') {
+                state.controlChannel = channel;
+                setupControlChannelListeners();
+            } else if (channel.label === 'fileTransfer') {
+                state.fileChannel = channel;
+                setupFileChannelListeners();
+            }
         };
         connectSignalingWS();
     }
@@ -491,6 +500,26 @@ export function setupControlChannelListeners() {
 
     state.controlChannel.onerror = (err) => {
         console.error('[P2P 控制通道 異常]:', err);
+    };
+}
+
+/**
+ * 設定檔案傳輸通道 (fileChannel) 監聽
+ */
+export function setupFileChannelListeners() {
+    if (!state.fileChannel) return;
+
+    state.fileChannel.binaryType = 'arraybuffer';
+    state.fileChannel.onmessage = (event) => {
+        handleIncomingData(event.data, 'file');
+    };
+
+    state.fileChannel.onclose = () => {
+        console.warn('[P2P 檔案通道] 關閉');
+    };
+
+    state.fileChannel.onerror = (err) => {
+        console.error('[P2P 檔案通道 異常]:', err);
     };
 }
 
@@ -675,17 +704,17 @@ async function logWebRTCStats(pc, dc) {
 
 // 視窗卸載離線告警
 window.addEventListener('beforeunload', () => {
-    if (state.dataChannel && state.dataChannel.readyState === 'open') {
+    if (state.controlChannel && state.controlChannel.readyState === 'open') {
         try {
-            state.dataChannel.send(JSON.stringify({ type: 'peer-leave' }));
+            state.controlChannel.send(JSON.stringify({ type: 'peer-leave' }));
         } catch (e) { }
     }
 });
 
 window.addEventListener('pagehide', () => {
-    if (state.dataChannel && state.dataChannel.readyState === 'open') {
+    if (state.controlChannel && state.controlChannel.readyState === 'open') {
         try {
-            state.dataChannel.send(JSON.stringify({ type: 'peer-leave' }));
+            state.controlChannel.send(JSON.stringify({ type: 'peer-leave' }));
         } catch (e) { }
     }
 });

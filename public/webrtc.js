@@ -251,6 +251,14 @@ export async function handleIncomingData(data, sourceChannel = 'file') {
 
             if (message.type === 'pong') return;
 
+            // 修復：接收並更新對端 ACK，解除 32MB 滑動窗口阻塞
+            if (message.type === 'ack') {
+                if (typeof message.offset === 'number') {
+                    lastConfirmedAckOffset = Math.max(lastConfirmedAckOffset, message.offset);
+                }
+                return;
+            }
+
             if (message.type === 'file-resync-request') {
                 console.log(`[發送端] 收到 P2P 控制線的 Resync 請求，從 Offset ${message.receivedOffset} 繼續發送...`);
                 showToast(`網路波動，已自動從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復發送`, 'info');
@@ -311,7 +319,7 @@ export async function handleIncomingData(data, sourceChannel = 'file') {
                 createOPFSWorker(isResume);
 
                 if (isResume) {
-                    state.dataChannel.send(JSON.stringify({
+                    state.controlChannel.send(JSON.stringify({
                         type: 'resume-request',
                         name: message.name,
                         receivedOffset: state.receivedSize
@@ -444,7 +452,7 @@ export async function sendFileChunks(startOffset = null) {
                 while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
                     await new Promise(resolve => setTimeout(resolve, 30));
                     if (mySessionId !== currentTransferSessionId) return;
-                    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                    if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                         isSendingInProgress = false;
                         return;
                     }
