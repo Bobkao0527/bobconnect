@@ -9,6 +9,9 @@ let tempFilename = null;
 let targetFilename = '';
 let targetFileSize = 0;
 let workerWriteCount = 0;
+let pendingAckBytes = 0;
+let ackDebounceTimer = null;
+const ACK_BATCH_THRESHOLD = 256 * 1024; // 累積寫入 256KB 再回傳 ACK，減少 75% 的跨線程 IPC
 
 self.addEventListener('error', (err) => {
     console.error('[OPFS Worker 全域錯誤]:', err);
@@ -20,6 +23,20 @@ self.addEventListener('unhandledrejection', (event) => {
     self.postMessage({ type: 'error', message: event.reason ? (event.reason.message || String(event.reason)) : '非預期異步錯誤' });
 });
 
+function flushAck() {
+    if (ackDebounceTimer) {
+        clearTimeout(ackDebounceTimer);
+        ackDebounceTimer = null;
+    }
+    if (pendingAckBytes > 0) {
+        self.postMessage({
+            type: 'write-ack',
+            size: pendingAckBytes
+        });
+        pendingAckBytes = 0;
+    }
+}
+
 self.onmessage = async (event) => {
     const data = event.data;
     if (!data || !data.type) return;
@@ -27,11 +44,13 @@ self.onmessage = async (event) => {
     switch (data.type) {
         case 'init':
         case 'init-resume': {
+            flushAck();
             const { downloadId, size, filename, tempFilename: customTempName } = data;
             const isResume = data.type === 'init-resume';
             targetFilename = filename || 'downloaded_file';
             targetFileSize = size || 0;
             workerWriteCount = 0;
+            pendingAckBytes = 0;
 
             console.log(`[OPFS Worker] 收到初始化請求 (${data.type}): 檔名="${targetFilename}", 預期大小=${(size / (1024 * 1024)).toFixed(2)} MB`);
 
@@ -59,7 +78,6 @@ self.onmessage = async (event) => {
                 tempFilename = customTempName || `temp_${downloadId || Date.now()}.tmp`;
 
                 try {
-                    // 續傳模式時不建立全新空白檔案，而是打開已存在的暫存檔
                     fileHandle = await rootDir.getFileHandle(tempFilename, { create: !isResume });
                 } catch (e) {
                     if (isResume) {
@@ -70,7 +88,6 @@ self.onmessage = async (event) => {
                     }
                 }
 
-                // 增加 createSyncAccessHandle 重試邏輯，避免鎖定衝突
                 let retries = 5;
                 while (retries > 0) {
                     try {
@@ -105,7 +122,6 @@ self.onmessage = async (event) => {
                 const view = new Uint8Array(chunk);
                 let bytesWritten = 0;
                 
-                // 確保循環寫滿，防止 Partial Write
                 while (bytesWritten < view.byteLength) {
                     const subView = view.subarray(bytesWritten);
                     const written = accessHandle.write(subView, { at: offset + bytesWritten });
@@ -115,10 +131,14 @@ self.onmessage = async (event) => {
                     bytesWritten += written;
                 }
 
-                self.postMessage({
-                    type: 'write-ack',
-                    size: bytesWritten || size || view.byteLength
-                });
+                pendingAckBytes += (bytesWritten || size || view.byteLength);
+
+                // 達到批次閾值即回報，否則啟動 20ms 保底定時器，避免零散封包未被確認
+                if (pendingAckBytes >= ACK_BATCH_THRESHOLD) {
+                    flushAck();
+                } else if (!ackDebounceTimer) {
+                    ackDebounceTimer = setTimeout(flushAck, 20);
+                }
             } catch (err) {
                 console.error(`[OPFS Worker] 寫入第 ${workerWriteCount} 塊時失敗 (offset: ${offset}):`, err);
                 await cleanup();
@@ -131,6 +151,9 @@ self.onmessage = async (event) => {
             try {
                 console.log(`[OPFS Worker] 收到結束請求，開始 Flush 與關閉檔案 (共寫入 ${workerWriteCount} 個分塊)...`);
                 const startTime = performance.now();
+
+                // 結算殘留的 ACK
+                flushAck();
 
                 if (accessHandle) {
                     if (targetFileSize > 0) {
@@ -167,6 +190,7 @@ self.onmessage = async (event) => {
 
         case 'abort': {
             console.warn('[OPFS Worker] 收到 abort 指令，執行資源清理');
+            if (ackDebounceTimer) clearTimeout(ackDebounceTimer);
             await cleanup();
             break;
         }
