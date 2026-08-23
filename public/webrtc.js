@@ -242,11 +242,6 @@ function createOPFSWorker(isResume = false) {
             releaseWakeLock();
             flushCumulativeAck();
 
-            if (state.ws) {
-                try { state.ws.close(); } catch (e) { }
-                state.ws = null;
-            }
-
             const { file, filename, tempFilename } = msg;
             const fileToDelete = tempFilename || currentTempFilename;
             const blobUrl = URL.createObjectURL(file);
@@ -822,6 +817,11 @@ export function setupDataChannelListeners() {
             type: 'device-info',
             isMobile: state.localIsMobile
         }));
+
+        if (state.ws) {
+            state.ws.close();
+            state.ws = null;
+        }
 
         document.getElementById('setup-view')?.classList.add('hidden');
         document.getElementById('signaling-box')?.classList.add('hidden');
