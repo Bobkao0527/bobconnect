@@ -5,9 +5,10 @@ import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
 import { initHost, initJoinerWithRoom, probeIPv4 } from './rtc-channel.js';
 import { sendFileChunks, evaluateFileRouting, clearEntireOPFS } from './webrtc.js';
-import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
+// 修正：補上 switchPairingTab 與 scanNearbyRooms 匯入
+import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms, switchPairingTab, scanNearbyRooms } from './scanner.js';
 
-// 全域暴露機制
+// 全域暴露機制 (供 HTML onclick 觸發)
 window.initHost = initHost;
 window.initJoinerWithRoom = initJoinerWithRoom;
 window.startJoinerScanner = startScanner;
@@ -16,6 +17,8 @@ window.openPairingModal = openPairingModal;
 window.closePairingModal = closePairingModal;
 window.sendFileChunks = sendFileChunks;
 window.hideToast = hideToast;
+window.switchPairingTab = switchPairingTab;
+window.scanNearbyRooms = scanNearbyRooms;
 
 // 頁面初始化
 window.addEventListener('DOMContentLoaded', async () => {
@@ -29,7 +32,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (rId) {
         state.roomId = rId;
         state.isHost = false;
-        initJoinerWithRoom();
+        initJoinerWithRoom(rId); // 修正：傳入 rId
     } else {
         autoCheckNearbyRooms();
     }
