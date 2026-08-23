@@ -20,8 +20,8 @@ const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 1MB 累積緩存低水位
-const BUFFERED_HIGH_THRESHOLD = 4 * 1024 * 1024; // 4MB 累積緩存高水位
+const BUFFERED_LOW_THRESHOLD = 8 * 1024 * 1024; // 8MB 累積緩存低水位
+const BUFFERED_HIGH_THRESHOLD = 32 * 1024 * 1024; // 32MB 累積緩存高水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -1109,8 +1109,8 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const CHUNK_SIZE = 64 * 1024;        // 64KB SCTP 最優傳輸封包
-    const BLOCK_SIZE = 2 * 1024 * 1024;  // 2MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
+    const CHUNK_SIZE = 256 * 1024;        // 256KB SCTP 最優傳輸封包
+    const BLOCK_SIZE = 8 * 1024 * 1024;  // 8MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
 
     let lastUiUpdateTime = 0;
