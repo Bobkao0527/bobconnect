@@ -198,8 +198,14 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         setupPeerConnectionListeners(state.peerConnection);
 
-        state.dataChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
-        setupDataChannelListeners();
+        // 建立雙並列 P2P 通道
+        // 1. 控制通道 (專門處理 Ping/ACK/復原對齊)
+        state.controlChannel = state.peerConnection.createDataChannel('controlChannel', { ordered: true });
+        setupControlChannelListeners();
+
+        // 2. 檔案通道 (專門處理二進制高頻數據)
+        state.fileChannel = state.peerConnection.createDataChannel('fileTransfer', { ordered: true });
+        setupFileChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
@@ -259,10 +265,18 @@ export async function initJoinerWithRoom(roomId) {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         setupPeerConnectionListeners(state.peerConnection);
 
+        // 依據 channel.label 分流綁定
         state.peerConnection.ondatachannel = (event) => {
-            state.dataChannel = event.channel;
-            setupDataChannelListeners();
+            const channel = event.channel;
+            if (channel.label === 'controlChannel') {
+                state.controlChannel = channel;
+                setupControlChannelListeners();
+            } else if (channel.label === 'fileTransfer') {
+                state.fileChannel = channel;
+                setupFileChannelListeners();
+            }
         };
+
         state.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
                 const payload = {
@@ -409,44 +423,32 @@ export async function restartSignalingAndPeerConnection() {
 }
 
 /**
- * 設定 DataChannel 事件監聽
+ * 設定檔案傳輸通道 (fileChannel) 監聽
  */
-export function setupDataChannelListeners() {
-    state.dataChannel.binaryType = 'arraybuffer';
-    state.dataChannel.bufferedAmountLowThreshold = 4 * 1024 * 1024;
+export function setupControlChannelListeners() {
+    if (!state.controlChannel) return;
 
-    state.dataChannel.onbufferedamountlow = () => {
-        if (window.bufferLowResolver) {
-            const resolve = window.bufferLowResolver;
-            window.bufferLowResolver = null;
-            resolve();
-        }
-    };
-
-    state.dataChannel.onopen = () => {
+    state.controlChannel.onopen = () => {
+        console.log('[P2P 控制通道] 已開啟');
         isDisconnectHandled = false;
         isReconnecting = false;
         reconnectAttempts = 0;
         lastActivityTime = Date.now();
 
-        if (window.bufferLowResolver) {
-            const resolve = window.bufferLowResolver;
-            window.bufferLowResolver = null;
-            resolve();
-        }
-
-        updateStatus('P2P 直連已開通 (加密)', 'green');
+        updateStatus('P2P 控制與傳輸通道已開通', 'green');
         showToast('P2P 直連通道就緒', 'success');
         triggerAppleGlow();
 
         startHeartbeatAndWatchdog();
         startTransportMonitor();
 
-        state.dataChannel.send(JSON.stringify({
+        // 發送裝置資訊
+        state.controlChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile
         }));
 
+        // 關閉信令 WS 節省資源
         if (state.ws) {
             state.ws.close();
             state.ws = null;
@@ -460,17 +462,15 @@ export function setupDataChannelListeners() {
             tfPanel.style.opacity = '1';
         }
 
-        // 續傳協商
+        // 若有續傳任務，經由 controlChannel 協商
         if (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) {
             document.getElementById('incoming-file-box')?.classList.remove('hidden');
             const recvFileName = document.getElementById('recv-file-name');
             if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
             updateRecvUi();
 
-            console.log(`[續傳協商] 接收端重新建立 OPFS Worker (續傳模式) 並請求從 Offset ${state.receivedSize} 續傳`);
             createOPFSWorker(true);
-
-            state.dataChannel.send(JSON.stringify({
+            state.controlChannel.send(JSON.stringify({
                 type: 'resume-request',
                 name: state.incomingFileInfo.name,
                 receivedOffset: state.receivedSize
@@ -478,19 +478,39 @@ export function setupDataChannelListeners() {
         }
     };
 
-    state.dataChannel.onclose = () => {
-        handlePeerDisconnection('直連通道中斷', false);
-    };
-
-    state.dataChannel.onerror = (err) => {
-        console.error('[DataChannel 異常]:', err);
-        handlePeerDisconnection('傳輸通道異常', false);
-    };
-
-    state.dataChannel.onmessage = (event) => {
+    state.controlChannel.onmessage = (event) => {
         lastActivityTime = Date.now();
-        handleIncomingData(event.data);
+        // 控制訊息傳入 webrtc.js 處理
+        handleIncomingData(event.data, 'control');
     };
+
+    state.controlChannel.onclose = () => {
+        console.warn('[P2P 控制通道] 關閉');
+        handlePeerDisconnection('控制通道中斷', false);
+    };
+
+    state.controlChannel.onerror = (err) => {
+        console.error('[P2P 控制通道 異常]:', err);
+    };
+}
+
+/**
+ * 優先經由 P2P 控制線進行修復，避免直接對 DO 信令發起連線
+ */
+export function triggerFileChannelRecovery(reason) {
+    if (state.controlChannel && state.controlChannel.readyState === 'open') {
+        console.log(`[P2P 內生修復] 理由: ${reason}。正在透過控制通道請求對端重新對齊與續傳...`);
+        showToast('檔案通道波動，正在自動無感修復...', 'warning');
+        
+        // 通知對端重新發送/續傳
+        state.controlChannel.send(JSON.stringify({
+            type: 'file-resync-request',
+            receivedOffset: state.receivedSize || 0
+        }));
+    } else {
+        // 連控制線都斷了才觸發完整重連 (打 DO 信令)
+        handlePeerDisconnection(reason, false);
+    }
 }
 
 function setupPeerConnectionListeners(pc) {
@@ -557,7 +577,7 @@ function startHeartbeatAndWatchdog() {
     let lastStatsBytesReceived = 0;
 
     heartbeatTimer = setInterval(() => {
-        if (state.dataChannel && state.dataChannel.readyState === 'open') {
+        if (state.controlChannel && state.controlChannel.readyState === 'open') {
             const isTransferring =
                 (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
                 (state.selectedFile && state.receivedSize < state.selectedFile.size);
@@ -566,7 +586,7 @@ function startHeartbeatAndWatchdog() {
 
             if (!isTransferring || idleTime > 3000) {
                 try {
-                    state.dataChannel.send(JSON.stringify({ type: 'ping' }));
+                    state.controlChannel.send(JSON.stringify({ type: 'ping' }));
                 } catch (e) {
                     console.warn('[Heartbeat] Ping 發送失敗:', e);
                 }
@@ -576,13 +596,13 @@ function startHeartbeatAndWatchdog() {
 
     watchdogTimer = setInterval(async () => {
         const now = Date.now();
-
         const isReceiving = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
         const isSending = state.selectedFile && state.receivedSize < state.selectedFile.size;
 
         if (!isReceiving && !isSending) return;
 
-        if (!state.dataChannel || state.dataChannel.readyState !== 'open') return;
+        // 檢查控制通道
+        if (!state.controlChannel || state.controlChannel.readyState !== 'open') return;
 
         try {
             const stats = await state.peerConnection?.getStats();
@@ -606,8 +626,8 @@ function startHeartbeatAndWatchdog() {
         const effectiveIdleTime = Date.now() - lastActivityTime;
 
         if (effectiveIdleTime > 15000) {
-            console.error(`[看門狗逾時] 傳輸中超過 ${(effectiveIdleTime / 1000).toFixed(1)} 秒無回應，嘗試重新連線續傳...`);
-            handlePeerDisconnection('傳輸逾時，正在重新連線...', false);
+            console.error(`[看門狗逾時] 傳輸中超過 ${(effectiveIdleTime / 1000).toFixed(1)} 秒無回應，優先嘗試 P2P 控制通道內生恢復...`);
+            triggerFileChannelRecovery('傳輸逾時無回應');
         }
     }, 1000);
 }

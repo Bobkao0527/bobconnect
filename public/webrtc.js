@@ -44,9 +44,9 @@ async function removeOPFSFile(filename) {
 }
 
 function flushCumulativeAck() {
-    if (state.receivedSize > lastAckedOffset && state.dataChannel && state.dataChannel.readyState === 'open') {
+    if (state.receivedSize > lastAckedOffset && state.controlChannel && state.controlChannel.readyState === 'open') {
         try {
-            state.dataChannel.send(JSON.stringify({
+            state.controlChannel.send(JSON.stringify({
                 type: 'ack',
                 offset: state.receivedSize
             }));
@@ -237,30 +237,24 @@ export function drainRecvQueue() {
     }
 }
 
-export async function handleIncomingData(data) {
-    if (typeof data === 'string') {
+export async function handleIncomingData(data, sourceChannel = 'file') {
+    if (typeof data === 'string' || sourceChannel === 'control') {
         try {
-            const message = JSON.parse(data);
+            const message = typeof data === 'string' ? JSON.parse(data) : data;
 
             if (message.type === 'ping') {
-                if (state.dataChannel && state.dataChannel.readyState === 'open') {
-                    state.dataChannel.send(JSON.stringify({ type: 'pong' }));
+                if (state.controlChannel && state.controlChannel.readyState === 'open') {
+                    state.controlChannel.send(JSON.stringify({ type: 'pong' }));
                 }
                 return;
             }
 
             if (message.type === 'pong') return;
 
-            if (message.type === 'peer-leave') {
-                console.warn('[接收端] 收到對端主動離線通知');
-                handlePeerDisconnection('對端已主動離開房間', true);
-                return;
-            }
-
-            if (message.type === 'ack') {
-                if (typeof message.offset === 'number') {
-                    lastConfirmedAckOffset = message.offset;
-                }
+            if (message.type === 'file-resync-request') {
+                console.log(`[發送端] 收到 P2P 控制線的 Resync 請求，從 Offset ${message.receivedOffset} 繼續發送...`);
+                showToast(`網路波動，已自動從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復發送`, 'info');
+                sendFileChunks(message.receivedOffset);
                 return;
             }
 
@@ -268,11 +262,12 @@ export async function handleIncomingData(data) {
                 console.log(`[發送端] 收到續傳請求，對端已完成: ${(message.receivedOffset / (1024 * 1024)).toFixed(2)} MB`);
                 showToast(`正在從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復傳輸...`, 'info');
                 
-                state.dataChannel.send(JSON.stringify({
-                    type: 'resume-ack',
-                    startOffset: message.receivedOffset
-                }));
-
+                if (state.controlChannel && state.controlChannel.readyState === 'open') {
+                    state.controlChannel.send(JSON.stringify({
+                        type: 'resume-ack',
+                        startOffset: message.receivedOffset
+                    }));
+                }
                 sendFileChunks(message.receivedOffset);
                 return;
             }
@@ -364,8 +359,12 @@ export async function sendFileChunks(startOffset = null) {
         return;
     }
 
-    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-        console.warn('[發送端] 通道尚未就緒，等待連線建立...');
+    if (!state.controlChannel || state.controlChannel.readyState !== 'open') {
+        console.warn('[發送端] 控制通道尚未就緒...');
+        return;
+    }
+    if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
+        console.warn('[發送端] 檔案通道尚未就緒...');
         return;
     }
 
@@ -385,7 +384,7 @@ export async function sendFileChunks(startOffset = null) {
     lastConfirmedAckOffset = offset;
 
     if (offset === 0) {
-        state.dataChannel.send(JSON.stringify({
+        state.controlChannel.send(JSON.stringify({
             type: 'file-meta',
             name: state.selectedFile.name,
             size: state.selectedFile.size
@@ -419,8 +418,11 @@ export async function sendFileChunks(startOffset = null) {
         while (offset < totalSize) {
             if (mySessionId !== currentTransferSessionId) return;
 
-            if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+            // 檢查檔案通道狀態
+            if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
+                console.warn('[發送端] 檔案通道中斷，暫停發送並觸發 P2P 控制線修復');
                 isSendingInProgress = false;
+                triggerFileChannelRecovery('檔案通道在中途斷開');
                 return;
             }
 
@@ -448,11 +450,11 @@ export async function sendFileChunks(startOffset = null) {
                     }
                 }
 
-                if (state.dataChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
+                if (state.fileChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
                     let stagnationCount = 0;
-                    let lastBufferedAmount = state.dataChannel.bufferedAmount;
+                    let lastBufferedAmount = state.fileChannel.bufferedAmount;
 
-                    while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
+                    while (state.fileChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                         await new Promise((resolve) => {
                             window.bufferLowResolver = resolve;
                             setTimeout(() => {
@@ -465,16 +467,18 @@ export async function sendFileChunks(startOffset = null) {
 
                         if (mySessionId !== currentTransferSessionId) return;
 
-                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                        if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                             isSendingInProgress = false;
+                            triggerFileChannelRecovery('背壓等待期間檔案通道斷開');
                             return;
                         }
 
-                        const currentBuffered = state.dataChannel.bufferedAmount;
+                        const currentBuffered = state.fileChannel.bufferedAmount;
                         if (currentBuffered >= lastBufferedAmount) {
                             stagnationCount++;
                             if (stagnationCount >= 100) {
-                                handlePeerDisconnection('發送背壓停滯超時', false);
+                                // 嘗試透過 controlChannel 救回，而不是直接掛斷
+                                triggerFileChannelRecovery('發送背壓停滯超時');
                                 return;
                             }
                         } else {
@@ -488,7 +492,7 @@ export async function sendFileChunks(startOffset = null) {
                 const chunkSize = nextBlockOffset - blockOffset;
                 const chunkView = new Uint8Array(blockBuffer, blockOffset, chunkSize);
 
-                state.dataChannel.send(chunkView);
+                state.fileChannel.send(chunkView);
 
                 blockOffset += chunkSize;
                 offset += chunkSize;
@@ -530,8 +534,8 @@ export async function sendFileChunks(startOffset = null) {
 
         if (mySessionId !== currentTransferSessionId) return;
 
-        if (state.dataChannel && state.dataChannel.readyState === 'open') {
-            state.dataChannel.send(JSON.stringify({ type: 'file-end' }));
+        if (state.controlChannel && state.controlChannel.readyState === 'open') {
+            state.controlChannel.send(JSON.stringify({ type: 'file-end' }));
         }
 
         const progStatus = document.getElementById('progress-status');
