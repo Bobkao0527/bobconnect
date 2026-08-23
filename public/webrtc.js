@@ -64,10 +64,6 @@ async function removeOPFSFile(filename) {
 
 // 接收端發送累積確認 (Cumulative ACK)
 function flushCumulativeAck() {
-    if (ackFlushTimer) {
-        clearTimeout(ackFlushTimer);
-        ackFlushTimer = null;
-    }
     if (state.receivedSize > lastAckedOffset && state.dataChannel && state.dataChannel.readyState === 'open') {
         try {
             state.dataChannel.send(JSON.stringify({
@@ -83,9 +79,6 @@ function flushCumulativeAck() {
  * 統一的斷線處理器 (支援短暫中斷重連與致命斷線區分)
  * @param {string} reason 斷線原因
  * @param {boolean} isFatal 是否為致命斷線 (如對端主動離線/使用者手動取消)
- */
-/**
- * 統一的斷線處理器 (修復：精確識別未完成傳輸與重置重連狀態機)
  */
 export function handlePeerDisconnection(reason = '連線已斷開', isFatal = false) {
     if (isDisconnectHandled && !isFatal) return;
@@ -129,6 +122,7 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     const hasActiveSession = Boolean(state.roomId && (isReceivingIncomplete || isSendingIncomplete));
 
     if (!isFatal && hasActiveSession) {
+        cleanupOPFSWorker(false, false); // 非致命中斷：終止 Worker，但保留暫存檔案 (Bug 5)
         isReconnecting = false; // 重設標記以允許進入重試邏輯
         attemptReconnection(reason);
         return;
@@ -137,7 +131,7 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     // 致命斷線或無傳輸任務，徹底清理
     isDisconnectHandled = true;
     releaseWakeLock();
-    cleanupOPFSWorker(false, true);
+    cleanupOPFSWorker(false, true); // 致命斷線：徹底刪除暫存檔案
 
     updateStatus('連線已中斷', 'red');
     showToast(reason, 'error');
@@ -710,6 +704,12 @@ export function setupDataChannelListeners() {
         startHeartbeatAndWatchdog();
         startTransportMonitor();
 
+        // 啟動 ACK 強制刷新定時器 (每 200ms) 作為流控兜底 (Bug 2)
+        if (ackFlushTimer) clearInterval(ackFlushTimer);
+        ackFlushTimer = setInterval(() => {
+            flushCumulativeAck();
+        }, 200);
+
         state.dataChannel.send(JSON.stringify({
             type: 'device-info',
             isMobile: state.localIsMobile
@@ -808,6 +808,11 @@ function drainRecvQueue() {
 
             currentOffset += chunkSize;
         }
+    }
+
+    // 雜湊式即時 ACK 旁路：inFlight 滿載時立即發送 ACK (Bug 2)
+    if (inFlightBytes >= MAX_IN_FLIGHT_BYTES) {
+        flushCumulativeAck();
     }
 
     if (recvQueue.length > 30) {
@@ -936,10 +941,9 @@ export async function handleIncomingData(data) {
                             state.receivedSize += writtenSize;
                             lastActivityTime = Date.now();
 
+                            // 超過累積限制立即觸發 ACK 發送
                             if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
                                 flushCumulativeAck();
-                            } else if (!ackFlushTimer) {
-                                ackFlushTimer = setTimeout(flushCumulativeAck, 100);
                             }
 
                             updateRecvUi();
@@ -988,8 +992,9 @@ export async function handleIncomingData(data) {
                         handlePeerDisconnection('OPFS Worker 內部錯誤', true);
                     };
 
+                    // 當已有已接收進度時，初始化為 'init-resume' 模式以防覆蓋暂存檔 (Bug 4)
                     opfsWorker.postMessage({
-                        type: 'init',
+                        type: state.receivedSize > 0 ? 'init-resume' : 'init',
                         downloadId: currentDownloadId,
                         tempFilename: currentTempFilename,
                         filename: message.name,
@@ -1119,6 +1124,10 @@ export async function sendFileChunks(startOffset = null) {
                 return;
             }
 
+            // 背壓等待與停滯偵測 (Bug 1)
+            let stagnationCount = 0;
+            let lastBufferedAmount = state.dataChannel.bufferedAmount;
+
             while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                 await new Promise((resolve) => {
                     bufferLowResolver = resolve;
@@ -1127,7 +1136,7 @@ export async function sendFileChunks(startOffset = null) {
                             bufferLowResolver = null;
                             resolve();
                         }
-                    }, 50);
+                    }, 500); // 延長至 500ms，消除空轉假醒 (Bug 1)
                 });
 
                 if (mySessionId !== currentTransferSessionId) return;
@@ -1136,6 +1145,20 @@ export async function sendFileChunks(startOffset = null) {
                     console.warn(`[發送端 背壓等待時中斷] 傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB`);
                     isSendingInProgress = false;
                     return;
+                }
+
+                // 背壓停滯檢查：若緩衝量不降，判定為通道卡死，主動觸發斷開重新續傳
+                const currentBuffered = state.dataChannel.bufferedAmount;
+                if (currentBuffered >= lastBufferedAmount) {
+                    stagnationCount++;
+                    if (stagnationCount >= 10) { // 10 次輪詢 (約 5 秒) 進度無任何消化
+                        console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
+                        handlePeerDisconnection('發送背壓停滯超時', false);
+                        return;
+                    }
+                } else {
+                    stagnationCount = 0;
+                    lastBufferedAmount = currentBuffered;
                 }
             }
 
@@ -1235,7 +1258,7 @@ export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
     }
 
     if (ackFlushTimer) {
-        clearTimeout(ackFlushTimer);
+        clearInterval(ackFlushTimer);
         ackFlushTimer = null;
     }
 

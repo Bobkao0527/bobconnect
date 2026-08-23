@@ -48,6 +48,7 @@ const MAX_RECONNECT_ATTEMPTS = 15;
 
 let isSendingInProgress = false; // 防止發送端重複進入發送迴圈
 let lastConfirmedAckOffset = 0;  // 發送端記錄對端已寫入落盤的確認點
+let currentTransferSessionId = 0; // 用於杜絕多個發送迴圈並行競爭
 
 // 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
 async function removeOPFSFile(filename) {
@@ -83,6 +84,9 @@ function flushCumulativeAck() {
  * @param {string} reason 斷線原因
  * @param {boolean} isFatal 是否為致命斷線 (如對端主動離線/使用者手動取消)
  */
+/**
+ * 統一的斷線處理器 (修復：精確識別未完成傳輸與重置重連狀態機)
+ */
 export function handlePeerDisconnection(reason = '連線已斷開', isFatal = false) {
     if (isDisconnectHandled && !isFatal) return;
 
@@ -104,15 +108,28 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
         state.ws = null;
     }
 
+    // 中斷當前所有正在等待 buffer 的 promise
     if (bufferLowResolver) {
         const resolve = bufferLowResolver;
         bufferLowResolver = null;
         resolve();
     }
 
-    // 若非致命斷線且正在傳輸中或已有房間，啟動自動重連與斷點續傳
-    const hasActiveSession = state.roomId && (state.incomingFileInfo || state.selectedFile);
+    // 中斷發送迴圈
+    currentTransferSessionId++;
+    isSendingInProgress = false;
+
+    // 清空接收端尚未寫入的隊列，防止續傳時舊 chunk 錯位寫入
+    recvQueue = [];
+    inFlightBytes = 0;
+
+    // 僅在有未完成傳輸任務時啟動自動重連，避免傳輸完成後因對端離線觸發無效重試
+    const isReceivingIncomplete = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
+    const isSendingIncomplete = state.selectedFile && totalSent < state.selectedFile.size;
+    const hasActiveSession = Boolean(state.roomId && (isReceivingIncomplete || isSendingIncomplete));
+
     if (!isFatal && hasActiveSession) {
+        isReconnecting = false; // 重設標記以允許進入重試邏輯
         attemptReconnection(reason);
         return;
     }
@@ -120,7 +137,7 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     // 致命斷線或無傳輸任務，徹底清理
     isDisconnectHandled = true;
     releaseWakeLock();
-    cleanupOPFSWorker(false, true); // 強制刪除未完成暫存檔
+    cleanupOPFSWorker(false, true);
 
     updateStatus('連線已中斷', 'red');
     showToast(reason, 'error');
@@ -143,7 +160,6 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     state.incomingFileInfo = null;
     state.receivedSize = 0;
     totalSent = 0;
-    isSendingInProgress = false;
     isReconnecting = false;
 }
 
@@ -678,6 +694,14 @@ export function setupDataChannelListeners() {
         isDisconnectHandled = false;
         isReconnecting = false;
         reconnectAttempts = 0;
+        lastActivityTime = Date.now();
+
+        // 清除任何殘存的非同步背壓等待
+        if (bufferLowResolver) {
+            const resolve = bufferLowResolver;
+            bufferLowResolver = null;
+            resolve();
+        }
 
         updateStatus('P2P 直連已開通 (加密)', 'green');
         showToast('P2P 直連通道就緒', 'success');
@@ -704,9 +728,12 @@ export function setupDataChannelListeners() {
             tfPanel.style.opacity = '1';
         }
 
-        // 續傳協商：若身為接收端且有未完成檔案，主動向發送端請求斷點續傳
+        // 續傳協商：若身為接收端且有未完成檔案，重整 Offset 並主動請求續傳
         if (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) {
-            console.log(`[續傳協商] 接收端連線重開，向發送端要求從 Offset ${state.receivedSize} 續傳`);
+            recvQueue = [];
+            inFlightBytes = 0;
+            currentOffset = state.receivedSize;
+            console.log(`[續傳協商] 接收端向發送端請求從 Offset ${state.receivedSize} 續傳`);
             state.dataChannel.send(JSON.stringify({
                 type: 'resume-request',
                 name: state.incomingFileInfo.name,
@@ -828,23 +855,26 @@ export async function handleIncomingData(data) {
                 return;
             }
 
-            // 發送端收到接收端的斷點續傳請求
+            // 發送端收到續傳請求
             if (message.type === 'resume-request') {
                 console.log(`[發送端] 收到續傳請求，對端已完成: ${(message.receivedOffset / (1024 * 1024)).toFixed(2)} MB`);
                 showToast(`正在從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復傳輸...`, 'info');
                 
-                // 確認續傳起點並重啟傳送迴圈
                 state.dataChannel.send(JSON.stringify({
                     type: 'resume-ack',
                     startOffset: message.receivedOffset
                 }));
+
+                // 啟動新的傳送任務（內部會遞增 Session ID 中斷舊任務）
                 sendFileChunks(message.receivedOffset);
                 return;
             }
 
-            // 接收端收到發送端的續傳確認
+            // 接收端收到續傳確認
             if (message.type === 'resume-ack') {
-                console.log(`[接收端] 發送端已確認從 Offset ${message.startOffset} 續傳`);
+                console.log(`[接收端] 發送端確認續傳 Offset: ${message.startOffset}`);
+                recvQueue = [];
+                inFlightBytes = 0;
                 currentOffset = message.startOffset;
                 isWorkerReady = true;
                 drainRecvQueue();
@@ -856,18 +886,18 @@ export async function handleIncomingData(data) {
                 recvPacketCount = 0;
                 workerAckCount = 0;
 
-                // 若為全新檔案或不同檔案，重置暫存檔名與進度
                 const isSameFile = state.incomingFileInfo &&
                     state.incomingFileInfo.name === message.name &&
                     state.incomingFileInfo.size === message.size &&
                     currentTempFilename;
 
                 if (!isSameFile) {
-                    cleanupOPFSWorker(false, true); // 清理舊檔案
+                    cleanupOPFSWorker(false, true);
                     currentDownloadId = `dl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
                     currentTempFilename = `temp_${currentDownloadId}.tmp`;
                     state.receivedSize = 0;
                     currentOffset = 0;
+                    lastAckedOffset = 0;
                 }
 
                 state.incomingFileInfo = { name: message.name, size: message.size };
@@ -880,7 +910,6 @@ export async function handleIncomingData(data) {
 
                 console.log(`[接收端] 收到檔案資訊: 檔名="${message.name}", 總大小=${(message.size / (1024 * 1024)).toFixed(2)} MB, 目前進度=${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB`);
 
-                // 啟動 OPFS Worker
                 if (!opfsWorker) {
                     try {
                         opfsWorker = new Worker('./opfs-worker.js');
@@ -909,6 +938,8 @@ export async function handleIncomingData(data) {
 
                             if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
                                 flushCumulativeAck();
+                            } else if (!ackFlushTimer) {
+                                ackFlushTimer = setTimeout(flushCumulativeAck, 100);
                             }
 
                             updateRecvUi();
@@ -969,7 +1000,6 @@ export async function handleIncomingData(data) {
                     drainRecvQueue();
                 }
 
-                // 若之前已經接收了部分資料，回覆目前斷點
                 if (state.receivedSize > 0) {
                     state.dataChannel.send(JSON.stringify({
                         type: 'resume-request',
@@ -1021,17 +1051,15 @@ export async function sendFileChunks(startOffset = null) {
         return;
     }
 
-    if (isSendingInProgress && startOffset === null) {
-        console.warn('[發送端] 傳輸已在進行中，略過重複調用');
-        return;
-    }
-
     if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
         console.warn('[發送端] 通道尚未就緒，等待連線建立...');
         return;
     }
 
+    // 生成當前 Session ID，使舊的異步發送迴圈自動退場
+    const mySessionId = ++currentTransferSessionId;
     isSendingInProgress = true;
+
     const btnSend = document.getElementById('btn-send');
     if (btnSend) {
         btnSend.disabled = true;
@@ -1044,7 +1072,6 @@ export async function sendFileChunks(startOffset = null) {
     totalSent = offset;
     lastConfirmedAckOffset = offset;
 
-    // 若從 0 開始，發送元數據宣告
     if (offset === 0) {
         console.log(`[發送端 開始新傳輸] 檔名: ${state.selectedFile.name}, 總大小: ${(state.selectedFile.size / (1024 * 1024)).toFixed(2)} MB`);
         state.dataChannel.send(JSON.stringify({
@@ -1053,14 +1080,12 @@ export async function sendFileChunks(startOffset = null) {
             size: state.selectedFile.size
         }));
     } else {
-        console.log(`[發送端 斷點續傳] 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
+        console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
     const chunkSize = 64 * 1024;
     bufferLowResolver = null;
 
-    let chunkIndex = Math.floor(offset / chunkSize);
-    let backpressureCount = 0;
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = offset;
@@ -1082,16 +1107,16 @@ export async function sendFileChunks(startOffset = null) {
         const totalSize = state.selectedFile.size;
 
         while (offset < totalSize) {
-            // 若傳輸中途 DataChannel 斷開，退出迴圈並保留進度，等待自動重連機制續傳
+            // 檢查 Session 是否已被新連線覆蓋，若是則立即退出
+            if (mySessionId !== currentTransferSessionId) {
+                console.warn(`[發送端] Session #${mySessionId} 已過期，由新 Session 接手，退出迴圈`);
+                return;
+            }
+
             if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                 console.warn(`[發送端 中斷暫停] 通道中斷，傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB，等待自動重連恢復...`);
                 isSendingInProgress = false;
                 return;
-            }
-
-            // 背壓控制
-            if (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
-                backpressureCount++;
             }
 
             while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
@@ -1105,6 +1130,8 @@ export async function sendFileChunks(startOffset = null) {
                     }, 50);
                 });
 
+                if (mySessionId !== currentTransferSessionId) return;
+
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
                     console.warn(`[發送端 背壓等待時中斷] 傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB`);
                     isSendingInProgress = false;
@@ -1116,8 +1143,9 @@ export async function sendFileChunks(startOffset = null) {
             const slice = state.selectedFile.slice(offset, nextOffset);
             const chunkBuffer = await slice.arrayBuffer();
 
+            if (mySessionId !== currentTransferSessionId) return;
+
             state.dataChannel.send(chunkBuffer);
-            chunkIndex++;
             lastActivityTime = Date.now();
 
             const bytesSent = chunkBuffer.byteLength;
@@ -1157,6 +1185,8 @@ export async function sendFileChunks(startOffset = null) {
             }
         }
 
+        if (mySessionId !== currentTransferSessionId) return;
+
         console.log(`[發送端 完成全數發送] 發送 file-end 信號...`);
 
         if (state.dataChannel && state.dataChannel.readyState === 'open') {
@@ -1177,24 +1207,30 @@ export async function sendFileChunks(startOffset = null) {
         showToast('檔案已完全投遞！', 'success');
         isSendingInProgress = false;
     } catch (e) {
-        console.error('[發送端 異常]:', e);
-        isSendingInProgress = false;
-        handlePeerDisconnection('傳輸中斷: ' + e.message, false);
+        if (mySessionId === currentTransferSessionId) {
+            console.error('[發送端 異常]:', e);
+            isSendingInProgress = false;
+            handlePeerDisconnection('傳輸中斷: ' + e.message, false);
+        }
     } finally {
-        releaseWakeLock();
-        if (btnSend && !isSendingInProgress) {
-            btnSend.disabled = false;
-            btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+        if (mySessionId === currentTransferSessionId) {
+            releaseWakeLock();
+            if (btnSend && !isSendingInProgress) {
+                btnSend.disabled = false;
+                btnSend.classList.remove('opacity-40', 'cursor-not-allowed');
+            }
         }
     }
 }
 
 /**
- * 釋放 OPFS Worker 與內部資源 (更新：增加 forceDelete 參數，斷線續傳期間保留暫存檔)
+ * 釋放 OPFS Worker 與內部資源 (修復：狀態完整復原)
  */
 export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
     if (opfsWorker) {
-        opfsWorker.terminate();
+        try {
+            opfsWorker.terminate();
+        } catch (e) { }
         opfsWorker = null;
     }
 
@@ -1203,7 +1239,6 @@ export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
         ackFlushTimer = null;
     }
 
-    // 只有在強制刪除 (取消/完全離開) 時才刪除暫存檔；重連中斷期間保留檔案以便續傳
     if (forceDelete && currentTempFilename) {
         removeOPFSFile(currentTempFilename);
         currentTempFilename = null;
