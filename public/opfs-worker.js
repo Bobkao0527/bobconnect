@@ -133,11 +133,11 @@ self.onmessage = async (event) => {
 
                 pendingAckBytes += (bytesWritten || size || view.byteLength);
 
-                // 達到批次閾值即回報，否則啟動 20ms 保底定時器，避免零散封包未被確認
+                // 達到批次閾值即回報，否則啟動 10ms 保底定時器，避免零散封包未被確認
                 if (pendingAckBytes >= ACK_BATCH_THRESHOLD) {
                     flushAck();
                 } else if (!ackDebounceTimer) {
-                    ackDebounceTimer = setTimeout(flushAck, 20);
+                    ackDebounceTimer = setTimeout(flushAck, 10);
                 }
             } catch (err) {
                 console.error(`[OPFS Worker] 寫入第 ${workerWriteCount} 塊時失敗 (offset: ${offset}):`, err);

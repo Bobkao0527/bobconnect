@@ -22,6 +22,7 @@ let totalSent = 0;
 let bufferLowResolver = null;
 const BUFFERED_LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 累積緩存低水位
 const BUFFERED_HIGH_THRESHOLD = 12 * 1024 * 1024; // 12MB 累積緩存高水位
+const MAX_UNACKED_WINDOW_BYTES = 32 * 1024 * 1024; // 32MB 發送端限制水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -205,7 +206,7 @@ function createOPFSWorker(isResume = false) {
     fileEndPending = false;
 
     try {
-        opfsWorker = new Worker('./opfs-worker.js');
+        opfsWorker = new Worker(new URL('./opfs-worker.js', import.meta.url));
     } catch (err) {
         console.error('[接收端] 建立 OPFS Worker 失敗:', err);
         showToast('無法建立 OPFS Worker: ' + err.message, 'error');
@@ -265,7 +266,7 @@ function createOPFSWorker(isResume = false) {
                 if (fileToDelete) {
                     await removeOPFSFile(fileToDelete);
                 }
-            }, 15000);
+            }, 60000);
         }
         else if (msg.type === 'error') {
             releaseWakeLock();
@@ -835,6 +836,7 @@ export function setupDataChannelListeners() {
             recvQueue = [];
             inFlightBytes = 0;
             currentOffset = state.receivedSize;
+            lastAckedOffset = state.receivedSize;
 
             document.getElementById('incoming-file-box')?.classList.remove('hidden');
             const recvFileName = document.getElementById('recv-file-name');
@@ -1109,8 +1111,8 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const CHUNK_SIZE = 64 * 1024;        // 64KB SCTP 最優傳輸封包
-    const BLOCK_SIZE = 8 * 1024 * 1024;  // 8MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
+    const CHUNK_SIZE = 64 * 1024; // 64KB SCTP 傳輸封包
+    const BLOCK_SIZE = 12 * 1024 * 1024; // 12MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
 
     let lastUiUpdateTime = 0;
@@ -1163,7 +1165,17 @@ export async function sendFileChunks(startOffset = null) {
                     return;
                 }
 
-                // 雙水位背壓控制：緩存超過 4MB (High Watermark) 時才等待其降回 1MB (Low Watermark)
+                // 若未確認落盤的數據量超過 32MB，暫停發送，等待接收端 Worker 寫入完成並回傳 ACK
+                while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
+                    await new Promise(resolve => setTimeout(resolve, 30));
+                    if (mySessionId !== currentTransferSessionId) return;
+                    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                        isSendingInProgress = false;
+                        return;
+                    }
+                }
+
+                // 雙水位背壓控制：緩存超過 12MB (High Watermark) 時才等待其降回 4MB (Low Watermark)
                 if (state.dataChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
                     let stagnationCount = 0;
                     let lastBufferedAmount = state.dataChannel.bufferedAmount;
@@ -1176,7 +1188,7 @@ export async function sendFileChunks(startOffset = null) {
                                     bufferLowResolver = null;
                                     resolve();
                                 }
-                            }, 250);
+                            }, 50);
                         });
 
                         if (mySessionId !== currentTransferSessionId) return;
@@ -1189,7 +1201,7 @@ export async function sendFileChunks(startOffset = null) {
                         const currentBuffered = state.dataChannel.bufferedAmount;
                         if (currentBuffered >= lastBufferedAmount) {
                             stagnationCount++;
-                            if (stagnationCount >= 20) { // 約 5 秒無任何消化
+                            if (stagnationCount >= 100) { // 約 1 秒無任何消化
                                 console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
                                 handlePeerDisconnection('發送背壓停滯超時', false);
                                 return;
