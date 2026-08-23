@@ -190,6 +190,107 @@ async function attemptReconnection(reason) {
 }
 
 /**
+ * 建立並初始化 OPFS Worker (支援全新寫入與斷點續傳)
+ * @param {boolean} isResume 是否為續傳模式
+ */
+function createOPFSWorker(isResume = false) {
+    if (opfsWorker) {
+        try { opfsWorker.terminate(); } catch (e) { }
+        opfsWorker = null;
+    }
+
+    isWorkerReady = false;
+    isFinishSent = false;
+    fileEndPending = false;
+
+    try {
+        opfsWorker = new Worker('./opfs-worker.js');
+    } catch (err) {
+        console.error('[接收端] 建立 OPFS Worker 失敗:', err);
+        showToast('無法建立 OPFS Worker: ' + err.message, 'error');
+        releaseWakeLock();
+        return false;
+    }
+
+    opfsWorker.onmessage = (e) => {
+        const msg = e.data;
+        if (!msg) return;
+
+        if (msg.type === 'init-success') {
+            console.log(`[接收端] OPFS Worker 就緒 (${isResume ? '續傳' : '全新'})`);
+            isWorkerReady = true;
+            drainRecvQueue();
+        }
+        else if (msg.type === 'write-ack') {
+            workerAckCount++;
+            const writtenSize = msg.size || 0;
+            inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
+            state.receivedSize += writtenSize;
+            lastActivityTime = Date.now();
+
+            // 超過累積限制立即觸發 ACK 發送
+            if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
+                flushCumulativeAck();
+            }
+
+            updateRecvUi();
+            drainRecvQueue();
+        }
+        else if (msg.type === 'finish-success') {
+            releaseWakeLock();
+            flushCumulativeAck();
+
+            const { file, filename, tempFilename } = msg;
+            const fileToDelete = tempFilename || currentTempFilename;
+            const blobUrl = URL.createObjectURL(file);
+
+            console.log(`[接收端 傳輸完成] 檔案大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
+
+            cleanupOPFSWorker(true, false);
+
+            const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
+            if (typeof triggerAutoDownload === 'function') {
+                triggerAutoDownload(blobUrl, filename, actualFileSize);
+            }
+
+            const recvPercent = document.getElementById('recv-percent');
+            const recvProgressBar = document.getElementById('recv-progress-bar');
+            if (recvPercent) recvPercent.innerText = '100% (完成)';
+            if (recvProgressBar) recvProgressBar.style.width = '100%';
+            showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
+
+            setTimeout(async () => {
+                URL.revokeObjectURL(blobUrl);
+                if (fileToDelete) {
+                    await removeOPFSFile(fileToDelete);
+                }
+            }, 15000);
+        }
+        else if (msg.type === 'error') {
+            releaseWakeLock();
+            console.error('[接收端] Worker 錯誤:', msg.message);
+            handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
+        }
+    };
+
+    opfsWorker.onerror = (err) => {
+        releaseWakeLock();
+        console.error('[接收端 OPFS Worker 異常]:', err);
+        handlePeerDisconnection('OPFS Worker 內部錯誤', true);
+    };
+
+    opfsWorker.postMessage({
+        type: isResume ? 'init-resume' : 'init',
+        downloadId: currentDownloadId,
+        tempFilename: currentTempFilename,
+        filename: state.incomingFileInfo?.name || 'downloaded_file',
+        size: state.incomingFileInfo?.size || 0
+    });
+
+    return true;
+}
+
+/**
  * 重建信令與 WebRTC 連線通道
  */
 async function restartSignalingAndPeerConnection() {
@@ -670,7 +771,7 @@ export async function initJoinerWithRoom(roomId) {
 }
 
 /**
- * 設定 DataChannel 事件監聽 (更新：通道建立後自動發起續傳協商)
+ * 設定 DataChannel 事件監聽 (更新：通道建立後自動重建 Worker 並發起續傳協商)
  */
 export function setupDataChannelListeners() {
     state.dataChannel.binaryType = 'arraybuffer';
@@ -704,7 +805,7 @@ export function setupDataChannelListeners() {
         startHeartbeatAndWatchdog();
         startTransportMonitor();
 
-        // 啟動 ACK 強制刷新定時器 (每 200ms) 作為流控兜底 (Bug 2)
+        // 啟動 ACK 強制刷新定時器 (每 200ms) 作為流控兜底
         if (ackFlushTimer) clearInterval(ackFlushTimer);
         ackFlushTimer = setInterval(() => {
             flushCumulativeAck();
@@ -728,12 +829,20 @@ export function setupDataChannelListeners() {
             tfPanel.style.opacity = '1';
         }
 
-        // 續傳協商：若身為接收端且有未完成檔案，重整 Offset 並主動請求續傳
+        // 續傳協商：若身為接收端且有未完成檔案，重整 Offset、重建 Worker 並主動請求續傳
         if (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) {
             recvQueue = [];
             inFlightBytes = 0;
             currentOffset = state.receivedSize;
-            console.log(`[續傳協商] 接收端向發送端請求從 Offset ${state.receivedSize} 續傳`);
+
+            document.getElementById('incoming-file-box')?.classList.remove('hidden');
+            const recvFileName = document.getElementById('recv-file-name');
+            if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
+            updateRecvUi();
+
+            console.log(`[續傳協商] 接收端重新建立 OPFS Worker (續傳模式) 並請求從 Offset ${state.receivedSize} 續傳`);
+            createOPFSWorker(true);
+
             state.dataChannel.send(JSON.stringify({
                 type: 'resume-request',
                 name: state.incomingFileInfo.name,
@@ -878,11 +987,13 @@ export async function handleIncomingData(data) {
             // 接收端收到續傳確認
             if (message.type === 'resume-ack') {
                 console.log(`[接收端] 發送端確認續傳 Offset: ${message.startOffset}`);
-                recvQueue = [];
-                inFlightBytes = 0;
                 currentOffset = message.startOffset;
-                isWorkerReady = true;
-                drainRecvQueue();
+                // 若 Worker 尚未建立 (兜底防護)，則立即建立
+                if (!opfsWorker) {
+                    createOPFSWorker(true);
+                } else if (isWorkerReady) {
+                    drainRecvQueue();
+                }
                 return;
             }
 
@@ -908,104 +1019,14 @@ export async function handleIncomingData(data) {
                 state.incomingFileInfo = { name: message.name, size: message.size };
                 state.lastRecvUiTime = 0;
                 recvQueue = [];
-                isWorkerReady = false;
-                fileEndPending = false;
-                isFinishSent = false;
                 inFlightBytes = 0;
 
                 console.log(`[接收端] 收到檔案資訊: 檔名="${message.name}", 總大小=${(message.size / (1024 * 1024)).toFixed(2)} MB, 目前進度=${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB`);
 
-                if (!opfsWorker) {
-                    try {
-                        opfsWorker = new Worker('./opfs-worker.js');
-                    } catch (err) {
-                        console.error('[接收端] 建立 OPFS Worker 失敗:', err);
-                        showToast('無法建立 OPFS Worker: ' + err.message, 'error');
-                        releaseWakeLock();
-                        return;
-                    }
+                const isResume = state.receivedSize > 0;
+                createOPFSWorker(isResume);
 
-                    opfsWorker.onmessage = (e) => {
-                        const msg = e.data;
-                        if (!msg) return;
-
-                        if (msg.type === 'init-success') {
-                            console.log('[接收端] OPFS Worker 就緒');
-                            isWorkerReady = true;
-                            drainRecvQueue();
-                        }
-                        else if (msg.type === 'write-ack') {
-                            workerAckCount++;
-                            const writtenSize = msg.size || 0;
-                            inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
-                            state.receivedSize += writtenSize;
-                            lastActivityTime = Date.now();
-
-                            // 超過累積限制立即觸發 ACK 發送
-                            if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
-                                flushCumulativeAck();
-                            }
-
-                            updateRecvUi();
-                            drainRecvQueue();
-                        }
-                        else if (msg.type === 'finish-success') {
-                            releaseWakeLock();
-                            flushCumulativeAck();
-
-                            const { file, filename, tempFilename } = msg;
-                            const fileToDelete = tempFilename || currentTempFilename;
-                            const blobUrl = URL.createObjectURL(file);
-
-                            console.log(`[接收端 傳輸完成] 檔案大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
-
-                            cleanupOPFSWorker(true, false);
-
-                            const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
-                            if (typeof triggerAutoDownload === 'function') {
-                                triggerAutoDownload(blobUrl, filename, actualFileSize);
-                            }
-
-                            const recvPercent = document.getElementById('recv-percent');
-                            const recvProgressBar = document.getElementById('recv-progress-bar');
-                            if (recvPercent) recvPercent.innerText = '100% (完成)';
-                            if (recvProgressBar) recvProgressBar.style.width = '100%';
-                            showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
-
-                            setTimeout(async () => {
-                                URL.revokeObjectURL(blobUrl);
-                                if (fileToDelete) {
-                                    await removeOPFSFile(fileToDelete);
-                                }
-                            }, 15000);
-                        }
-                        else if (msg.type === 'error') {
-                            releaseWakeLock();
-                            console.error('[接收端] Worker 錯誤:', msg.message);
-                            handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
-                        }
-                    };
-
-                    opfsWorker.onerror = (err) => {
-                        releaseWakeLock();
-                        console.error('[接收端 OPFS Worker 異常]:', err);
-                        handlePeerDisconnection('OPFS Worker 內部錯誤', true);
-                    };
-
-                    // 當已有已接收進度時，初始化為 'init-resume' 模式以防覆蓋暂存檔 (Bug 4)
-                    opfsWorker.postMessage({
-                        type: state.receivedSize > 0 ? 'init-resume' : 'init',
-                        downloadId: currentDownloadId,
-                        tempFilename: currentTempFilename,
-                        filename: message.name,
-                        size: message.size
-                    });
-                } else {
-                    isWorkerReady = true;
-                    drainRecvQueue();
-                }
-
-                if (state.receivedSize > 0) {
+                if (isResume) {
                     state.dataChannel.send(JSON.stringify({
                         type: 'resume-request',
                         name: message.name,
@@ -1016,6 +1037,7 @@ export async function handleIncomingData(data) {
                 document.getElementById('incoming-file-box')?.classList.remove('hidden');
                 const recvFileName = document.getElementById('recv-file-name');
                 if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
+                updateRecvUi();
 
             } else if (message.type === 'file-end') {
                 console.log(`[接收端] 收到 file-end 信號 (已收 ${recvPacketCount} 包, 寫入 ${workerAckCount} 次)`);

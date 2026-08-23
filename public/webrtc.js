@@ -16,16 +16,17 @@ let recvQueue = [];
 let isWorkerReady = false;
 let fileEndPending = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 8 * 1024 * 1024; // 8MB 接收並發窗口
+const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 256 * 1024; // 256KB 累積緩存低水位
+const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 1MB 累積緩存低水位
+const BUFFERED_HIGH_THRESHOLD = 4 * 1024 * 1024; // 4MB 累積緩存高水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
 let ackFlushTimer = null;
-const BATCH_ACK_INTERVAL = 128 * 1024; // 每累積寫入 128KB (2個 chunk) 即發送一次確認
+const BATCH_ACK_INTERVAL = 2 * 1024 * 1024; // 每累積寫入 2MB 即發送一次確認
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -919,16 +920,14 @@ function drainRecvQueue() {
         }
     }
 
-    // 雜湊式即時 ACK 旁路：inFlight 滿載時立即發送 ACK (Bug 2)
     if (inFlightBytes >= MAX_IN_FLIGHT_BYTES) {
         flushCumulativeAck();
     }
 
-    if (recvQueue.length > 30) {
+    if (recvQueue.length > 100) {
         console.warn(`[接收端 佇列積壓] 隊列待處理封包: ${recvQueue.length} 個 | Worker 寫入中記憶體 (inFlight): ${(inFlightBytes / 1024).toFixed(1)} KB`);
     }
 
-    // 雙重判定：收到 file-end 訊號 或是 接收位元組數已完全達標，且 Worker 均已寫入落盤完畢
     const isTotalReceived = state.incomingFileInfo && state.receivedSize >= state.incomingFileInfo.size;
     if ((fileEndPending || isTotalReceived) && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
         console.log(`[接收端 準備收尾] 總接收已達標 (${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB)，通知 Worker 執行 Finish...`);
@@ -1069,7 +1068,7 @@ export function evaluateFileRouting(file) {
 }
 
 /**
- * 發送檔案分塊 (更新：支援從指定 Offset 斷點續傳，並於中斷時自動暫停等待重連)
+ * 發送檔案分塊 (高效雙水位管線 + 2MB 預讀塊極速重構版)
  * @param {number|null} startOffset 指定開始傳輸的 Offset (續傳使用)
  */
 export async function sendFileChunks(startOffset = null) {
@@ -1110,7 +1109,8 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const chunkSize = 64 * 1024;
+    const CHUNK_SIZE = 64 * 1024;        // 64KB SCTP 最優傳輸封包
+    const BLOCK_SIZE = 2 * 1024 * 1024;  // 2MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
 
     let lastUiUpdateTime = 0;
@@ -1134,7 +1134,6 @@ export async function sendFileChunks(startOffset = null) {
         const totalSize = state.selectedFile.size;
 
         while (offset < totalSize) {
-            // 檢查 Session 是否已被新連線覆蓋，若是則立即退出
             if (mySessionId !== currentTransferSessionId) {
                 console.warn(`[發送端] Session #${mySessionId} 已過期，由新 Session 接手，退出迴圈`);
                 return;
@@ -1146,85 +1145,102 @@ export async function sendFileChunks(startOffset = null) {
                 return;
             }
 
-            // 背壓等待與停滯偵測 (Bug 1)
-            let stagnationCount = 0;
-            let lastBufferedAmount = state.dataChannel.bufferedAmount;
+            // 批次從磁碟讀取 2MB 大區塊至記憶體
+            const blockEnd = Math.min(offset + BLOCK_SIZE, totalSize);
+            const blockSlice = state.selectedFile.slice(offset, blockEnd);
+            const blockBuffer = await blockSlice.arrayBuffer();
 
-            while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
-                await new Promise((resolve) => {
-                    bufferLowResolver = resolve;
-                    setTimeout(() => {
-                        if (bufferLowResolver === resolve) {
-                            bufferLowResolver = null;
-                            resolve();
-                        }
-                    }, 500); // 延長至 500ms，消除空轉假醒 (Bug 1)
-                });
+            let blockOffset = 0;
+            const blockLength = blockBuffer.byteLength;
 
+            // 在記憶體中連續切分 64KB 快速發送
+            while (blockOffset < blockLength) {
                 if (mySessionId !== currentTransferSessionId) return;
 
                 if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
-                    console.warn(`[發送端 背壓等待時中斷] 傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB`);
+                    console.warn(`[發送端 中斷暫停] 通道中斷，傳輸停在 ${(offset / (1024 * 1024)).toFixed(2)} MB`);
                     isSendingInProgress = false;
                     return;
                 }
 
-                // 背壓停滯檢查：若緩衝量不降，判定為通道卡死，主動觸發斷開重新續傳
-                const currentBuffered = state.dataChannel.bufferedAmount;
-                if (currentBuffered >= lastBufferedAmount) {
-                    stagnationCount++;
-                    if (stagnationCount >= 10) { // 10 次輪詢 (約 5 秒) 進度無任何消化
-                        console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
-                        handlePeerDisconnection('發送背壓停滯超時', false);
-                        return;
+                // 雙水位背壓控制：緩存超過 4MB (High Watermark) 時才等待其降回 1MB (Low Watermark)
+                if (state.dataChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
+                    let stagnationCount = 0;
+                    let lastBufferedAmount = state.dataChannel.bufferedAmount;
+
+                    while (state.dataChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
+                        await new Promise((resolve) => {
+                            bufferLowResolver = resolve;
+                            setTimeout(() => {
+                                if (bufferLowResolver === resolve) {
+                                    bufferLowResolver = null;
+                                    resolve();
+                                }
+                            }, 250);
+                        });
+
+                        if (mySessionId !== currentTransferSessionId) return;
+
+                        if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                            isSendingInProgress = false;
+                            return;
+                        }
+
+                        const currentBuffered = state.dataChannel.bufferedAmount;
+                        if (currentBuffered >= lastBufferedAmount) {
+                            stagnationCount++;
+                            if (stagnationCount >= 20) { // 約 5 秒無任何消化
+                                console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
+                                handlePeerDisconnection('發送背壓停滯超時', false);
+                                return;
+                            }
+                        } else {
+                            stagnationCount = 0;
+                            lastBufferedAmount = currentBuffered;
+                        }
                     }
-                } else {
-                    stagnationCount = 0;
-                    lastBufferedAmount = currentBuffered;
                 }
-            }
 
-            const nextOffset = Math.min(offset + chunkSize, totalSize);
-            const slice = state.selectedFile.slice(offset, nextOffset);
-            const chunkBuffer = await slice.arrayBuffer();
+                const nextBlockOffset = Math.min(blockOffset + CHUNK_SIZE, blockLength);
+                const chunkBuffer = blockBuffer.slice(blockOffset, nextBlockOffset);
 
-            if (mySessionId !== currentTransferSessionId) return;
+                state.dataChannel.send(chunkBuffer);
+                lastActivityTime = Date.now();
 
-            state.dataChannel.send(chunkBuffer);
-            lastActivityTime = Date.now();
+                const bytesSent = chunkBuffer.byteLength;
+                blockOffset += bytesSent;
+                offset += bytesSent;
+                totalSent = offset;
 
-            const bytesSent = chunkBuffer.byteLength;
-            offset += bytesSent;
-            totalSent = offset;
+                const now = performance.now();
+                if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
+                    lastUiUpdateTime = now;
 
-            const now = performance.now();
-            if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
-                lastUiUpdateTime = now;
+                    const percent = Math.min(100, Math.round((totalSent / totalSize) * 100));
+                    const progPercent = document.getElementById('progress-percent');
+                    const progBar = document.getElementById('progress-bar');
+                    if (progPercent) progPercent.innerText = `${percent}%`;
+                    if (progBar) progBar.style.width = `${percent}%`;
 
-                const percent = Math.min(100, Math.round((totalSent / totalSize) * 100));
-                const progPercent = document.getElementById('progress-percent');
-                const progBar = document.getElementById('progress-bar');
-                if (progPercent) progPercent.innerText = `${percent}%`;
-                if (progBar) progBar.style.width = `${percent}%`;
+                    const speedElapsed = (now - lastSpeedTime) / 1000;
+                    if (speedElapsed > 0) {
+                        const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
+                        smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                        lastSpeedBytes = totalSent;
+                        lastSpeedTime = now;
 
-                const speedElapsed = (now - lastSpeedTime) / 1000;
-                if (speedElapsed > 0) {
-                    const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                    smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
-                    lastSpeedBytes = totalSent;
-                    lastSpeedTime = now;
+                        const speedText = document.getElementById('transfer-speed');
+                        if (speedText) {
+                            speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                        }
 
-                    const speedText = document.getElementById('transfer-speed');
-                    if (speedText) {
-                        speedText.innerText = `${(smoothSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
-                    }
+                        const remainingBytes = Math.max(0, totalSize - totalSent);
+                        const etaSeconds = remainingBytes / smoothSpeed;
 
-                    const remainingBytes = Math.max(0, totalSize - totalSent);
-                    const etaSeconds = remainingBytes / smoothSpeed;
-
-                    const timeText = document.getElementById('transfer-time');
-                    if (timeText) {
-                        timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                        const timeText = document.getElementById('transfer-time');
+                        if (timeText) {
+                            timeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                        }
                     }
                 }
             }
