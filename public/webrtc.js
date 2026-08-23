@@ -1109,8 +1109,8 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const CHUNK_SIZE = 64 * 1024;        // 64KB SCTP 最優傳輸封包
-    const BLOCK_SIZE = 8 * 1024 * 1024;  // 8MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
+    const CHUNK_SIZE = 256 * 1024;        // 64KB SCTP 最優傳輸封包
+    const BLOCK_SIZE = 12 * 1024 * 1024;  // 12MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
 
     let lastUiUpdateTime = 0;
