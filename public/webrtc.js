@@ -20,8 +20,8 @@ const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 8 * 1024 * 1024; // 8MB 累積緩存低水位
-const BUFFERED_HIGH_THRESHOLD = 32 * 1024 * 1024; // 32MB 累積緩存高水位
+const BUFFERED_LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 累積緩存低水位
+const BUFFERED_HIGH_THRESHOLD = 12 * 1024 * 1024; // 12MB 累積緩存高水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
