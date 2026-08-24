@@ -34,9 +34,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (rId) {
         state.roomId = rId;
         state.isHost = false;
-        initJoinerWithRoom();
+        initJoinerWithRoom(rId);
     } else {
-        // 🚀【自動對齊觸發】：若無 URL 參數，立刻執行背景 1 秒內無感自動對接
         autoCheckNearbyRooms();
     }
 
