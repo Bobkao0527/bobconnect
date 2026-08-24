@@ -1175,8 +1175,9 @@ export async function sendFileChunks(startOffset = null) {
         return;
     }
 
-    if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+    if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
         console.warn('[發送端] 通道尚未就緒，等待連線建立...');
+        showToast('通道尚未建立，請確認 P2P 連線狀態', 'warning');
         return;
     }
 
