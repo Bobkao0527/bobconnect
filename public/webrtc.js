@@ -3,7 +3,19 @@
  */
 import { state } from './state.js';
 import { showToast, triggerAutoDownload, acquireWakeLock, releaseWakeLock } from './ui.js';
-import { handlePeerDisconnection } from './rtc-channel.js';
+
+let onPeerDisconnectCallback = null;
+export function setPeerDisconnectHandler(handler) {
+    onPeerDisconnectCallback = handler;
+}
+
+function notifyDisconnect(reason, isFatal = false) {
+    if (typeof onPeerDisconnectCallback === 'function') {
+        onPeerDisconnectCallback(reason, isFatal);
+    } else {
+        console.error('[WebRTC] 斷線處理器未註冊:', reason);
+    }
+}
 
 let currentDownloadId = null;
 let currentTempFilename = null;
@@ -145,14 +157,14 @@ export function createOPFSWorker(isResume = false) {
         else if (msg.type === 'error') {
             releaseWakeLock();
             console.error('[接收端] Worker 錯誤:', msg.message);
-            handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
+            notifyDisconnect('接收端寫入錯誤: ' + msg.message, true);
         }
     };
 
     opfsWorker.onerror = (err) => {
         releaseWakeLock();
         console.error('[接收端 OPFS Worker 異常]:', err);
-        handlePeerDisconnection('OPFS Worker 內部錯誤', true);
+        notifyDisconnect('OPFS Worker 內部錯誤', true);
     };
 
     opfsWorker.postMessage({
@@ -444,7 +456,7 @@ export async function sendFileChunks(startOffset = null) {
             while (blockOffset < blockLength) {
                 if (mySessionId !== currentTransferSessionId) return;
 
-                if (!state.dataChannel || state.dataChannel.readyState !== 'open') {
+                if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                     isSendingInProgress = false;
                     return;
                 }
@@ -562,7 +574,7 @@ export async function sendFileChunks(startOffset = null) {
         if (mySessionId === currentTransferSessionId) {
             console.error('[發送端 異常]:', e);
             isSendingInProgress = false;
-            handlePeerDisconnection('傳輸中斷: ' + e.message, false);
+            notifyDisconnect('傳輸中斷: ' + e.message, false);
         }
     } finally {
         if (mySessionId === currentTransferSessionId) {

@@ -3,7 +3,7 @@
  */
 import { state, getWorkerUrl } from './state.js';
 import { showToast, updateStatus, generateQRCode, triggerAppleGlow, acquireWakeLock, releaseWakeLock } from './ui.js';
-import { handleIncomingData, createOPFSWorker, cleanupOPFSWorker, updateRecvUi, resetTransferState } from './webrtc.js';
+import { handleIncomingData, createOPFSWorker, cleanupOPFSWorker, updateRecvUi, resetTransferState, setPeerDisconnectHandler } from './webrtc.js';
 
 let localCandidates = [];
 let pendingCandidates = [];
@@ -87,6 +87,8 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     state.receivedSize = 0;
     isReconnecting = false;
 }
+
+setPeerDisconnectHandler(handlePeerDisconnection);
 
 /**
  * 自動重連控制器
@@ -432,7 +434,7 @@ export async function restartSignalingAndPeerConnection() {
 }
 
 /**
- * 設定檔案傳輸通道 (fileChannel) 監聽
+ * 設定控制通道 (controlChannel) 監聽
  */
 export function setupControlChannelListeners() {
     if (!state.controlChannel) return;
@@ -578,7 +580,7 @@ function startTransportMonitor() {
 
     transportMonitorTimer = setInterval(async () => {
         const pc = state.peerConnection;
-        const dc = state.dataChannel;
+        const dc = state.fileChannel;
         if (!pc) return;
 
         try {
