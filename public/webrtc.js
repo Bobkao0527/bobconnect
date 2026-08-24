@@ -8,6 +8,7 @@ let currentDownloadId = null;
 let currentTempFilename = null; // 記錄當前正在接收的暫存檔名
 let opfsWorker = null;
 let currentOffset = 0;
+let signalingQueue = Promise.resolve();
 
 let localCandidates = [];
 let pendingCandidates = [];
@@ -62,6 +63,40 @@ async function removeOPFSFile(filename) {
     } catch (e) {
         // 檔案若已刪除或不存在則忽略
     }
+}
+
+function handleSignalingMessage(data) {
+    signalingQueue = signalingQueue.then(async () => {
+        try {
+            if (data.type === 'offer' && !state.isHost) {
+                updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
+                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                await processPendingCandidates();
+
+                const answer = await state.peerConnection.createAnswer();
+                await state.peerConnection.setLocalDescription(answer);
+
+                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify({ type: 'answer', answer, roomId: state.roomId }));
+                }
+            }
+            else if (data.type === 'answer' && state.isHost) {
+                updateStatus('成功對齊傳輸描述，建立直連中！', 'yellow');
+                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+                await processPendingCandidates();
+                showToast('對齊成功，極速握手中...', 'success');
+            }
+            else if (data.type === 'candidate' && state.peerConnection) {
+                if (state.peerConnection.remoteDescription && state.peerConnection.remoteDescription.type) {
+                    await state.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                } else {
+                    pendingCandidates.push(data.candidate);
+                }
+            }
+        } catch (err) {
+            console.error("[DO WebSocket 訊息處理失敗]:", err);
+        }
+    });
 }
 
 // 接收端發送累積確認 (Cumulative ACK)
@@ -686,34 +721,9 @@ function connectSignalingWS() {
     state.ws.onmessage = async (event) => {
         try {
             const data = JSON.parse(event.data);
-
-            if (data.type === 'offer' && !state.isHost) {
-                updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
-                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
-                await processPendingCandidates();
-
-                const answer = await state.peerConnection.createAnswer();
-                await state.peerConnection.setLocalDescription(answer);
-
-                if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-                    state.ws.send(JSON.stringify({ type: 'answer', answer, roomId: state.roomId }));
-                }
-            }
-            else if (data.type === 'answer' && state.isHost) {
-                updateStatus('成功對齊傳輸描述，建立直連中！', 'yellow');
-                await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
-                await processPendingCandidates();
-                showToast('對齊成功，極速握手中...', 'success');
-            }
-            else if (data.type === 'candidate' && state.peerConnection) {
-                if (state.peerConnection.remoteDescription) {
-                    await state.peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-                } else {
-                    pendingCandidates.push(data.candidate);
-                }
-            }
-        } catch (err) {
-            console.error("[DO WebSocket 訊息解析失敗]:", err);
+            handleSignalingMessage(data);
+        } catch (e) {
+            console.error("解析 JSON 失敗:", e);
         }
     };
 

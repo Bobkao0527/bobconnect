@@ -117,17 +117,30 @@ export class SignalRoom {
         
         if (roomId) {
           const existingMeta = ws.deserializeAttachment() || {};
-          ws.serializeAttachment({
+          const updatedMeta = {
             ...existingMeta,
             roomId: roomId,
             ipKey: ipKey,
             offer: data.offer,
-            candidates: existingMeta.candidates || [], // 保留或初始化 candidates 陣列
+            candidates: existingMeta.candidates || [],
             timestamp: Date.now()
-          });
-        }
+          };
+          ws.serializeAttachment(updatedMeta);
 
-        this.broadcast(ws, data);
+          // 🚀 廣播 Offer 給對端
+          this.broadcast(ws, data);
+
+          // 🚀 若在發送 Offer 前已有快取的 Candidates，一併補發給 Joiner
+          if (updatedMeta.candidates.length > 0) {
+            for (const cand of updatedMeta.candidates) {
+              this.broadcast(ws, {
+                type: "candidate",
+                candidate: cand,
+                roomId: roomId
+              });
+            }
+          }
+        }
       } else if (data.type === "candidate") {
         // 🚀 將接收到的 Candidate 寫入該 WebSocket 的 Attachment 快取中
         try {
