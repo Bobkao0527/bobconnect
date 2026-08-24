@@ -1,13 +1,15 @@
 /**
  * app.js - 模組進入點
+ * 綁定檔案拖曳 UI 事件，並將 initHost、startJoinerScanner 等模組化函式
+ * 掛載至全域 window，確保與 HTML 中的 inline onclick 屬性 100% 相容。
+ * 🚀【智慧自動對齊優化】：若網址沒有帶房間號參數，自動向背景探測同 IP 下 60s 內房間並自動連線！
  */
 import { state } from './state.js';
 import { checkInAppBrowser, hideToast } from './ui.js';
-import { initHost, initJoinerWithRoom, probeIPv4 } from './rtc-channel.js';
-import { sendFileChunks, evaluateFileRouting, clearEntireOPFS } from './webrtc.js';
-import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms, switchPairingTab, scanNearbyRooms } from './scanner.js';
+import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4, clearEntireOPFS } from './webrtc.js';
+import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
 
-// 全域暴露機制 (供 HTML onclick 觸發)
+// 全域暴露機制
 window.initHost = initHost;
 window.initJoinerWithRoom = initJoinerWithRoom;
 window.startJoinerScanner = startScanner;
@@ -16,27 +18,32 @@ window.openPairingModal = openPairingModal;
 window.closePairingModal = closePairingModal;
 window.sendFileChunks = sendFileChunks;
 window.hideToast = hideToast;
-window.switchPairingTab = switchPairingTab;
-window.scanNearbyRooms = scanNearbyRooms;
 
 // 頁面初始化
 window.addEventListener('DOMContentLoaded', async () => {
-    checkInAppBrowser();
+    checkInAppBrowser(); // 檢查內嵌瀏覽器防暴走
 
+    // 🚀【強制 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配
+    // await 探針以確保下一步自動探測時能夾帶最穩定的 IP 金鑰
     await probeIPv4();
     clearEntireOPFS();
 
+    // 解析路徑自動加入
     const urlParams = new URLSearchParams(window.location.search);
     const rId = urlParams.get('room');
     if (rId) {
         state.roomId = rId;
         state.isHost = false;
-        initJoinerWithRoom(rId); // 修正：傳入 rId
+        initJoinerWithRoom();
     } else {
+        // 🚀【自動對齊觸發】：若無 URL 參數，立刻執行背景 1 秒內無感自動對接
         autoCheckNearbyRooms();
     }
 
+    // 拖曳區事件註冊
     setupDragAndDrop();
+
+    // 初始化 PIN 碼多欄位輸入傾聽器
     setupPinInputs();
 });
 
