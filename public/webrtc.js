@@ -25,6 +25,10 @@ const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 累積緩存低水位
 const BUFFERED_HIGH_THRESHOLD = 2 * 1024 * 1024; // 2MB 累積緩存高水位
 const MAX_UNACKED_WINDOW_BYTES = 8 * 1024 * 1024; // 8MB 發送端限制水位
 
+const BACKPRESSURE_SAMPLE_INTERVAL_MS = 100;
+const BACKPRESSURE_RECOVERY_DELAY_MS = 3000;
+const BACKPRESSURE_HARD_TIMEOUT_MS = 3000;
+
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
 let ackFlushTimer = null;
@@ -130,25 +134,34 @@ function flushCumulativeAck() {
  * @param {boolean} isFatal 是否為致命斷線 (如對端主動離線/使用者手動取消)
  */
 export function handlePeerDisconnection(reason = '連線已斷開', isFatal = false) {
-    if (isDisconnectHandled && !isFatal) return;
+    if (isDisconnectHandled) {
+        console.warn(`[連線中斷忽略重複觸發]: ${reason}`);
+        return;
+    }
+
+    isDisconnectHandled = true;
 
     console.warn(`[連線中斷觸發]: ${reason} (isFatal=${isFatal})`);
+
     stopHeartbeatAndWatchdog();
     stopTransportMonitor();
 
-    // 【修改】：同時釋放兩條 DataChannel
+    // 同時釋放兩條 DataChannel
     if (state.fileChannel) {
         try { state.fileChannel.close(); } catch (e) { }
         state.fileChannel = null;
     }
+
     if (state.stateChannel) {
         try { state.stateChannel.close(); } catch (e) { }
         state.stateChannel = null;
     }
+
     if (state.peerConnection) {
         try { state.peerConnection.close(); } catch (e) { }
         state.peerConnection = null;
     }
+
     if (state.ws) {
         try { state.ws.close(); } catch (e) { }
         state.ws = null;
@@ -165,19 +178,20 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     currentTransferSessionId++;
     isSendingInProgress = false;
 
-    // 清空接收端尚未寫入的隊列，防止續傳時舊 chunk 錯位寫入
+    // 清空接收端尚未寫入的隊列
     recvQueue = [];
     inFlightBytes = 0;
-
     // 僅在有未完成傳輸任務時啟動自動重連，避免傳輸完成後因對端離線觸發無效重試
     const isReceivingIncomplete = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
     const isSendingIncomplete = state.selectedFile && totalSent < state.selectedFile.size;
     const hasActiveSession = Boolean(state.roomId && (isReceivingIncomplete || isSendingIncomplete));
 
     if (!isFatal && hasActiveSession) {
-        cleanupOPFSWorker(false, false); // 非致命中斷：終止 Worker，但保留暫存檔案 (Bug 5)
-        isReconnecting = false; // 重設標記以允許進入重試邏輯
-        attemptReconnection(reason);
+        cleanupOPFSWorker(false, false);
+        // 只允許這一次 handlePeerDisconnection() 啟動重連。
+        if (!isReconnecting) {
+            attemptReconnection(reason);
+        }
         return;
     }
 
@@ -935,11 +949,27 @@ export function setupFileChannelListeners() {
     };
 
     state.fileChannel.onclose = () => {
-        console.warn('[fileChannel] 檔案通道異常關閉，嘗試經由 stateChannel 發起通道內快速重連...');
+        if (isDisconnectHandled) {
+        console.log('[fileChannel] 已知是主動清理，不再觸發重連');
+        return;
+    }
+    console.warn('[fileChannel] 檔案通道已關閉');
+    const controlAlive = state.stateChannel?.readyState === 'open';
+
+    if (controlAlive) {
+        console.log('[fileChannel] stateChannel 仍存活，嘗試 In-Band 修復');
         triggerInBandRenegotiation();
-    };
+    } else {
+        console.warn('[fileChannel] stateChannel 也不可用，進入完整重連');
+        handlePeerDisconnection('檔案通道與控制通道皆不可用',false);
+    }
+};
 
     state.fileChannel.onerror = (err) => {
+        if (isDisconnectHandled) {
+            console.log('[fileChannel] 已知是主動清理，忽略 error');
+            return;
+        }
         console.error('[fileChannel 異常]:', err);
         triggerInBandRenegotiation();
     };
@@ -954,35 +984,73 @@ export function setupFileChannelListeners() {
 /**
  * 免經過 DO 信令伺服器的「通道內極速重新握手 (In-Band Renegotiation)」
  */
+let isInBandRenegotiating = false;
 export async function triggerInBandRenegotiation() {
-    if (!state.stateChannel || state.stateChannel.readyState !== 'open') {
-        console.warn('[In-Band 重連] stateChannel 已無法使用，降級回傳統 DO 信令重連');
-        handlePeerDisconnection('傳輸通道中斷且無法進行內部重連', false);
+     if (isInBandRenegotiating) {
+        console.warn('[In-Band 重連] 已有一個修復流程進行中，忽略重複請求');
         return;
     }
+    if (
+        !state.stateChannel ||
+        state.stateChannel.readyState !== 'open'
+    ) {
+        console.warn(
+            '[In-Band 重連] stateChannel 已無法使用，降級回傳統 DO 信令重連'
+        );
+        handlePeerDisconnection(
+            '傳輸通道中斷且無法進行內部重連',
+            false
+        );
+        return;
+    }
+    isInBandRenegotiating = true;
 
     try {
-        console.log('[In-Band 重連] 透過 stateChannel 發起內部 WebRTC ICE Restart...');
-        showToast('檔案通道異常，正在進行通道內快速修復...', 'warning');
-
-        // 由 Host 端發起新的 Offer
+        console.log(
+            '[In-Band 重連] 透過 stateChannel 發起內部 WebRTC ICE Restart...'
+        );
+        showToast(
+            '檔案通道異常，正在進行通道內快速修復...',
+            'warning'
+        );
         if (state.isHost) {
-            if (typeof state.peerConnection.restartIce === 'function') {
+            if (
+                typeof state.peerConnection?.restartIce === 'function'
+            ) {
                 state.peerConnection.restartIce();
             }
-            const offer = await state.peerConnection.createOffer({ iceRestart: true });
-            await state.peerConnection.setLocalDescription(offer);
+            const offer =
+                await state.peerConnection.createOffer({
+                    iceRestart: true
+                });
 
-            state.stateChannel.send(JSON.stringify({
-                type: 'inband-offer',
-                offer: offer
-            }));
+            await state.peerConnection.setLocalDescription(
+                offer
+            );
+            state.stateChannel.send(
+                JSON.stringify({
+                    type: 'inband-offer',
+                    offer: state.peerConnection.localDescription
+                })
+            );
         } else {
-            state.stateChannel.send(JSON.stringify({ type: 'inband-request-reconnect' }));
+            state.stateChannel.send(
+                JSON.stringify({
+                    type: 'inband-request-reconnect'
+                })
+            );
         }
     } catch (err) {
-        console.error('[In-Band 重連失敗]:', err);
-        handlePeerDisconnection('內部快速重連失敗', false);
+        console.error(
+            '[In-Band 重連失敗]:',
+            err
+        );
+        handlePeerDisconnection(
+            '內部快速重連失敗',
+            false
+        );
+    } finally {
+        isInBandRenegotiating = false;
     }
 }
 
@@ -1251,8 +1319,11 @@ export async function sendFileChunks(startOffset = null) {
     const CHUNK_SIZE = 16 * 1024; // 16KB SCTP 傳輸封包
     const BLOCK_SIZE = 2 * 1024 * 1024; // 2MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
-    let stagnationCount = 0;
-    let lastBufferedAmount = 0;
+    let backpressureStallStartedAt = 0;
+    let lastBackpressureBuffered = 0;
+    let lastBackpressureAck = lastConfirmedAckOffset;
+    let recoveryRequested = false;
+    let recoveryStartedAt = 0;
 
     let lastUiUpdateTime = 0;
     let lastSpeedTime = performance.now();
@@ -1329,6 +1400,23 @@ export async function sendFileChunks(startOffset = null) {
 
                 // 雙水位背壓控制：緩存超過高水位 (BUFFERED_HIGH_THRESHOLD) 時等待降回低水位 (BUFFERED_LOW_THRESHOLD)
                 if (state.fileChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
+                    if (backpressureStallStartedAt === 0) {
+                        backpressureStallStartedAt = performance.now();
+                        lastBackpressureBuffered = state.fileChannel.bufferedAmount;
+                        lastBackpressureAck = lastConfirmedAckOffset;
+
+                        console.log('[發送端] 進入 DataChannel 背壓等待', {
+                            offset,
+                            totalSent,
+                            bufferedAmount: state.fileChannel.bufferedAmount,
+                            bufferedMB: (
+                                state.fileChannel.bufferedAmount / (1024 * 1024)
+                            ).toFixed(2),
+                            lastConfirmedAckOffset,
+                            unackedBytes: offset - lastConfirmedAckOffset
+                        });
+                    }
+
                     while (state.fileChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                         await new Promise((resolve) => {
                             bufferLowResolver = resolve;
@@ -1337,57 +1425,144 @@ export async function sendFileChunks(startOffset = null) {
                                     bufferLowResolver = null;
                                     resolve();
                                 }
-                            }, 30);
+                            }, BACKPRESSURE_SAMPLE_INTERVAL_MS);
                         });
-
-                        if (mySessionId !== currentTransferSessionId) return;
-
+                        if (mySessionId !== currentTransferSessionId) {
+                            return;
+                        }
                         if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                             isSendingInProgress = false;
                             return;
                         }
-
+                        const now = performance.now();
                         const currentBuffered = state.fileChannel.bufferedAmount;
-                        console.log('[SEND BACKPRESSURE]', {
-                            offset,
-                            totalSent,
-                            lastConfirmedAckOffset,
-                            unackedBytes: offset - lastConfirmedAckOffset,
+                        const currentAck = lastConfirmedAckOffset;
+                        const bufferedChanged =
+                            currentBuffered !== lastBackpressureBuffered;
+                        const ackChanged =
+                            currentAck !== lastBackpressureAck;
+                        if (bufferedChanged || ackChanged) {
+                            console.log('[發送端] 背壓仍有進度', {
+                                offset,
+                                totalSent,
 
-                            currentBuffered,
-                            currentBufferedMB: (currentBuffered / (1024 * 1024)).toFixed(2),
+                                oldBuffered: lastBackpressureBuffered,
+                                newBuffered: currentBuffered,
 
-                            lastBufferedAmount,
-                            lastBufferedMB: (lastBufferedAmount / (1024 * 1024)).toFixed(2),
+                                oldAck: lastBackpressureAck,
+                                newAck: currentAck,
 
-                            stagnationCount,
-                            dcState: state.fileChannel.readyState,
-                            pcState: state.peerConnection?.connectionState,
-                            iceState: state.peerConnection?.iceConnectionState
-                        });
-                        if (currentBuffered >= lastBufferedAmount && lastBufferedAmount > 0) {
-                            stagnationCount++;
-                            if (stagnationCount >= 100) { 
-                                console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
-                                console.error('[發送端] 卡死當下完整狀態:', {
-                                    offset,
-                                    totalSent,
-                                    lastConfirmedAckOffset,
-                                    unackedBytes: offset - lastConfirmedAckOffset,
-                                    bufferedAmount: currentBuffered,
-                                    stagnationCount,
-                                    dcState: state.fileChannel?.readyState,
-                                    pcState: state.peerConnection?.connectionState,
-                                    iceState: state.peerConnection?.iceConnectionState
-                                });
-                                handlePeerDisconnection('發送背壓停滯超時', false);
+                                ackAdvance: currentAck - lastBackpressureAck
+                            });
+                            // 有任何進度就重新計時
+                            backpressureStallStartedAt = now;
+                            // 一旦恢復進度，下次真的 stall 時可以再次嘗試 In-Band recovery
+                            recoveryRequested = false;
+                            recoveryStartedAt = 0;
+
+                            lastBackpressureBuffered = currentBuffered;
+                            lastBackpressureAck = currentAck;
+                        } else {
+                            const stallDuration =
+                                now - backpressureStallStartedAt;
+                            if (
+                                !recoveryRequested &&
+                                stallDuration >= BACKPRESSURE_RECOVERY_DELAY_MS
+                            ) {
+                                const pcState =
+                                    state.peerConnection?.connectionState;
+                                const iceState =
+                                    state.peerConnection?.iceConnectionState;
+                                const controlOpen =
+                                    state.stateChannel?.readyState === 'open';
+                                console.warn(
+                                    '[發送端] fileChannel 疑似真正停滯，先嘗試 In-Band 修復',
+                                    {
+                                        stallDurationMs: Math.round(stallDuration),
+                                        offset,
+                                        totalSent,
+                                        bufferedAmount: currentBuffered,
+                                        bufferedMB: (
+                                            currentBuffered / (1024 * 1024)
+                                        ).toFixed(2),
+                                        lastConfirmedAckOffset,
+                                        unackedBytes:
+                                            offset - lastConfirmedAckOffset,
+                                        pcState,
+                                        iceState,
+                                        controlOpen
+                                    }
+                                );
+
+                                recoveryRequested = true;
+                                recoveryStartedAt = now;
+
+                                // stateChannel 還活著：
+                                // 優先走 In-Band ICE restart，不要立即關掉整個 PeerConnection。
+                                if (
+                                    controlOpen &&
+                                    pcState === 'connected' &&
+                                    (iceState === 'connected' || iceState === 'completed')
+                                ) {
+                                    try {
+                                        await triggerInBandRenegotiation();
+                                    } catch (err) {
+                                        console.warn(
+                                            '[發送端] In-Band 修復請求失敗:',
+                                            err
+                                        );
+                                    }
+                                } else {
+                                    console.warn(
+                                        '[發送端] stateChannel / PeerConnection 狀態不適合 In-Band 修復，等待硬逾時'
+                                    );
+                                }
+                            }
+                            if (
+                                recoveryRequested &&
+                                recoveryStartedAt > 0 &&
+                                now - recoveryStartedAt >= BACKPRESSURE_HARD_TIMEOUT_MS
+                            ) {
+
+                                console.error(
+                                    '[發送端] In-Band 修復後仍完全沒有資料進度，進入完整重連',
+                                    {
+                                        recoveryDurationMs:
+                                            Math.round(now - recoveryStartedAt),
+                                        offset,
+                                        totalSent,
+                                        lastConfirmedAckOffset,
+                                        unackedBytes:
+                                            offset - lastConfirmedAckOffset,
+                                        bufferedAmount: currentBuffered,
+                                        pcState:
+                                            state.peerConnection?.connectionState,
+                                        iceState:
+                                            state.peerConnection?.iceConnectionState,
+                                        dcState:
+                                            state.fileChannel?.readyState
+                                    }
+                                );
+                                handlePeerDisconnection(
+                                    '檔案通道長時間停滯，正在重新連線...',
+                                    false
+                                );
                                 return;
                             }
-                        } else {
-                            stagnationCount = 0; // 有消耗就歸零
-                            lastBufferedAmount = currentBuffered;
                         }
                     }
+                    console.log('[發送端] DataChannel 背壓解除', {
+                        offset,
+                        totalSent,
+                        bufferedAmount: state.fileChannel.bufferedAmount,
+                        lastConfirmedAckOffset
+                    });
+
+                    backpressureStallStartedAt = 0;
+                    lastBackpressureBuffered = 0;
+                    lastBackpressureAck = lastConfirmedAckOffset;
+                    recoveryRequested = false;
+                    recoveryStartedAt = 0;
                 }
 
                 const nextBlockOffset = Math.min(blockOffset + CHUNK_SIZE, blockLength);
