@@ -21,9 +21,9 @@ const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 1MB 累積緩存低水位
-const BUFFERED_HIGH_THRESHOLD = 8 * 1024 * 1024; // 8MB 累積緩存高水位
-const MAX_UNACKED_WINDOW_BYTES = 16 * 1024 * 1024; // 16MB 發送端限制水位
+const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 累積緩存低水位
+const BUFFERED_HIGH_THRESHOLD = 2 * 1024 * 1024; // 2MB 累積緩存高水位
+const MAX_UNACKED_WINDOW_BYTES = 8 * 1024 * 1024; // 8MB 發送端限制水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -942,6 +942,9 @@ export async function triggerInBandRenegotiation() {
 
         // 由 Host 端發起新的 Offer
         if (state.isHost) {
+            if (typeof state.peerConnection.restartIce === 'function') {
+                state.peerConnection.restartIce();
+            }
             const offer = await state.peerConnection.createOffer({ iceRestart: true });
             await state.peerConnection.setLocalDescription(offer);
 
@@ -1209,8 +1212,8 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const CHUNK_SIZE = 64 * 1024; // 64KB SCTP 傳輸封包
-    const BLOCK_SIZE = 12 * 1024 * 1024; // 12MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
+    const CHUNK_SIZE = 16 * 1024; // 16KB SCTP 傳輸封包
+    const BLOCK_SIZE = 2 * 1024 * 1024; // 2MB 記憶體預讀塊 (大幅降低 Blob I/O 呼叫頻率)
     bufferLowResolver = null;
     let stagnationCount = 0;
     let lastBufferedAmount = 0;
@@ -1255,7 +1258,7 @@ export async function sendFileChunks(startOffset = null) {
             let blockOffset = 0;
             const blockLength = blockBuffer.byteLength;
 
-            // 在記憶體中連續切分 64KB 快速發送
+            // 在記憶體中連續切分 16 KiB 快速發送
             while (blockOffset < blockLength) {
                 if (mySessionId !== currentTransferSessionId) return;
 
@@ -1265,7 +1268,7 @@ export async function sendFileChunks(startOffset = null) {
                     return;
                 }
 
-                // 若未確認落盤的數據量超過 32MB，暫停發送，等待接收端 Worker 寫入完成並回傳 ACK
+                // 若未確認落盤的數據量超過滑動視窗上限，暫停發送，等待接收端 Worker 回傳 ACK
                 while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
                     await new Promise(resolve => setTimeout(resolve, 30));
                     stagnationCount = 0;
@@ -1276,7 +1279,7 @@ export async function sendFileChunks(startOffset = null) {
                     }
                 }
 
-                // 雙水位背壓控制：緩存超過 12MB (High Watermark) 時才等待其降回 4MB (Low Watermark)
+                // 雙水位背壓控制：緩存超過高水位 (BUFFERED_HIGH_THRESHOLD) 時等待降回低水位 (BUFFERED_LOW_THRESHOLD)
                 if (state.fileChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
                     while (state.fileChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
                         await new Promise((resolve) => {
@@ -1425,6 +1428,10 @@ export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
     isFinishSent = false;
     inFlightBytes = 0;
     bufferLowResolver = null;
+    if (forceDelete || isSuccess) {
+        currentOffset = 0;
+        lastAckedOffset = 0;
+    }
 }
 
 export async function clearEntireOPFS() {
