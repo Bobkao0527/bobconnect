@@ -1297,15 +1297,15 @@ export async function sendFileChunks(startOffset = null) {
                         }
 
                         const currentBuffered = state.fileChannel.bufferedAmount;
-                        if (currentBuffered >= lastBufferedAmount) {
+                        if (currentBuffered >= lastBufferedAmount && lastBufferedAmount > 0) {
                             stagnationCount++;
-                            if (stagnationCount >= 200) {
+                            if (stagnationCount >= 500) { 
                                 console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
                                 handlePeerDisconnection('發送背壓停滯超時', false);
                                 return;
                             }
                         } else {
-                            stagnationCount = 0;
+                            stagnationCount = 0; // 有消耗就歸零
                             lastBufferedAmount = currentBuffered;
                         }
                     }
@@ -1320,6 +1320,11 @@ export async function sendFileChunks(startOffset = null) {
                 blockOffset += chunkSize;
                 offset += chunkSize;
                 totalSent = offset;
+
+                // 每發送 1MB 讓出一次微任務，避免完全鎖死 Event Loop
+                if (blockOffset % (1024 * 1024) === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
 
                 const now = performance.now();
                 if (now - lastUiUpdateTime > 80 || totalSent >= totalSize) {
