@@ -1384,7 +1384,7 @@ export async function sendFileChunks(startOffset = null) {
                         unackedBytes: offset - lastConfirmedAckOffset,
                         unackedMB: ((offset - lastConfirmedAckOffset) / (1024 * 1024)).toFixed(2),
                         bufferedAmount: state.fileChannel?.bufferedAmount,
-                        bufferedMB: ((state.fileChannel?.bufferedAmount || 0) / (1024 * 1024)).toFixed(2),
+                        bufferedMB: ((state.fileChannel?.bufferedAmount || 0) /(1024 * 1024)).toFixed(2),
                         dcState: state.fileChannel?.readyState,
                         pcState: state.peerConnection?.connectionState,
                         iceState: state.peerConnection?.iceConnectionState
