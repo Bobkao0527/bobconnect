@@ -1390,7 +1390,6 @@ export async function sendFileChunks(startOffset = null) {
                         iceState: state.peerConnection?.iceConnectionState
                     });
                     await new Promise(resolve => setTimeout(resolve, 30));
-                    stagnationCount = 0;
                     if (mySessionId !== currentTransferSessionId) return;
                     if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                         isSendingInProgress = false;
