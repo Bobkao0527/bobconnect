@@ -127,38 +127,16 @@ export function releaseWakeLock() {
 }
 
 // 行動端原生分享或背景傳統下載
-export async function triggerAutoDownload(url, filename, fileSize = 0) {
-    const sizeLimit = 50 * 1024 * 1024; // 50MB 限制
-
-    // 只有在明確已知檔案小於 50MB 時，才嘗試走行動端原生 Web Share API，防止大檔案 OOM 崩潰
-    if (state.localIsMobile && fileSize > 0 && fileSize < sizeLimit && navigator.canShare && navigator.share) {
-        try {
-            const response = await fetch(url);
-            const blob = await response.blob();
-            const file = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
-
-            if (navigator.canShare({ files: [file] })) {
-                await navigator.share({
-                    files: [file],
-                    title: filename,
-                    text: `Bob 檔案傳輸系統成功接收：${filename}`
-                });
-                return;
-            }
-        } catch (err) {
-            console.warn("[系統提示] 原生分享未成功，將降級走瀏覽器預設下載機制。", err);
-        }
-    }
-
-    // 瀏覽器傳統下載觸發
+export function triggerAutoDownload(url, filename, fileSize = 0) {
+    // 1. 建立標準下載連結 (切記：絕對不要加上 target = '_blank')
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
-    a.target = '_blank';
+    a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
 
-    // 同步綁定備用手動下載按鈕，提供使用者 100% 可手動補救路徑
+    // 3. 綁定手動備用按鈕 (若使用者不小心按到取消，還可以手動點擊補救)
     const manualContainer = document.getElementById('manual-download-container');
     const manualBtn = document.getElementById('btn-manual-download');
     if (manualContainer && manualBtn) {
@@ -167,16 +145,17 @@ export async function triggerAutoDownload(url, filename, fileSize = 0) {
             const manualLink = document.createElement('a');
             manualLink.href = url;
             manualLink.download = filename;
-            manualLink.target = '_blank';
+            manualLink.style.display = 'none';
             document.body.appendChild(manualLink);
             manualLink.click();
-            setTimeout(() => document.body.removeChild(manualLink), 150);
+            setTimeout(() => document.body.removeChild(manualLink), 300);
         };
     }
 
+    // 4. 清理 DOM 節點
     setTimeout(() => {
         if (document.body.contains(a)) {
             document.body.removeChild(a);
         }
-    }, 300);
+    }, 1000);
 }
