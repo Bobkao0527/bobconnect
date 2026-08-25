@@ -305,6 +305,7 @@ function createOPFSWorker(isResume = false) {
                 if (fileToDelete) {
                     await removeOPFSFile(fileToDelete);
                 }
+                cleanupOPFSWorker(true, false);
             }, 60000);
         }
         else if (msg.type === 'error') {
