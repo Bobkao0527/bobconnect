@@ -21,9 +21,9 @@ const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 let totalSent = 0;
 let bufferLowResolver = null;
-const BUFFERED_LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB 累積緩存低水位
-const BUFFERED_HIGH_THRESHOLD = 12 * 1024 * 1024; // 12MB 累積緩存高水位
-const MAX_UNACKED_WINDOW_BYTES = 32 * 1024 * 1024; // 32MB 發送端限制水位
+const BUFFERED_LOW_THRESHOLD = 1 * 1024 * 1024; // 1MB 累積緩存低水位
+const BUFFERED_HIGH_THRESHOLD = 8 * 1024 * 1024; // 8MB 累積緩存高水位
+const MAX_UNACKED_WINDOW_BYTES = 16 * 1024 * 1024; // 16MB 發送端限制水位
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -1286,7 +1286,7 @@ export async function sendFileChunks(startOffset = null) {
                                     bufferLowResolver = null;
                                     resolve();
                                 }
-                            }, 50);
+                            }, 30);
                         });
 
                         if (mySessionId !== currentTransferSessionId) return;
@@ -1299,7 +1299,7 @@ export async function sendFileChunks(startOffset = null) {
                         const currentBuffered = state.fileChannel.bufferedAmount;
                         if (currentBuffered >= lastBufferedAmount && lastBufferedAmount > 0) {
                             stagnationCount++;
-                            if (stagnationCount >= 500) { 
+                            if (stagnationCount >= 100) { 
                                 console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
                                 handlePeerDisconnection('發送背壓停滯超時', false);
                                 return;
