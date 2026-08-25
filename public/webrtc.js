@@ -1268,6 +1268,7 @@ export async function sendFileChunks(startOffset = null) {
                 // 若未確認落盤的數據量超過 32MB，暫停發送，等待接收端 Worker 寫入完成並回傳 ACK
                 while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
                     await new Promise(resolve => setTimeout(resolve, 30));
+                    stagnationCount = 0;
                     if (mySessionId !== currentTransferSessionId) return;
                     if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                         isSendingInProgress = false;
@@ -1298,7 +1299,7 @@ export async function sendFileChunks(startOffset = null) {
                         const currentBuffered = state.fileChannel.bufferedAmount;
                         if (currentBuffered >= lastBufferedAmount) {
                             stagnationCount++;
-                            if (stagnationCount >= 100) {
+                            if (stagnationCount >= 200) {
                                 console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
                                 handlePeerDisconnection('發送背壓停滯超時', false);
                                 return;
