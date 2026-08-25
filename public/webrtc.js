@@ -101,14 +101,26 @@ function handleSignalingMessage(data) {
 
 // 接收端發送累積確認 (Cumulative ACK)
 function flushCumulativeAck() {
-    if (state.receivedSize > lastAckedOffset && state.stateChannel && state.stateChannel.readyState === 'open') {
+    if (
+        state.receivedSize > lastAckedOffset &&
+        state.stateChannel &&
+        state.stateChannel.readyState === 'open'
+    ) {
         try {
+            console.log('[SEND CUMULATIVE ACK]', {
+                oldAck: lastAckedOffset,
+                newAck: state.receivedSize,
+                ackAdvance: state.receivedSize - lastAckedOffset,
+                receivedMB: (state.receivedSize / (1024 * 1024)).toFixed(2)
+            });
             state.stateChannel.send(JSON.stringify({
                 type: 'ack',
                 offset: state.receivedSize
             }));
             lastAckedOffset = state.receivedSize;
-        } catch (e) { }
+        } catch (e) {
+            console.error('[CUM ACK 發送失敗]', e);
+        }
     }
 }
 
@@ -268,6 +280,19 @@ function createOPFSWorker(isResume = false) {
             inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
             state.receivedSize += writtenSize;
             lastActivityTime = Date.now();
+            console.log('[RECV WORKER ACK]', {
+                writtenSize,
+                receivedSize: state.receivedSize,
+                receivedMB: (state.receivedSize / (1024 * 1024)).toFixed(2),
+
+                inFlightBytes,
+                inFlightMB: (inFlightBytes / (1024 * 1024)).toFixed(2),
+
+                recvQueueLength: recvQueue.length,
+                workerAckCount,
+                lastAckedOffset,
+                ackPendingBytes: state.receivedSize - lastAckedOffset
+            });
 
             // 超過累積限制立即觸發 ACK 發送
             if (state.receivedSize - lastAckedOffset >= BATCH_ACK_INTERVAL) {
@@ -1003,6 +1028,17 @@ export async function handleControlMessage(jsonString) {
         if (message.type === 'ack') {
             lastActivityTime = Date.now();
             if (typeof message.offset === 'number') {
+                console.log('[RECV ACK FROM PEER]', {
+                    oldAck: lastConfirmedAckOffset,
+                    newAck: message.offset,
+                    ackAdvance: message.offset - lastConfirmedAckOffset,
+
+                    totalSent,
+                    remainingUnacked: totalSent - message.offset,
+                    remainingUnackedMB: (
+                        (totalSent - message.offset) / (1024 * 1024)
+                    ).toFixed(2)
+                });
                 lastConfirmedAckOffset = message.offset;
             }
             return;
@@ -1270,6 +1306,18 @@ export async function sendFileChunks(startOffset = null) {
 
                 // 若未確認落盤的數據量超過滑動視窗上限，暫停發送，等待接收端 Worker 回傳 ACK
                 while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
+                    console.log('[SEND WAITING ACK]', {
+                        offset,
+                        totalSent,
+                        lastConfirmedAckOffset,
+                        unackedBytes: offset - lastConfirmedAckOffset,
+                        unackedMB: ((offset - lastConfirmedAckOffset) / (1024 * 1024)).toFixed(2),
+                        bufferedAmount: state.fileChannel?.bufferedAmount,
+                        bufferedMB: ((state.fileChannel?.bufferedAmount || 0) / (1024 * 1024)).toFixed(2),
+                        dcState: state.fileChannel?.readyState,
+                        pcState: state.peerConnection?.connectionState,
+                        iceState: state.peerConnection?.iceConnectionState
+                    });
                     await new Promise(resolve => setTimeout(resolve, 30));
                     stagnationCount = 0;
                     if (mySessionId !== currentTransferSessionId) return;
@@ -1300,10 +1348,38 @@ export async function sendFileChunks(startOffset = null) {
                         }
 
                         const currentBuffered = state.fileChannel.bufferedAmount;
+                        console.log('[SEND BACKPRESSURE]', {
+                            offset,
+                            totalSent,
+                            lastConfirmedAckOffset,
+                            unackedBytes: offset - lastConfirmedAckOffset,
+
+                            currentBuffered,
+                            currentBufferedMB: (currentBuffered / (1024 * 1024)).toFixed(2),
+
+                            lastBufferedAmount,
+                            lastBufferedMB: (lastBufferedAmount / (1024 * 1024)).toFixed(2),
+
+                            stagnationCount,
+                            dcState: state.fileChannel.readyState,
+                            pcState: state.peerConnection?.connectionState,
+                            iceState: state.peerConnection?.iceConnectionState
+                        });
                         if (currentBuffered >= lastBufferedAmount && lastBufferedAmount > 0) {
                             stagnationCount++;
                             if (stagnationCount >= 100) { 
                                 console.error('[發送端] 偵測到發送背壓持續卡死無進度，將主動重連...');
+                                console.error('[發送端] 卡死當下完整狀態:', {
+                                    offset,
+                                    totalSent,
+                                    lastConfirmedAckOffset,
+                                    unackedBytes: offset - lastConfirmedAckOffset,
+                                    bufferedAmount: currentBuffered,
+                                    stagnationCount,
+                                    dcState: state.fileChannel?.readyState,
+                                    pcState: state.peerConnection?.connectionState,
+                                    iceState: state.peerConnection?.iceConnectionState
+                                });
                                 handlePeerDisconnection('發送背壓停滯超時', false);
                                 return;
                             }

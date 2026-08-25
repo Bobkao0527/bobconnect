@@ -112,6 +112,7 @@ self.onmessage = async (event) => {
         }
 
         case 'write': {
+            const writeMessageStart = performance.now();
             const { chunk, offset, size } = data;
             try {
                 if (!accessHandle) {
@@ -124,11 +125,37 @@ self.onmessage = async (event) => {
                 
                 while (bytesWritten < view.byteLength) {
                     const subView = view.subarray(bytesWritten);
-                    const written = accessHandle.write(subView, { at: offset + bytesWritten });
+                    const writeStart = performance.now();
+                    const written = accessHandle.write(
+                        subView,
+                        { at: offset + bytesWritten }
+                    );
+                    const writeCost = performance.now() - writeStart;
+                    if (writeCost > 50) {
+                        console.warn('[OPFS SLOW WRITE]', {
+                            offset: offset + bytesWritten,
+                            requestBytes: subView.byteLength,
+                            writtenBytes: written,
+                            costMs: writeCost
+                        });
+                    }
                     if (written === 0) {
-                        throw new Error(`OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`);
+                        throw new Error(
+                            `OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`
+                        );
                     }
                     bytesWritten += written;
+                }
+
+                const totalWriteCost = performance.now() - writeMessageStart;
+                if (totalWriteCost > 50) {
+                    console.warn('[OPFS WRITE MESSAGE SLOW]', {
+                        offset,
+                        size,
+                        actualBytes: bytesWritten,
+                        totalCostMs: totalWriteCost,
+                        workerWriteCount
+                    });
                 }
 
                 pendingAckBytes += (bytesWritten || size || view.byteLength);
