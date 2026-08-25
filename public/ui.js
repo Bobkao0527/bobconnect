@@ -128,34 +128,66 @@ export function releaseWakeLock() {
 
 // 行動端原生分享或背景傳統下載
 export function triggerAutoDownload(url, filename, fileSize = 0) {
-    // 1. 建立標準下載連結 (切記：絕對不要加上 target = '_blank')
     const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
 
-    // 3. 綁定手動備用按鈕 (若使用者不小心按到取消，還可以手動點擊補救)
+    a.href = url;
+    a.download = filename || 'downloaded_file';
+    a.rel = 'noopener';
+    a.style.position = 'fixed';
+    a.style.left = '-9999px';
+    a.style.width = '1px';
+    a.style.height = '1px';
+    a.style.opacity = '0';
+
+    document.body.appendChild(a);
+
+    // Safari / WebKit：
+    // 不要在建立 Blob URL 的同一個同步執行階段立即 click。
+    setTimeout(() => {
+        try {
+            a.click();
+            console.log('[下載] 已觸發 Safari Blob URL 下載');
+        } catch (err) {
+            console.error('[下載] 自動下載觸發失敗:', err);
+        }
+    }, 100);
+
+    // 自動下載的 anchor 本身可以清掉，
+    // 但不要在這裡 revokeObjectURL(url)。
+    setTimeout(() => {
+        a.remove();
+    }, 1500);
+
+    // 手動下載按鈕共用同一個仍有效的 Blob URL
     const manualContainer = document.getElementById('manual-download-container');
     const manualBtn = document.getElementById('btn-manual-download');
+
     if (manualContainer && manualBtn) {
         manualContainer.classList.remove('hidden');
+
         manualBtn.onclick = () => {
             const manualLink = document.createElement('a');
+
             manualLink.href = url;
-            manualLink.download = filename;
-            manualLink.style.display = 'none';
+            manualLink.download = filename || 'downloaded_file';
+            manualLink.rel = 'noopener';
+            manualLink.style.position = 'fixed';
+            manualLink.style.left = '-9999px';
+
             document.body.appendChild(manualLink);
-            manualLink.click();
-            setTimeout(() => document.body.removeChild(manualLink), 300);
+
+            setTimeout(() => {
+                try {
+                    manualLink.click();
+                    console.log('[下載] 手動重試下載');
+                } catch (err) {
+                    console.error('[下載] 手動下載失敗:', err);
+                }
+
+                setTimeout(() => {
+                    manualLink.remove();
+                }, 1000);
+            }, 50);
         };
     }
-
-    // 4. 清理 DOM 節點
-    setTimeout(() => {
-        if (document.body.contains(a)) {
-            document.body.removeChild(a);
-        }
-    }, 1000);
 }

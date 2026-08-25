@@ -289,29 +289,32 @@ function createOPFSWorker(isResume = false) {
 
             const { file, filename, tempFilename } = msg;
             const fileToDelete = tempFilename || currentTempFilename;
+
+            console.log('[FINISH SUCCESS]', {
+                filename,
+                fileSize: file?.size,
+                expectedSize: state.incomingFileInfo?.size,
+                type: file?.type
+            });
+
             const blobUrl = URL.createObjectURL(file);
 
-            console.log(`[接收端 傳輸完成] 檔案大小: ${(file.size / (1024 * 1024)).toFixed(2)} MB`);
-            cleanupOPFSWorker(true, false);
+            console.log('[BLOB URL CREATED]', blobUrl);
 
-            const actualFileSize = state.incomingFileInfo ? state.incomingFileInfo.size : (file ? file.size : 0);
-            if (typeof triggerAutoDownload === 'function') {
-                triggerAutoDownload(blobUrl, filename, actualFileSize);
-            }
+            // ⭐ 先不要 cleanup Worker
+            // cleanupOPFSWorker(true, false);
 
-            const recvPercent = document.getElementById('recv-percent');
-            const recvProgressBar = document.getElementById('recv-progress-bar');
-            if (recvPercent) recvPercent.innerText = '100% (完成)';
-            if (recvProgressBar) recvProgressBar.style.width = '100%';
-            showToast(`「${state.incomingFileInfo ? state.incomingFileInfo.name : filename}」傳輸成功！`, 'success');
+            triggerAutoDownload(blobUrl, filename, actualFileSize);
 
+            // 測試期間不要刪 OPFS
+            /*
             setTimeout(async () => {
                 URL.revokeObjectURL(blobUrl);
                 if (fileToDelete) {
                     await removeOPFSFile(fileToDelete);
                 }
-                cleanupOPFSWorker(true, false);
             }, 60000);
+            */
         } else if (msg.type === 'error') {
             releaseWakeLock();
             handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
