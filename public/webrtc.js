@@ -217,7 +217,7 @@ async function attemptReconnection(reason) {
         return;
     }
 
-    const backoffDelay = Math.min(1000 * Math.pow(1.3, reconnectAttempts - 1), 5000);
+    const backoffDelay = Math.min(300 * Math.pow(1.1, reconnectAttempts - 1), 2000);
     console.log(`[自動重連] 第 ${reconnectAttempts} 次嘗試，${(backoffDelay / 1000).toFixed(1)} 秒後重敲信令伺服器... 原因: ${reason}`);
 
     updateStatus(`網路波動，正在自動重連 (第 ${reconnectAttempts} 次)...`, 'yellow');
@@ -410,7 +410,7 @@ function startHeartbeatAndWatchdog() {
                 }
             }
         }
-    }, 2000);
+    }, 1000);
 
     watchdogTimer = setInterval(async () => {
         const now = Date.now();
