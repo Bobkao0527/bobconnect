@@ -15,7 +15,6 @@ let pendingCandidates = [];
 
 let recvQueue = [];
 let isWorkerReady = false;
-let fileEndPending = false;
 let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
@@ -39,11 +38,6 @@ let heartbeatTimer = null;
 let watchdogTimer = null;
 let lastActivityTime = Date.now();
 let isDisconnectHandled = false;
-
-// log監控區
-let recvPacketCount = 0;
-let workerAckCount = 0;
-let transportMonitorTimer = null;
 
 let isFinishSent = false;
 
@@ -131,7 +125,6 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     console.warn(`[連線中斷觸發]: ${reason} (isFatal=${isFatal})`);
 
     stopHeartbeatAndWatchdog();
-    stopTransportMonitor();
 
     // 同時釋放兩條 DataChannel
     if (state.fileChannel) {
@@ -251,7 +244,6 @@ function createOPFSWorker(isResume = false) {
 
     isWorkerReady = false;
     isFinishSent = false;
-    fileEndPending = false;
 
     try {
         opfsWorker = new Worker(new URL('./opfs-worker.js', import.meta.url));
@@ -271,7 +263,6 @@ function createOPFSWorker(isResume = false) {
             isWorkerReady = true;
             drainRecvQueue();
         } else if (msg.type === 'write-ack') {
-            workerAckCount++;
             const writtenSize = msg.size || 0;
             inFlightBytes = Math.max(0, inFlightBytes - writtenSize);
             state.receivedSize += writtenSize;
@@ -291,31 +282,17 @@ function createOPFSWorker(isResume = false) {
             const fileToDelete = tempFilename || currentTempFilename;
             const actualFileSize = file ? file.size : (state.incomingFileInfo?.size || 0);
 
-            console.log('[FINISH SUCCESS]', {
-                filename,
-                fileSize: file?.size,
-                expectedSize: state.incomingFileInfo?.size,
-                type: file?.type
-            });
-
             const blobUrl = URL.createObjectURL(file);
-
-            console.log('[BLOB URL CREATED]', blobUrl);
-
-            // ⭐ 先不要 cleanup Worker
-            // cleanupOPFSWorker(true, false);
-
             triggerAutoDownload(blobUrl, filename, actualFileSize);
 
-            // 測試期間不要刪 OPFS
-            /*
+            // 完成後正常清理 Worker 與暫存檔
+            cleanupOPFSWorker(true, false);
             setTimeout(async () => {
                 URL.revokeObjectURL(blobUrl);
                 if (fileToDelete) {
                     await removeOPFSFile(fileToDelete);
                 }
-            }, 60000);
-            */
+            }, 30000);
         } else if (msg.type === 'error') {
             releaseWakeLock();
             handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
@@ -400,25 +377,6 @@ async function restartSignalingAndPeerConnection() {
             }
         };
         connectSignalingWS();
-    }
-}
-
-function startTransportMonitor() {
-    stopTransportMonitor();
-    transportMonitorTimer = setInterval(async () => {
-        const pc = state.peerConnection;
-        const dc = state.fileChannel;
-        if (!pc) return;
-        try {
-            await logWebRTCStats(pc, dc);
-        } catch (err) {}
-    }, 1000);
-}
-
-function stopTransportMonitor() {
-    if (transportMonitorTimer) {
-        clearInterval(transportMonitorTimer);
-        transportMonitorTimer = null;
     }
 }
 
@@ -519,20 +477,6 @@ function setupPeerConnectionListeners(pc) {
             handlePeerDisconnection('ICE 連線已關閉 (closed)', false);
         }
     };
-}
-
-async function logWebRTCStats(pc, dc) {
-    if (!pc) return;
-    const stats = await pc.getStats();
-    let transport = null;
-    let candidatePair = null;
-    let dataChannelStats = null;
-
-    stats.forEach(report => {
-        if (report.type === 'transport') transport = report;
-        if (report.type === 'candidate-pair' && report.state === 'succeeded') candidatePair = report;
-        if (report.type === 'data-channel') dataChannelStats = report;
-    });
 }
 
 // 監聽視窗卸載主動向對端告警
@@ -751,7 +695,6 @@ export function setupStateChannelListeners() {
         triggerAppleGlow();
 
         startHeartbeatAndWatchdog();
-        startTransportMonitor();
 
         if (ackFlushTimer) clearInterval(ackFlushTimer);
         ackFlushTimer = setInterval(() => flushCumulativeAck(), 200);
@@ -976,8 +919,6 @@ export async function handleControlMessage(jsonString) {
 
         if (message.type === 'file-meta') {
             acquireWakeLock();
-            recvPacketCount = 0;
-            workerAckCount = 0;
 
             const isSameFile = state.incomingFileInfo &&
                 state.incomingFileInfo.name === message.name &&
@@ -1014,7 +955,6 @@ export async function handleControlMessage(jsonString) {
             if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
             updateRecvUi();
         } else if (message.type === 'file-end') {
-            fileEndPending = true;
             drainRecvQueue();
         }
     } catch (e) {
@@ -1086,14 +1026,12 @@ function drainRecvQueue() {
     if (isTotalReceived && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
         console.log(`[接收端 準備收尾] 總接收已達標 (${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB)，通知 Worker 執行 Finish...`);
         isFinishSent = true;
-        fileEndPending = false;
         opfsWorker.postMessage({ type: 'finish' });
     }
 
 }
 
 export function handleIncomingData(data) {
-    recvPacketCount++;
     recvQueue.push(data);
     lastActivityTime = Date.now();
 
@@ -1388,7 +1326,6 @@ export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
 
     recvQueue = [];
     isWorkerReady = false;
-    fileEndPending = false;
     isFinishSent = false;
     inFlightBytes = 0;
     bufferLowResolver = null;

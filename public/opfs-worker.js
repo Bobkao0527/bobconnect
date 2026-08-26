@@ -77,16 +77,8 @@ self.onmessage = async (event) => {
                 rootDir = await navigator.storage.getDirectory();
                 tempFilename = customTempName || `temp_${downloadId || Date.now()}.tmp`;
 
-                try {
-                    fileHandle = await rootDir.getFileHandle(tempFilename, { create: !isResume });
-                } catch (e) {
-                    if (isResume) {
-                        console.warn(`[OPFS Worker] 續傳檔案 ${tempFilename} 不存在，fallback 建立新檔`);
-                        fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
-                    } else {
-                        throw e;
-                    }
-                }
+                // { create: true } 存在即開啟，不存在即建立，不破壞舊有檔案內容
+                fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
 
                 let retries = 5;
                 while (retries > 0) {
