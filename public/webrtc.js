@@ -18,6 +18,11 @@ let isWorkerReady = false;
 let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
+// 【接收端流量控制】佇列積壓門檻：超過即請求發送端暫停，消化後恢復
+const PAUSE_QUEUE_COUNT = 256;   // 約 4MB (16KB chunks)
+const RESUME_QUEUE_COUNT = 64;   // 積壓消化到 64 個以下才恢復
+let isPausedRemote = false;
+
 let totalSent = 0;
 let bufferLowResolver = null;
 const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 累積緩存低水位
@@ -25,8 +30,35 @@ const BUFFERED_HIGH_THRESHOLD = 2 * 1024 * 1024; // 2MB 累積緩存高水位
 const MAX_UNACKED_WINDOW_BYTES = 8 * 1024 * 1024; // 8MB 發送端限制水位
 
 const BACKPRESSURE_SAMPLE_INTERVAL_MS = 100;
-const BACKPRESSURE_RECOVERY_DELAY_MS = 3000;
-const BACKPRESSURE_HARD_TIMEOUT_MS = 3000;
+// 【穩定性修復】大檔案傳輸時網路抖動造成短暫停滯是正常現象，
+// 過早發動 ICE Restart 反而會打斷 SCTP 連線、製造更多斷線。
+// 參考: webrtc/samples 官方 datatransfer 範例僅等待 bufferedamountlow，不做激進自救。
+const BACKPRESSURE_RECOVERY_DELAY_MS = 10000;   // 停滯 10 秒才嘗試 ICE Restart
+const BACKPRESSURE_HARD_TIMEOUT_MS = 15000;     // 再等 15 秒 (共 25 秒) 才宣告重連
+
+// 【動態 chunk size】依 RFC 8841 a=max-message-size 協商結果決定。
+// Safari/WebKit 的 maxMessageSize 為 65536 (64KB)，SDP 未聲明時規範預設也是 64KB。
+// 上限保守取 64KB 以確保跨瀏覽器相容 (Firefox 舊版對 ordered channel 僅保證 16KB)。
+let CHUNK_SIZE = 16 * 1024; // 預設值，連線建立後依 sctp.maxMessageSize 動態調整
+const MAX_SAFE_CHUNK_SIZE = 64 * 1024;
+
+/**
+ * 依協商結果計算安全 chunk size (在 PeerConnection 建立後呼叫)
+ */
+function negotiateChunkSize() {
+    try {
+        const sctpMax = state.peerConnection?.sctp?.maxMessageSize || 0;
+        if (sctpMax > 0) {
+            // 取 min(對端可接收上限, 64KB 安全上限)，再預留 1KB 給潛在 framing 開銷
+            CHUNK_SIZE = Math.min(sctpMax - 1024, MAX_SAFE_CHUNK_SIZE);
+        } else {
+            CHUNK_SIZE = 16 * 1024; // 無法取得時退回最保守的 16KB
+        }
+        console.log(`[傳輸參數] sctp.maxMessageSize=${sctpMax}, 採用 chunk size=${CHUNK_SIZE / 1024}KB`);
+    } catch (e) {
+        CHUNK_SIZE = 16 * 1024;
+    }
+}
 
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
@@ -50,6 +82,7 @@ const MAX_RECONNECT_ATTEMPTS = 15;
 let isSendingInProgress = false;
 let lastConfirmedAckOffset = 0;
 let currentTransferSessionId = 0;
+let isFlowPausedByRemote = false; // 接收端流量控制旗標
 
 // 接收端速率與 ETA 追蹤變數
 let lastRecvSpeedTime = 0;
@@ -173,10 +206,12 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     // 中斷發送迴圈
     currentTransferSessionId++;
     isSendingInProgress = false;
+    isFlowPausedByRemote = false;
 
     // 清空接收端尚未寫入的隊列
     recvQueue = [];
     inFlightBytes = 0;
+    isPausedRemote = false;
 
     const isReceivingIncomplete = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
     const isSendingIncomplete = state.selectedFile && totalSent < state.selectedFile.size;
@@ -487,6 +522,8 @@ function setupPeerConnectionListeners(pc) {
             handlePeerDisconnection('對端連線已關閉 (closed)', false);
         } else if (pc.connectionState === 'connected') {
             updateStatus('P2P 直連已開通 (加密)', 'green');
+            // 連線建立後依協商結果動態決定 chunk size
+            negotiateChunkSize();
         }
     };
 
@@ -923,6 +960,19 @@ export async function handleControlMessage(jsonString) {
             return;
         }
 
+        // 【接收端 流量控制】發送端響應接收端的暫停/恢復請求
+        if (message.type === 'flow-pause') {
+            isFlowPausedByRemote = true;
+            console.log('[發送端 流量控制] 接收端要求暫停，等待恢復信號...');
+            return;
+        }
+
+        if (message.type === 'flow-resume') {
+            isFlowPausedByRemote = false;
+            console.log('[發送端 流量控制] 接收端已消化積壓，恢復傳輸');
+            return;
+        }
+
         if (message.type === 'resume-request') {
             console.log(`[發送端] 收到續傳請求 Offset: ${(message.receivedOffset / (1024 * 1024)).toFixed(2)} MB`);
             showToast(`正在從 ${(message.receivedOffset / (1024 * 1024)).toFixed(1)} MB 處恢復傳輸...`, 'info');
@@ -1078,6 +1128,15 @@ function drainRecvQueue() {
         flushCumulativeAck();
     }
 
+    // 【接收端 流量控制】積壓已消化，通知發送端恢復傳輸
+    if (isPausedRemote && recvQueue.length <= RESUME_QUEUE_COUNT && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
+        isPausedRemote = false;
+        try {
+            state.stateChannel?.send(JSON.stringify({ type: 'flow-resume' }));
+            console.log('[接收端 流量控制] 佇列已消化，恢復傳輸');
+        } catch (e) { }
+    }
+
     if (recvQueue.length > 100) {
         console.warn(`[接收端 佇列積壓] 隊列待處理封包: ${recvQueue.length} 個 | Worker 寫入中記憶體 (inFlight): ${(inFlightBytes / 1024).toFixed(1)} KB`);
     }
@@ -1094,6 +1153,17 @@ function drainRecvQueue() {
 export function handleIncomingData(data) {
     recvQueue.push(data);
     lastActivityTime = Date.now();
+
+    // 【接收端流量控制】當佇列積壓過大時，通知發送端暫停，
+    // 避免 iOS Safari 因記憶體壓力直接終止頁面導致「斷線」。
+    if (!isPausedRemote && state.incomingFileInfo &&
+        recvQueue.length > PAUSE_QUEUE_COUNT) {
+        isPausedRemote = true;
+        try {
+            state.stateChannel?.send(JSON.stringify({ type: 'flow-pause' }));
+            console.warn(`[接收端 流量控制] 佇列積壓 ${recvQueue.length} 個分塊，請求發送端暫停`);
+        } catch (e) { }
+    }
 
     if (isWorkerReady) {
         drainRecvQueue();
@@ -1152,7 +1222,7 @@ export async function sendFileChunks(startOffset = null) {
         console.log(`[發送端 斷點續傳] Session #${mySessionId} 從 ${(offset / (1024 * 1024)).toFixed(2)} MB 處接續傳輸`);
     }
 
-    const CHUNK_SIZE = 16 * 1024;
+    const CHUNK_SIZE_LOCAL = CHUNK_SIZE;
     const BLOCK_SIZE = 2 * 1024 * 1024;
     bufferLowResolver = null;
     let backpressureStallStartedAt = 0;
@@ -1165,6 +1235,7 @@ export async function sendFileChunks(startOffset = null) {
     let lastSpeedTime = performance.now();
     let lastSpeedBytes = offset;
     let smoothSpeed = 0;
+    let nextYieldAt = 1024 * 1024;
 
     try {
         const totalSize = state.selectedFile.size;
@@ -1199,6 +1270,17 @@ export async function sendFileChunks(startOffset = null) {
 
                 while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
                     await new Promise(resolve => setTimeout(resolve, 30));
+                    if (mySessionId !== currentTransferSessionId) return;
+                    if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
+                        isSendingInProgress = false;
+                        return;
+                    }
+                }
+
+                // 【接收端 流量控制】接收端佇列積壓時暫停發送 (非致命，純背壓調節)
+                // 注意：此等待不計入 backpressure 停滯計時，避免誤觸重連
+                while (isFlowPausedByRemote) {
+                    await new Promise(resolve => setTimeout(resolve, 50));
                     if (mySessionId !== currentTransferSessionId) return;
                     if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                         isSendingInProgress = false;
@@ -1267,7 +1349,7 @@ export async function sendFileChunks(startOffset = null) {
                     recoveryStartedAt = 0;
                 }
 
-                const nextBlockOffset = Math.min(blockOffset + CHUNK_SIZE, blockLength);
+                const nextBlockOffset = Math.min(blockOffset + CHUNK_SIZE_LOCAL, blockLength);
                 const chunkSize = nextBlockOffset - blockOffset;
                 const chunkView = new Uint8Array(blockBuffer, blockOffset, chunkSize);
 
@@ -1277,8 +1359,11 @@ export async function sendFileChunks(startOffset = null) {
                 offset += chunkSize;
                 totalSent = offset;
 
-                if (blockOffset % (1024 * 1024) === 0) {
+                // 【修復】定期讓出主執行緒，避免 UI 凍結與 Safari 計時器節流誤判
+                // 原寫法 `blockOffset % (1024*1024) === 0` 在 chunk size 非 1MB 公約數時永遠不成立
+                if (blockOffset >= nextYieldAt) {
                     await new Promise(resolve => setTimeout(resolve, 0));
+                    nextYieldAt += 1024 * 1024;
                 }
 
                 const now = performance.now();
