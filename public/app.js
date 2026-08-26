@@ -5,9 +5,19 @@
  * 🚀【智慧自動對齊優化】：若網址沒有帶房間號參數，自動向背景探測同 IP 下 60s 內房間並自動連線！
  */
 import { state } from './state.js';
-import { checkInAppBrowser, hideToast } from './ui.js';
+import { checkInAppBrowser, hideToast, toggleWakeLock, showToast} from './ui.js';
 import { initHost, initJoinerWithRoom, sendFileChunks, evaluateFileRouting, probeIPv4, clearEntireOPFS } from './webrtc.js';
 import { startScanner, stopScanner, openPairingModal, closePairingModal, setupPinInputs, autoCheckNearbyRooms } from './scanner.js';
+
+async function handleClearOPFS() {
+    try {
+        await clearEntireOPFS();
+        showToast('OPFS 快取已成功清空', 'success');
+    } catch (err) {
+        console.error('[OPFS] 清空失敗:', err);
+        showToast('清空 OPFS 快取失敗', 'error');
+    }
+}
 
 // 全域暴露機制
 window.initHost = initHost;
@@ -104,14 +114,4 @@ function handleFileSelect(file) {
     if (timeText) timeText.innerText = `--:--`;
 
     evaluateFileRouting(file);
-}
-
-async function handleClearOPFS() {
-    try {
-        await clearEntireOPFS();
-        showToast('OPFS 快取已成功清空', 'success');
-    } catch (err) {
-        console.error('[OPFS] 清空失敗:', err);
-        showToast('清空 OPFS 快取失敗', 'error');
-    }
 }
