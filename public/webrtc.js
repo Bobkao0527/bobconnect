@@ -33,8 +33,8 @@ const BACKPRESSURE_SAMPLE_INTERVAL_MS = 100;
 // 【穩定性修復】大檔案傳輸時網路抖動造成短暫停滯是正常現象，
 // 過早發動 ICE Restart 反而會打斷 SCTP 連線、製造更多斷線。
 // 參考: webrtc/samples 官方 datatransfer 範例僅等待 bufferedamountlow，不做激進自救。
-const BACKPRESSURE_RECOVERY_DELAY_MS = 10000;   // 停滯 10 秒才嘗試 ICE Restart
-const BACKPRESSURE_HARD_TIMEOUT_MS = 15000;     // 再等 15 秒 (共 25 秒) 才宣告重連
+const BACKPRESSURE_RECOVERY_DELAY_MS = 5000;   // 停滯 5 秒才嘗試 ICE Restart
+const BACKPRESSURE_HARD_TIMEOUT_MS = 5000;     // 再等 5 秒 (共 10 秒) 才宣告重連
 
 // 【動態 chunk size】依 RFC 8841 a=max-message-size 協商結果決定。
 // Safari/WebKit 的 maxMessageSize 為 65536 (64KB)，SDP 未聲明時規範預設也是 64KB。
