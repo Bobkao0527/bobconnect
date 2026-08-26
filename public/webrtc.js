@@ -51,6 +51,22 @@ let isSendingInProgress = false;
 let lastConfirmedAckOffset = 0;
 let currentTransferSessionId = 0;
 
+// 接收端速率與 ETA 追蹤變數
+let lastRecvSpeedTime = 0;
+let lastRecvSpeedBytes = 0;
+let smoothRecvSpeed = 0;
+const formatEta = (seconds) => {
+        if (!isFinite(seconds) || seconds <= 0) return '--:--';
+        seconds = Math.ceil(seconds);
+        if (seconds < 60) return `00:${String(seconds).padStart(2, '0')}`;
+        const minutes = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        if (minutes < 60) return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+        const hours = Math.floor(minutes / 60);
+        const mins = minutes % 60;
+        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    };
+
 // 獨立輔助函式：由主線程直接刪除指定 OPFS 檔案
 async function removeOPFSFile(filename) {
     if (!filename || !navigator.storage?.getDirectory) return;
@@ -949,6 +965,9 @@ export async function handleControlMessage(jsonString) {
 
             state.incomingFileInfo = { name: message.name, size: message.size };
             state.lastRecvUiTime = 0;
+            lastRecvSpeedTime = performance.now();
+            lastRecvSpeedBytes = state.receivedSize;
+            smoothRecvSpeed = 0;
             recvQueue = [];
             inFlightBytes = 0;
 
@@ -977,15 +996,43 @@ export async function handleControlMessage(jsonString) {
 
 function updateRecvUi() {
     if (state.incomingFileInfo && state.incomingFileInfo.size > 0) {
-        const now = Date.now();
-        if (now - state.lastRecvUiTime > 80 || state.receivedSize >= state.incomingFileInfo.size) {
+        const now = performance.now();
+        const totalSize = state.incomingFileInfo.size;
+
+        // 進度條：每 80ms 刷新一次以保持流暢視覺
+        if (now - state.lastRecvUiTime > 80 || state.receivedSize >= totalSize) {
             state.lastRecvUiTime = now;
-            const percent = Math.min(100, Math.round((state.receivedSize / state.incomingFileInfo.size) * 100));
+            const percent = Math.min(100, Math.round((state.receivedSize / totalSize) * 100));
 
             const recvPercent = document.getElementById('recv-percent');
             const recvProgressBar = document.getElementById('recv-progress-bar');
             if (recvPercent) recvPercent.innerText = `${percent}%`;
             if (recvProgressBar) recvProgressBar.style.width = `${percent}%`;
+
+            // 速度與 ETA 計算：每 500ms (0.5秒) 採樣一次
+            const speedElapsed = (now - lastRecvSpeedTime) / 1000;
+            if (speedElapsed >= 0.5 || state.receivedSize >= totalSize) {
+                const instantSpeed = (state.receivedSize - lastRecvSpeedBytes) / speedElapsed;
+                // 平滑濾波：保留 85% 舊速率 + 15% 新速率
+                smoothRecvSpeed = smoothRecvSpeed === 0 ? instantSpeed : smoothRecvSpeed * 0.85 + instantSpeed * 0.15;
+                lastRecvSpeedBytes = state.receivedSize;
+                lastRecvSpeedTime = now;
+
+                // 更新接收端速度 (請確認 HTML 中是否有對應元素，如 #recv-speed)
+                const recvSpeedText = document.getElementById('recv-speed');
+                if (recvSpeedText) {
+                    recvSpeedText.innerText = `${(smoothRecvSpeed / (1024 * 1024)).toFixed(2)} MB/s`;
+                }
+
+                // 更新接收端剩餘時間 (請確認 HTML 中是否有對應元素，如 #recv-time)
+                const remainingBytes = Math.max(0, totalSize - state.receivedSize);
+                const etaSeconds = smoothRecvSpeed > 0 ? remainingBytes / smoothRecvSpeed : 0;
+
+                const recvTimeText = document.getElementById('recv-time');
+                if (recvTimeText) {
+                    recvTimeText.innerText = percent >= 100 ? '00:00' : formatEta(etaSeconds);
+                }
+            }
         }
     }
 }
@@ -1119,18 +1166,6 @@ export async function sendFileChunks(startOffset = null) {
     let lastSpeedBytes = offset;
     let smoothSpeed = 0;
 
-    const formatEta = (seconds) => {
-        if (!isFinite(seconds) || seconds <= 0) return '--:--';
-        seconds = Math.ceil(seconds);
-        if (seconds < 60) return `00:${String(seconds).padStart(2, '0')}`;
-        const minutes = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        if (minutes < 60) return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-        const hours = Math.floor(minutes / 60);
-        const mins = minutes % 60;
-        return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-    };
-
     try {
         const totalSize = state.selectedFile.size;
 
@@ -1257,9 +1292,9 @@ export async function sendFileChunks(startOffset = null) {
                     if (progBar) progBar.style.width = `${percent}%`;
 
                     const speedElapsed = (now - lastSpeedTime) / 1000;
-                    if (speedElapsed > 0) {
+                    if (speedElapsed >= 0.5 || totalSent >= totalSize) {
                         const instantSpeed = (totalSent - lastSpeedBytes) / speedElapsed;
-                        smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.7 + instantSpeed * 0.3;
+                        smoothSpeed = smoothSpeed === 0 ? instantSpeed : smoothSpeed * 0.85 + instantSpeed * 0.15;
                         lastSpeedBytes = totalSent;
                         lastSpeedTime = now;
 
@@ -1269,7 +1304,7 @@ export async function sendFileChunks(startOffset = null) {
                         }
 
                         const remainingBytes = Math.max(0, totalSize - totalSent);
-                        const etaSeconds = remainingBytes / smoothSpeed;
+                        const etaSeconds = smoothSpeed > 0 ? remainingBytes / smoothSpeed : 0;
 
                         const timeText = document.getElementById('transfer-time');
                         if (timeText) {

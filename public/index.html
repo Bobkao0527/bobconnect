@@ -173,26 +173,27 @@
             </div>
 
             <!-- 接收檔案提示區 -->
-            <div id="incoming-file-box" class="hidden mt-4 bg-slate-950 border border-slate-900 p-4 rounded-xl space-y-3 text-center">
-                <p id="incoming-status-title" class="text-xs text-emerald-400 font-semibold flex items-center justify-center gap-1.5 mb-2">
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                    正在接收檔案...
-                </p>
-                <div class="space-y-1.5 text-left">
+            <div id="incoming-file-box" class="hidden mt-4 space-y-4 bg-slate-950 p-4 rounded-xl border border-slate-900">
+                <div class="flex justify-between items-center">
+                    <div class="truncate pr-4">
+                        <p id="recv-file-name" class="font-bold text-xs text-slate-200 truncate max-w-[200px]">準備接收檔案...</p>
+                        <p class="text-[10px] text-slate-500">P2P 直連接收中</p>
+                    </div>
+                </div>
+
+                <!-- 進度條區塊 -->
+                <div class="space-y-1.5">
                     <div class="flex justify-between text-[10px]">
-                        <span id="recv-file-name" class="text-slate-400 truncate max-w-[200px]">檔案中...</span>
+                        <span class="text-slate-500">接收進度</span>
                         <span id="recv-percent" class="font-bold text-emerald-400">0%</span>
                     </div>
                     <div class="w-full bg-slate-900 rounded-full h-1 overflow-hidden">
-                        <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-1 w-0"></div>
+                        <div id="recv-progress-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-1 w-0 transition-all duration-75"></div>
                     </div>
-                </div>
-                <!-- 備用手動下載按鈕 -->
-                <div id="manual-download-container" class="hidden pt-3 border-t border-slate-900 mt-2">
-                    <button id="btn-manual-download" class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition shadow-lg shadow-emerald-600/10">
-                        📥 手動下載檔案
-                    </button>
-                    <p class="text-[9px] text-slate-500 mt-1 font-sans">若自動下載未觸發，請點擊按鈕手動儲存</p>
+                    <div class="flex justify-between text-[9px] text-slate-600 pt-0.5 font-mono">
+                        <span id="recv-speed">0.00 MB/s</span>
+                        <span id="recv-time">--:--</span>
+                    </div>
                 </div>
             </div>
         </div>
