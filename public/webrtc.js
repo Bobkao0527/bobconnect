@@ -19,15 +19,14 @@ let inFlightBytes = 0;
 const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
 // 【接收端流量控制】佇列積壓門檻：超過即請求發送端暫停，消化後恢復
-const PAUSE_QUEUE_COUNT = 320;   // 約 5MB (16KB chunks)
-const RESUME_QUEUE_COUNT = 192;  // 降低暫停/恢復遲滯，減少吞吐震盪
+const PAUSE_QUEUE_COUNT = 256;   // 約 4MB (16KB chunks)
+const RESUME_QUEUE_COUNT = 64;   // 積壓消化到 64 個以下才恢復
 let isPausedRemote = false;
 
 let totalSent = 0;
 let bufferLowResolver = null;
 const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 累積緩存低水位
 const BUFFERED_HIGH_THRESHOLD = 2 * 1024 * 1024; // 2MB 累積緩存高水位
-const BUFFERED_SOFT_TARGET = 1024 * 1024; // 1MB 軟目標：超過即微等待，避免一路衝到硬停
 const MAX_UNACKED_WINDOW_BYTES = 8 * 1024 * 1024; // 8MB 發送端限制水位
 
 const BACKPRESSURE_SAMPLE_INTERVAL_MS = 100;
@@ -64,7 +63,7 @@ function negotiateChunkSize() {
 // 接收端累積確認 (Cumulative ACK) 機制
 let lastAckedOffset = 0;
 let ackFlushTimer = null;
-const BATCH_ACK_INTERVAL = 512 * 1024; // 每累積寫入 512KB 即發送一次確認，降低發送端等待抖動
+const BATCH_ACK_INTERVAL = 2 * 1024 * 1024; // 每累積寫入 2MB 即發送一次確認
 
 // 心跳與看門狗
 let heartbeatTimer = null;
@@ -764,7 +763,7 @@ export function setupStateChannelListeners() {
         startHeartbeatAndWatchdog();
 
         if (ackFlushTimer) clearInterval(ackFlushTimer);
-        ackFlushTimer = setInterval(() => flushCumulativeAck(), 100);
+        ackFlushTimer = setInterval(() => flushCumulativeAck(), 200);
 
         try {
             state.stateChannel.send(JSON.stringify({
@@ -1225,17 +1224,6 @@ export async function sendFileChunks(startOffset = null) {
 
     const CHUNK_SIZE_LOCAL = CHUNK_SIZE;
     const BLOCK_SIZE = 2 * 1024 * 1024;
-    const waitForBufferDrain = async (timeoutMs = BACKPRESSURE_SAMPLE_INTERVAL_MS) => {
-        await new Promise((resolve) => {
-            bufferLowResolver = resolve;
-            setTimeout(() => {
-                if (bufferLowResolver === resolve) {
-                    bufferLowResolver = null;
-                    resolve();
-                }
-            }, timeoutMs);
-        });
-    };
     bufferLowResolver = null;
     let backpressureStallStartedAt = 0;
     let lastBackpressureBuffered = 0;
@@ -1300,20 +1288,6 @@ export async function sendFileChunks(startOffset = null) {
                     }
                 }
 
-                // 軟性節流：先在 1MB 左右做微等待，避免一路填滿到硬停造成 sawtooth
-                while (state.fileChannel.bufferedAmount > BUFFERED_SOFT_TARGET) {
-                    await waitForBufferDrain(BACKPRESSURE_SAMPLE_INTERVAL_MS);
-                    if (mySessionId !== currentTransferSessionId) return;
-                    if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
-                        isSendingInProgress = false;
-                        return;
-                    }
-                    // 若瞬間上升到硬停區，交由下方硬停邏輯處理
-                    if (state.fileChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
-                        break;
-                    }
-                }
-
                 if (state.fileChannel.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
                     if (backpressureStallStartedAt === 0) {
                         backpressureStallStartedAt = performance.now();
@@ -1322,7 +1296,15 @@ export async function sendFileChunks(startOffset = null) {
                     }
 
                     while (state.fileChannel.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
-                        await waitForBufferDrain(BACKPRESSURE_SAMPLE_INTERVAL_MS);
+                        await new Promise((resolve) => {
+                            bufferLowResolver = resolve;
+                            setTimeout(() => {
+                                if (bufferLowResolver === resolve) {
+                                    bufferLowResolver = null;
+                                    resolve();
+                                }
+                            }, BACKPRESSURE_SAMPLE_INTERVAL_MS);
+                        });
                         if (mySessionId !== currentTransferSessionId) return;
                         if (!state.fileChannel || state.fileChannel.readyState !== 'open') {
                             isSendingInProgress = false;
