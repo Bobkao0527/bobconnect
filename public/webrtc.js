@@ -289,6 +289,7 @@ function createOPFSWorker(isResume = false) {
 
             const { file, filename, tempFilename } = msg;
             const fileToDelete = tempFilename || currentTempFilename;
+            const actualFileSize = file ? file.size : (state.incomingFileInfo?.size || 0);
 
             console.log('[FINISH SUCCESS]', {
                 filename,
@@ -1082,12 +1083,13 @@ function drainRecvQueue() {
     }
 
     const isTotalReceived = state.incomingFileInfo && state.receivedSize >= state.incomingFileInfo.size;
-    if ((fileEndPending || isTotalReceived) && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
+    if (isTotalReceived && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
         console.log(`[接收端 準備收尾] 總接收已達標 (${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB)，通知 Worker 執行 Finish...`);
         isFinishSent = true;
         fileEndPending = false;
         opfsWorker.postMessage({ type: 'finish' });
     }
+
 }
 
 export function handleIncomingData(data) {
