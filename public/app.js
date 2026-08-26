@@ -18,6 +18,8 @@ window.openPairingModal = openPairingModal;
 window.closePairingModal = closePairingModal;
 window.sendFileChunks = sendFileChunks;
 window.hideToast = hideToast;
+window.toggleWakeLock = toggleWakeLock;
+window.handleClearOPFS = handleClearOPFS;
 
 // 頁面初始化
 window.addEventListener('DOMContentLoaded', async () => {
@@ -102,4 +104,14 @@ function handleFileSelect(file) {
     if (timeText) timeText.innerText = `--:--`;
 
     evaluateFileRouting(file);
+}
+
+async function handleClearOPFS() {
+    try {
+        await clearEntireOPFS();
+        showToast('OPFS 快取已成功清空', 'success');
+    } catch (err) {
+        console.error('[OPFS] 清空失敗:', err);
+        showToast('清空 OPFS 快取失敗', 'error');
+    }
 }

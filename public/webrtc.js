@@ -693,14 +693,14 @@ export function setupStateChannelListeners() {
 
     state.stateChannel.onopen = () => {
         console.log('[stateChannel] 控制通道已就緒');
-        const wasReconnecting = isReconnecting || reconnectAttempts > 0;
+        const isResumeOrReconnect = isReconnecting || reconnectAttempts > 0 || Boolean(state.incomingFileInfo) || state.receivedSize > 0;
         isDisconnectHandled = false;
         isReconnecting = false;
         reconnectAttempts = 0;
         lastActivityTime = Date.now();
 
         updateStatus('P2P 直連已開通 (加密雙通道)', 'green');
-        if (!wasReconnecting) {
+        if (!isResumeOrReconnect) {
             showToast('P2P 控制通道已開通', 'success');
             triggerAppleGlow();
         } else {

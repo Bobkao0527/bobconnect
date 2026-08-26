@@ -70,12 +70,30 @@ export function updateStatus(text, color) {
     if (color === 'green') {
         indicator.classList.add('bg-emerald-500', 'animate-pulse');
         statusText.className = "text-[10px] font-medium tracking-widest text-emerald-400";
+        setPairedUIState(true);
     } else if (color === 'yellow') {
         indicator.classList.add('bg-yellow-500', 'animate-pulse');
         statusText.className = "text-[10px] font-medium tracking-widest text-yellow-400";
     } else {
         indicator.classList.add('bg-red-500');
         statusText.className = "text-[10px] font-medium tracking-widest text-red-400";
+        setPairedUIState(false);
+    }
+}
+
+// 🚀 切換配對前後的 UI 按鈕顯示狀態
+export function setPairedUIState(isPaired) {
+    const manualPairingBtn = document.getElementById('btn-manual-pairing');
+    const pairedActions = document.getElementById('paired-actions');
+
+    if (manualPairingBtn && pairedActions) {
+        if (isPaired) {
+            manualPairingBtn.classList.add('hidden');
+            pairedActions.classList.remove('hidden');
+        } else {
+            manualPairingBtn.classList.remove('hidden');
+            pairedActions.classList.add('hidden');
+        }
     }
 }
 
@@ -106,13 +124,18 @@ export async function acquireWakeLock() {
                 wakeLockSentinel = await navigator.wakeLock.request('screen');
                 wakeLockSentinel.addEventListener('release', () => {
                     wakeLockSentinel = null;
+                    updateWakeLockButtonState(false);
                 });
                 console.log('[系統狀態] 螢幕保持常亮 (Wake Lock 已啟用)');
+                updateWakeLockButtonState(true);
+                return true;
             }
         } catch (err) {
             console.warn('[系統狀態] 無法取得 Wake Lock:', err);
+            return false;
         }
     }
+    return false;
 }
 
 export function releaseWakeLock() {
@@ -122,6 +145,36 @@ export function releaseWakeLock() {
         } catch (err) { }
         wakeLockSentinel = null;
         console.log('[系統狀態] 螢幕常亮鎖已安全釋放');
+        updateWakeLockButtonState(false);
+    }
+}
+
+// 專為 Safari 手勢觸發設計的 Wake Lock 切換函式
+export async function toggleWakeLock() {
+    if (wakeLockSentinel) {
+        releaseWakeLock();
+        showToast('已關閉螢幕長亮', 'info');
+    } else {
+        const success = await acquireWakeLock();
+        if (success) {
+            showToast('已成功保持螢幕長亮', 'success');
+        } else {
+            showToast('無法啟用螢幕長亮（不支援或未允許權限）', 'error');
+        }
+    }
+}
+
+// 更新 Wake Lock 按鈕點亮/熄滅狀態
+function updateWakeLockButtonState(isActive) {
+    const btn = document.getElementById('btn-toggle-wakelock');
+    if (!btn) return;
+
+    if (isActive) {
+        btn.className = "px-3.5 py-1.5 bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5";
+        btn.innerHTML = '✨ 螢幕常亮中';
+    } else {
+        btn.className = "px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5";
+        btn.innerHTML = '💡 保持螢幕長亮';
     }
 }
 

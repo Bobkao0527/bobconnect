@@ -113,9 +113,20 @@
 
             <!-- 輔助入口：手動配對 -->
             <div class="w-full text-center">
-                <button onclick="openPairingModal()" class="text-[10px] text-slate-500 hover:text-slate-300 underline underline-offset-4 tracking-wider transition-all">
+                <!-- 配對前顯示：手動配對入口 -->
+                <button id="btn-manual-pairing" onclick="openPairingModal()" class="text-[10px] text-slate-500 hover:text-slate-300 underline underline-offset-4 tracking-wider transition-all">
                     無相機？使用手動輸入或附近裝置配對
                 </button>
+
+                <!-- 配對後顯示：功能操作按鈕（取代原本的無相機文字） -->
+                <div id="paired-actions" class="hidden flex items-center justify-center gap-3">
+                    <button onclick="handleClearOPFS()" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
+                        🗑️ 清空暫存資料
+                    </button>
+                    <button id="btn-toggle-wakelock" onclick="toggleWakeLock()" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
+                        💡 保持螢幕長亮
+                    </button>
+                </div>
             </div>
 
             <!-- 連線狀態指示器 -->
