@@ -24,19 +24,20 @@ export class SignalRoom {
     this.state.acceptWebSocket(server);
 
     if (roomId) {
-      server.serializeAttachment({ roomId });
+      server.serializeAttachment({ roomId, sessionToken: roomId });
 
-      // 🚀 Joiner 加入時，推播 Host 的 Offer + 所有備份的 Candidates
+      // 🚀 Joiner / 重連者加入時，比對 roomId 或 sessionToken
       for (const socket of this.state.getWebSockets()) {
         if (socket !== server && socket.readyState === 1) {
           try {
             const meta = socket.deserializeAttachment();
-            if (meta && meta.roomId === roomId && meta.offer) {
-              // 發送 Offer
+            const isMatch = meta && (meta.roomId === roomId || meta.sessionToken === roomId);
+            if (isMatch && meta.offer) {
               server.send(JSON.stringify({
                 type: "offer",
                 offer: meta.offer,
-                roomId: roomId
+                roomId: meta.roomId,
+                sessionToken: meta.sessionToken
               }));
 
               // 🚀 補發所有快取在 Attachment 裡的 Candidates
@@ -114,12 +115,14 @@ export class SignalRoom {
       if (data.type === "offer") {
         const ipKey = data.ipKey || "ipv4:127.0.0.1";
         const roomId = data.roomId;
+        const sessionToken = data.sessionToken || roomId;
         
         if (roomId) {
           const existingMeta = ws.deserializeAttachment() || {};
           const updatedMeta = {
             ...existingMeta,
             roomId: roomId,
+            sessionToken: sessionToken,
             ipKey: ipKey,
             offer: data.offer,
             candidates: existingMeta.candidates || [],
@@ -174,12 +177,18 @@ export class SignalRoom {
   broadcast(sender, data) {
     const senderMeta = sender.deserializeAttachment();
     const targetRoomId = data.roomId || (senderMeta ? senderMeta.roomId : null);
+    const targetSessionToken = data.sessionToken || (senderMeta ? senderMeta.sessionToken : null);
     const msg = JSON.stringify(data);
 
     for (const socket of this.state.getWebSockets()) {
       if (socket !== sender && socket.readyState === 1) {
         const socketMeta = socket.deserializeAttachment();
-        if (targetRoomId && socketMeta && socketMeta.roomId === targetRoomId) {
+        
+        // 🚀 修改：精準匹配 PIN 碼或長金鑰
+        const isMatchRoom = targetRoomId && socketMeta && socketMeta.roomId === targetRoomId;
+        const isMatchToken = targetSessionToken && socketMeta && socketMeta.sessionToken === targetSessionToken;
+
+        if (isMatchRoom || isMatchToken) {
           socket.send(msg);
         }
       }

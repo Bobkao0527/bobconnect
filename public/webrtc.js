@@ -67,6 +67,9 @@ function handleSignalingMessage(data) {
     signalingQueue = signalingQueue.then(async () => {
         try {
             if (data.type === 'offer' && !state.isHost) {
+                if (data.sessionToken) {
+                    state.sessionToken = data.sessionToken;
+                }
                 updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
                 await state.peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
                 await processPendingCandidates();
@@ -351,12 +354,16 @@ async function restartSignalingAndPeerConnection() {
 
         const offer = await state.peerConnection.createOffer();
         await state.peerConnection.setLocalDescription(offer);
+        if (!state.sessionToken) {
+            state.sessionToken = 'st_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+        }
 
         const ipKey = state.localIPv4 ? `ipv4:${state.localIPv4}` : null;
         const offerPayload = {
             type: 'offer',
             offer: state.peerConnection.localDescription,
             roomId: state.roomId,
+            sessionToken: state.sessionToken,
             ipKey: ipKey
         };
 
@@ -595,7 +602,8 @@ export async function initHost() {
 }
 
 function connectSignalingWS() {
-    const wsUrl = getWorkerUrl().replace(/^http/, 'ws') + `/ws/${state.roomId}`;
+    const targetRoom = state.sessionToken || state.roomId;
+    const wsUrl = getWorkerUrl().replace(/^http/, 'ws') + `/ws/${targetRoom}`;
     state.ws = new WebSocket(wsUrl);
 
     state.ws.onopen = () => {
@@ -685,14 +693,19 @@ export function setupStateChannelListeners() {
 
     state.stateChannel.onopen = () => {
         console.log('[stateChannel] 控制通道已就緒');
+        const wasReconnecting = isReconnecting || reconnectAttempts > 0;
         isDisconnectHandled = false;
         isReconnecting = false;
         reconnectAttempts = 0;
         lastActivityTime = Date.now();
 
         updateStatus('P2P 直連已開通 (加密雙通道)', 'green');
-        showToast('P2P 控制通道已開通', 'success');
-        triggerAppleGlow();
+        if (!wasReconnecting) {
+            showToast('P2P 控制通道已開通', 'success');
+            triggerAppleGlow();
+        } else {
+            showToast('已完成背景金鑰重連', 'info');
+        }
 
         startHeartbeatAndWatchdog();
 
@@ -705,12 +718,12 @@ export function setupStateChannelListeners() {
                 isMobile: state.localIsMobile
             }));
         } catch (e) { }
-
+        /* 保留休眠連線以實現毫秒級重連
         if (state.ws) {
             state.ws.close();
             state.ws = null;
         }
-
+        */
         document.getElementById('setup-view')?.classList.add('hidden');
         document.getElementById('signaling-box')?.classList.add('hidden');
         const tfPanel = document.getElementById('transfer-panel');
