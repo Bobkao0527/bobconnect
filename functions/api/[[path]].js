@@ -6,9 +6,15 @@ export async function onRequest(context) {
 
   const url = new URL(request.url);
   const path = url.pathname.replace(/^\/api/, "") || "/";
+  const requestOrigin = request.headers.get("Origin");
+  const isWebSocket = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+
+  if ((requestOrigin && requestOrigin !== url.origin) || (isWebSocket && requestOrigin !== url.origin)) {
+    return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+  }
 
   const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": url.origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4",
   };

@@ -31,8 +31,25 @@ window.hideToast = hideToast;
 window.toggleWakeLock = toggleWakeLock;
 window.handleClearOPFS = handleClearOPFS;
 
+function setupButtonHandlers() {
+    document.getElementById('btn-role-host')?.addEventListener('click', initHost);
+    document.getElementById('btn-role-joiner')?.addEventListener('click', startScanner);
+    document.getElementById('btn-manual-pairing')?.addEventListener('click', openPairingModal);
+    document.getElementById('btn-clear-opfs')?.addEventListener('click', handleClearOPFS);
+    document.getElementById('btn-toggle-wakelock')?.addEventListener('click', toggleWakeLock);
+    document.getElementById('btn-send')?.addEventListener('click', sendFileChunks);
+    document.getElementById('btn-hide-toast')?.addEventListener('click', hideToast);
+    document.getElementById('btn-open-pairing-from-scanner')?.addEventListener('click', openPairingModal);
+    document.getElementById('btn-stop-scanner')?.addEventListener('click', stopScanner);
+    document.getElementById('btn-close-pairing')?.addEventListener('click', closePairingModal);
+    document.getElementById('tab-lan-btn')?.addEventListener('click', () => switchPairingTab('lan'));
+    document.getElementById('tab-pin-btn')?.addEventListener('click', () => switchPairingTab('pin'));
+    document.getElementById('btn-scan-nearby')?.addEventListener('click', scanNearbyRooms);
+}
+
 // 頁面初始化
 window.addEventListener('DOMContentLoaded', async () => {
+    setupButtonHandlers();
     checkInAppBrowser(); // 檢查內嵌瀏覽器防暴走
 
     // 🚀【強制 IPv4 探針】：取得公網 IPv4 確保能進行同網域精準匹配

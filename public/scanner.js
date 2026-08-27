@@ -210,12 +210,14 @@ async function scanNearbyRooms() {
         } else if (rooms.length === 1) {
             const targetRoom = rooms[0];
             statusText.innerText = "成功偵測到附近裝置！";
-            roomListContainer.innerHTML = `
-                <button onclick="connectNearbyRoom('${targetRoom}')" class="w-full py-3 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/30 text-emerald-300 text-xs font-bold rounded-xl transition flex items-center justify-center gap-2">
-                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span>
-                    點擊一鍵連線
-                </button>
-            `;
+            const connectButton = document.createElement('button');
+            connectButton.className = "w-full py-3 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/30 text-emerald-300 text-xs font-bold rounded-xl transition flex items-center justify-center gap-2";
+            connectButton.addEventListener('click', () => window.connectNearbyRoom(targetRoom));
+
+            const indicator = document.createElement('span');
+            indicator.className = "w-2 h-2 rounded-full bg-emerald-400 animate-ping";
+            connectButton.append(indicator, document.createTextNode('點擊一鍵連線'));
+            roomListContainer.replaceChildren(connectButton);
         } else {
             state.nearbyRooms = rooms; 
             statusText.innerText = `偵測到 ${rooms.length} 個附近裝置，請輸入驗證碼：`;
@@ -226,11 +228,11 @@ async function scanNearbyRooms() {
     } catch (err) {
         console.error("[LAN 自動偵測失敗]:", err);
         statusText.innerText = "自動偵測目前無法使用，請使用 PIN 碼連線。";
-        roomListContainer.innerHTML = `
-            <button onclick="switchPairingTab('pin')" class="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold rounded-xl transition border border-slate-800">
-                👉 直接輸入 PIN 配對碼
-            </button>
-        `;
+        const pinButton = document.createElement('button');
+        pinButton.className = "w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold rounded-xl transition border border-slate-800";
+        pinButton.textContent = '👉 直接輸入 PIN 配對碼';
+        pinButton.addEventListener('click', () => switchPairingTab('pin'));
+        roomListContainer.replaceChildren(pinButton);
     }
 }
 

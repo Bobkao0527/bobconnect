@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; script-src 'self' https://cdn.tailwindcss.com https://cdnjs.cloudflare.com https://cdn.jsdelivr.net 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss: https://api4.ipify.org https://ipv4.icanhazip.com; media-src 'self' blob:; worker-src 'self' blob:; child-src 'self' blob:;">
     <title>Bob檔案高速傳輸系統</title>
     <!-- 引入 Tailwind CSS 提供極簡現代化 UI -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -10,18 +11,6 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
     <!-- 引入 jsQR 用於相機即時解析 QR Code -->
     <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        brandBlue: '#3b82f6',
-                        brandGreen: '#10b981',
-                    }
-                }
-            }
-        }
-    </script>
     <link rel="icon" href="data:,">
     <!-- 引入外置樣式檔 -->
     <link rel="stylesheet" href="style.css">
@@ -73,7 +62,7 @@
             <!-- 角色選擇：雙圖標大按鈕 -->
             <div id="setup-view" class="grid grid-cols-2 gap-4 w-full">
                 <!-- 發起者按鈕 -->
-                <button id="btn-role-host" onclick="initHost()" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-blue-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
+                <button id="btn-role-host" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-blue-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
                     <div class="p-3 bg-blue-500/10 text-blue-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h.01M16 12h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
                     </div>
@@ -81,7 +70,7 @@
                 </button>
                 
                 <!-- 接收者按鈕 -->
-                <button id="btn-role-joiner" onclick="startJoinerScanner()" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-emerald-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
+                <button id="btn-role-joiner" class="group flex flex-col items-center justify-center p-6 rounded-2xl bg-slate-950 border border-slate-900 hover:border-emerald-500/40 hover:bg-slate-900/40 transition-all duration-300 space-y-3">
                     <div class="p-3 bg-emerald-500/10 text-emerald-400 rounded-xl group-hover:scale-110 transition-transform duration-300">
                         <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path></svg>
                     </div>
@@ -114,16 +103,16 @@
             <!-- 輔助入口：手動配對 -->
             <div class="w-full text-center">
                 <!-- 配對前顯示：手動配對入口 -->
-                <button id="btn-manual-pairing" onclick="openPairingModal()" class="text-[10px] text-slate-500 hover:text-slate-300 underline underline-offset-4 tracking-wider transition-all">
+                <button id="btn-manual-pairing" class="text-[10px] text-slate-500 hover:text-slate-300 underline underline-offset-4 tracking-wider transition-all">
                     無相機？使用手動輸入或附近裝置配對
                 </button>
 
                 <!-- 配對後顯示：功能操作按鈕（取代原本的無相機文字） -->
                 <div id="paired-actions" class="hidden flex items-center justify-center gap-3">
-                    <button onclick="handleClearOPFS()" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
+                    <button id="btn-clear-opfs" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
                         🗑️ 清空暫存資料
                     </button>
-                    <button id="btn-toggle-wakelock" onclick="toggleWakeLock()" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
+                    <button id="btn-toggle-wakelock" class="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white text-[11px] font-medium rounded-xl transition-all shadow-sm flex items-center gap-1.5">
                         💡 保持螢幕長亮
                     </button>
                 </div>
@@ -153,7 +142,7 @@
                         <p id="info-file-name" class="font-bold text-xs text-slate-200 truncate max-w-[200px]">檔案名稱.ext</p>
                         <p id="info-file-size" class="text-[10px] text-slate-500">0 Bytes</p>
                     </div>
-                    <button id="btn-send" onclick="sendFileChunks()" class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-4 py-1.5 rounded-lg transition-all shadow-md shadow-blue-600/10">開始發送</button>
+                    <button id="btn-send" class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs px-4 py-1.5 rounded-lg transition-all shadow-md shadow-blue-600/10">開始發送</button>
                 </div>
 
                 <!-- 進度條 -->
@@ -201,7 +190,7 @@
         <!-- 自訂通知訊息元件 (Toast) -->
         <div id="alert-toast" class="hidden p-3.5 rounded-xl border bg-slate-950 shadow-2xl flex items-center justify-between text-xs transition-all duration-300">
             <span id="toast-msg">提示訊息</span>
-            <button onclick="hideToast()" class="text-slate-400 hover:text-white ml-4 text-[10px] font-bold tracking-wider">關閉</button>
+            <button id="btn-hide-toast" class="text-slate-400 hover:text-white ml-4 text-[10px] font-bold tracking-wider">關閉</button>
         </div>
 
     </main>
@@ -229,10 +218,10 @@
                 </div>
             </div>
 
-            <button onclick="openPairingModal()" class="mt-3 w-full bg-emerald-950/40 hover:bg-emerald-900/40 border border-emerald-500/20 text-emerald-400 font-bold py-2 rounded-xl text-xs transition">
+            <button id="btn-open-pairing-from-scanner" class="mt-3 w-full bg-emerald-950/40 hover:bg-emerald-900/40 border border-emerald-500/20 text-emerald-400 font-bold py-2 rounded-xl text-xs transition">
                 Keyboard 無相機手動輸入
             </button>
-            <button onclick="stopScanner()" class="mt-2 w-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 font-bold py-2 rounded-xl text-xs transition">取消</button>
+            <button id="btn-stop-scanner" class="mt-2 w-full bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 font-bold py-2 rounded-xl text-xs transition">取消</button>
         </div>
     </div>
 
@@ -243,15 +232,15 @@
                 <h3 class="text-sm font-black text-white flex items-center gap-1.5">
                     ⚙️ 手動與附近配對
                 </h3>
-                <button onclick="closePairingModal()" class="text-xs text-slate-500 hover:text-slate-300">✕ 關閉</button>
+                <button id="btn-close-pairing" class="text-xs text-slate-500 hover:text-slate-300">✕ 關閉</button>
             </div>
 
             <!-- 頁籤選擇區 -->
             <div class="flex border-b border-slate-900">
-                <button id="tab-lan-btn" onclick="switchPairingTab('lan')" class="flex-1 py-2 text-center text-xs font-bold border-b-2 border-emerald-500 text-emerald-400">
+                <button id="tab-lan-btn" class="flex-1 py-2 text-center text-xs font-bold border-b-2 border-emerald-500 text-emerald-400">
                     附近裝置 (WiFi)
                 </button>
-                <button id="tab-pin-btn" onclick="switchPairingTab('pin')" class="flex-1 py-2 text-center text-xs font-bold border-b border-slate-900 text-slate-500 hover:text-slate-300">
+                <button id="tab-pin-btn" class="flex-1 py-2 text-center text-xs font-bold border-b border-slate-900 text-slate-500 hover:text-slate-300">
                     輸入 PIN 配對碼
                 </button>
             </div>
@@ -272,7 +261,7 @@
                     <div id="lan-room-list" class="pt-2"></div>
                 </div>
                 
-                <button onclick="scanNearbyRooms()" class="w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded-xl text-[10px] tracking-widest font-mono transition">
+                <button id="btn-scan-nearby" class="w-full py-2 bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white rounded-xl text-[10px] tracking-widest font-mono transition">
                     🔄 重新掃描
                 </button>
             </div>

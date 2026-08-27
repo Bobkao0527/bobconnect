@@ -1,30 +1,67 @@
 // do-worker.js (免 Storage 費用，純 WebSocket Attachment 記憶體架構)
+const MAX_TOTAL_CONNECTIONS = 500;
+const MAX_CONNECTIONS_PER_IP = 20;
+const MAX_CONNECTIONS_PER_ROOM = 3;
+const MAX_MESSAGES_PER_SECOND = 30;
+const MAX_MESSAGE_BYTES = 256 * 1024;
+const MAX_CANDIDATES_PER_CONNECTION = 200;
+const ROOM_LOOKUP_LIMIT = 30;
+const ROOM_LOOKUP_WINDOW_MS = 60 * 1000;
+const CONNECTION_ATTEMPT_LIMIT = 10;
+const CONNECTION_ATTEMPT_WINDOW_MS = 60 * 1000;
+
 export class SignalRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+    this.rateLimits = new Map();
   }
 
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname.replace(/^\/api/, "") || "/";
+    const requestOrigin = request.headers.get("Origin");
+    const isWebSocket = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+
+    if ((requestOrigin && requestOrigin !== url.origin) || (isWebSocket && requestOrigin !== url.origin)) {
+      return new Response("Forbidden", { status: 403, headers: { "Cache-Control": "no-store" } });
+    }
 
     if (path === "/rooms-by-ip") {
       return this.handleRegistry(request, path);
     }
 
-    if (request.headers.get("Upgrade") !== "websocket") {
+    if (!isWebSocket) {
       return new Response("Expected WebSocket", { status: 426 });
     }
 
-    const roomId = path.split("/")[2];
+    const roomId = path.startsWith("/ws/") ? path.slice(4) : null;
+    if (!roomId) {
+      return new Response("Room ID Required", { status: 400 });
+    }
+
+    const ipKey = this.getClientIp(request);
+    const discoveryKey = this.getDiscoveryKey(request);
+    if (this.countActiveSockets() >= MAX_TOTAL_CONNECTIONS) {
+      return new Response("Too Many Connections", { status: 429 });
+    }
+    if (this.countSocketsByIp(ipKey) >= MAX_CONNECTIONS_PER_IP) {
+      return new Response("Too Many Connections From This IP", { status: 429 });
+    }
+    if (!this.consumeRateLimit(`connect:${ipKey}`, CONNECTION_ATTEMPT_LIMIT, CONNECTION_ATTEMPT_WINDOW_MS)) {
+      return new Response("Connection Rate Limit Exceeded", { status: 429 });
+    }
+    if (this.countSocketsByRoom(roomId) >= MAX_CONNECTIONS_PER_ROOM) {
+      return new Response("Room Is Full", { status: 409 });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
     this.state.acceptWebSocket(server);
 
     if (roomId) {
-      server.serializeAttachment({ roomId, sessionToken: roomId });
+      server.serializeAttachment({ roomId, sessionToken: roomId, ipKey, discoveryKey });
 
       // 🚀 Joiner / 重連者加入時，比對 roomId 或 sessionToken
       for (const socket of this.state.getWebSockets()) {
@@ -62,8 +99,9 @@ export class SignalRoom {
 
   // 🚀 核心：利用 WebSocket Attachment 在休眠喚醒時即時還原活躍房間列表
   async handleRegistry(request, path) {
+    const requestOrigin = new URL(request.url).origin;
     const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": requestOrigin,
       "Access-Control-Allow-Methods": "GET, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type, X-Client-IPv4",
     };
@@ -72,21 +110,15 @@ export class SignalRoom {
       return new Response(null, { headers: corsHeaders });
     }
 
-    const getIpKey = (req) => {
-      const clientIpv4 = req.headers.get("X-Client-IPv4");
-      if (clientIpv4) return `ipv4:${clientIpv4}`;
-      const clientIp = req.headers.get("CF-Connecting-IP") || "127.0.0.1";
-      if (clientIp.includes(":")) {
-        const segments = clientIp.split(":");
-        return `ipv6:${segments.slice(0, 4).join(":")}`;
-      }
-      return `ipv4:${clientIp}`;
-    };
-
-    const ipKey = getIpKey(request);
+    const ipKey = this.getClientIp(request);
+    const discoveryKey = this.getDiscoveryKey(request);
 
     // GET /rooms-by-ip (搜尋同 IP 房間)
     if (request.method === "GET" && path === "/rooms-by-ip") {
+      if (!this.consumeRateLimit(`lookup:${ipKey}`, ROOM_LOOKUP_LIMIT, ROOM_LOOKUP_WINDOW_MS)) {
+        return Response.json({ error: "Rate limit exceeded" }, { status: 429, headers: corsHeaders });
+      }
+
       const validRooms = [];
       
       // 遍歷所有『目前仍活著』的 WebSocket 連線
@@ -94,7 +126,7 @@ export class SignalRoom {
         try {
           if (ws.readyState === 1) {
             const roomMeta = ws.deserializeAttachment();
-            if (roomMeta && roomMeta.ipKey === ipKey && roomMeta.roomId) {
+            if (roomMeta && roomMeta.discoveryKey === discoveryKey && roomMeta.roomId) {
               validRooms.push(roomMeta.roomId);
             }
           }
@@ -110,10 +142,32 @@ export class SignalRoom {
   // 🚀 Hibernation API 訊息事件處理器
   async webSocketMessage(ws, message) {
     try {
-      const data = JSON.parse(message);
+      const messageText = typeof message === "string"
+        ? message
+        : new TextDecoder().decode(message);
+      if (new TextEncoder().encode(messageText).byteLength > MAX_MESSAGE_BYTES) {
+        ws.close(1009, "Message Too Large");
+        return;
+      }
+
+      const meta = ws.deserializeAttachment() || {};
+      const now = Date.now();
+      const messageWindowStart = meta.messageWindowStart || now;
+      const messageCount = now - messageWindowStart >= 1000 ? 1 : (meta.messageCount || 0) + 1;
+      const updatedRateMeta = now - messageWindowStart >= 1000
+        ? { ...meta, messageWindowStart: now, messageCount }
+        : { ...meta, messageWindowStart, messageCount };
+      if (messageCount > MAX_MESSAGES_PER_SECOND) {
+        ws.serializeAttachment(updatedRateMeta);
+        ws.close(1008, "Message Rate Limit Exceeded");
+        return;
+      }
+      ws.serializeAttachment(updatedRateMeta);
+
+      const data = JSON.parse(messageText);
       
       if (data.type === "offer") {
-        const ipKey = data.ipKey || "ipv4:127.0.0.1";
+        const ipKey = updatedRateMeta.ipKey;
         const roomId = data.roomId;
         const sessionToken = data.sessionToken || roomId;
         
@@ -150,6 +204,10 @@ export class SignalRoom {
           const meta = ws.deserializeAttachment() || {};
           if (meta.roomId) {
             meta.candidates = meta.candidates || [];
+            if (meta.candidates.length >= MAX_CANDIDATES_PER_CONNECTION) {
+              ws.close(1008, "Too Many ICE Candidates");
+              return;
+            }
             meta.candidates.push(data.candidate);
             ws.serializeAttachment(meta);
           }
@@ -194,10 +252,65 @@ export class SignalRoom {
       }
     }
   }
+
+  getClientIp(request) {
+    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
+    if (clientIp.includes(":")) {
+      const segments = clientIp.split(":");
+      return `ipv6:${segments.slice(0, 4).join(":")}`;
+    }
+    return `ipv4:${clientIp}`;
+  }
+
+  getDiscoveryKey(request) {
+    const clientIpv4 = request.headers.get("X-Client-IPv4");
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(clientIpv4 || "")) {
+      return `ipv4:${clientIpv4}`;
+    }
+    return this.getClientIp(request);
+  }
+
+  countActiveSockets() {
+    return this.state.getWebSockets().filter((socket) => socket.readyState === 1).length;
+  }
+
+  countSocketsByIp(ipKey) {
+    return this.state.getWebSockets().filter((socket) => {
+      if (socket.readyState !== 1) return false;
+      try {
+        return socket.deserializeAttachment()?.ipKey === ipKey;
+      } catch (e) {
+        return false;
+      }
+    }).length;
+  }
+
+  countSocketsByRoom(roomId) {
+    return this.state.getWebSockets().filter((socket) => {
+      if (socket.readyState !== 1) return false;
+      try {
+        return socket.deserializeAttachment()?.roomId === roomId;
+      } catch (e) {
+        return false;
+      }
+    }).length;
+  }
+
+  consumeRateLimit(key, limit, windowMs) {
+    const now = Date.now();
+    const current = this.rateLimits.get(key);
+    if (!current || now - current.startedAt >= windowMs) {
+      this.rateLimits.set(key, { startedAt: now, count: 1 });
+      return true;
+    }
+    if (current.count >= limit) return false;
+    current.count += 1;
+    return true;
+  }
 }
 
 export default {
-  async fetch(request, env) {
-    return new Response("BobConnect Signal DO Worker Running");
+  async fetch() {
+    return new Response("Not Found", { status: 404 });
   }
 };
