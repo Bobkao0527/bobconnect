@@ -1,5 +1,7 @@
 # BobConnect
 
+> [English Version](README.en.md)
+
 BobConnect 是一個以 WebRTC 為核心的瀏覽器點對點檔案傳輸工具。檔案內容會直接在兩個瀏覽器之間傳送，Cloudflare Durable Object 只負責配對與 WebRTC signaling，不會中轉檔案內容。
 
 ## AI 協作者
