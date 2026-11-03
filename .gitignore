@@ -4,3 +4,8 @@
 .wrangler/
 node_modules/
 .vscode/
+.DS_Store
+# Agent 記憶與追蹤檔
+TODO.md
+MEMORY.md
+LOG.md

@@ -2,12 +2,14 @@
 const MAX_TOTAL_CONNECTIONS = 500;
 const MAX_CONNECTIONS_PER_IP = 20;
 const MAX_CONNECTIONS_PER_ROOM = 3;
-const MAX_MESSAGES_PER_SECOND = 30;
+// 放寬至 60：ICE candidate 初次湧入 (多 STUN × 多網卡 × IPv4/IPv6) 可能瞬間超過 30 則而被誤關
+const MAX_MESSAGES_PER_SECOND = 60;
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_CANDIDATES_PER_CONNECTION = 200;
 const ROOM_LOOKUP_LIMIT = 30;
 const ROOM_LOOKUP_WINDOW_MS = 60 * 1000;
-const CONNECTION_ATTEMPT_LIMIT = 10;
+// 放寬至 40：同區網兩端共用公網 IP，斷線重連時雙方各算一次，10 次/分鐘極易觸發 429 使重連卡死
+const CONNECTION_ATTEMPT_LIMIT = 40;
 const CONNECTION_ATTEMPT_WINDOW_MS = 60 * 1000;
 
 export class SignalRoom {
@@ -15,6 +17,13 @@ export class SignalRoom {
     this.state = state;
     this.env = env;
     this.rateLimits = new Map();
+
+    // 🚀 WebSocket 保活：前端每 30 秒送 "ping"，由邊緣直接回 "pong"，不會喚醒 DO (避免 Cloudflare 100 秒閒置斷線)
+    try {
+      this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    } catch (e) {
+      console.warn("[DO] setWebSocketAutoResponse 不可用，改由 webSocketMessage 回應 ping", e);
+    }
   }
 
   async fetch(request) {
@@ -150,6 +159,12 @@ export class SignalRoom {
         return;
       }
 
+      // 保活 ping 的保底處理 (auto-response 不可用時)
+      if (messageText === "ping") {
+        ws.send("pong");
+        return;
+      }
+
       const meta = ws.deserializeAttachment() || {};
       const now = Date.now();
       const messageWindowStart = meta.messageWindowStart || now;
@@ -179,10 +194,24 @@ export class SignalRoom {
             sessionToken: sessionToken,
             ipKey: ipKey,
             offer: data.offer,
-            candidates: existingMeta.candidates || [],
+            // 新 offer 代表新一代 ICE，舊 candidates 已失效；清空也避免長連線累積到上限被關閉
+            candidates: [],
             timestamp: Date.now()
           };
           ws.serializeAttachment(updatedMeta);
+
+          // 🚀 關閉同一 session 中已被取代的舊 Host socket (殘留的舊 offer 會讓重連的 Joiner 拿到過期描述而握手失敗)
+          for (const socket of this.state.getWebSockets()) {
+            if (socket === ws || socket.readyState !== 1) continue;
+            try {
+              const otherMeta = socket.deserializeAttachment();
+              const isSameSession = otherMeta && otherMeta.offer &&
+                (otherMeta.sessionToken === sessionToken || otherMeta.roomId === roomId);
+              if (isSameSession) {
+                socket.close(1000, "Superseded");
+              }
+            } catch (e) {}
+          }
 
           // 🚀 廣播 Offer 給對端
           this.broadcast(ws, data);
