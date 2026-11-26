@@ -14,13 +14,33 @@ let localCandidates = [];
 let pendingCandidates = [];
 
 let recvQueue = [];
+let recvQueueHead = 0;
+let recvQueuedBytes = 0;
 let isWorkerReady = false;
 let inFlightBytes = 0;
-const MAX_IN_FLIGHT_BYTES = 16 * 1024 * 1024; // 16MB 接收並發窗口
 
-// 【接收端流量控制】佇列積壓門檻：超過即請求發送端暫停，消化後恢復
-const PAUSE_QUEUE_COUNT = 256;   // 約 4MB (16KB chunks)
-const RESUME_QUEUE_COUNT = 64;   // 積壓消化到 64 個以下才恢復
+function resetRecvQueue() {
+    recvQueue = [];
+    recvQueueHead = 0;
+    recvQueuedBytes = 0;
+}
+
+// 依裝置記憶體能力決定接收端並發寫入與流量控制位元組門檻
+function getReceiverLimits() {
+    if (state.localIsMobile) {
+        return {
+            maxInFlight: 8 * 1024 * 1024,
+            pauseBytes: 8 * 1024 * 1024,
+            resumeBytes: 2 * 1024 * 1024
+        };
+    }
+    return {
+        maxInFlight: 16 * 1024 * 1024,
+        pauseBytes: 16 * 1024 * 1024,
+        resumeBytes: 4 * 1024 * 1024
+    };
+}
+
 let isPausedRemote = false;
 
 // 【續傳對齊】接收端送出 resume-request 後，丟棄 fileChannel 上的舊 session 資料，
@@ -31,9 +51,31 @@ let totalSent = 0;
 let bufferLowResolver = null;
 let ackWindowResolver = null;
 let flowResumeResolver = null;
-const BUFFERED_LOW_THRESHOLD = 1024 * 1024; // 1MB 累積緩存低水位
-const BUFFERED_HIGH_THRESHOLD = 8 * 1024 * 1024; // 8MB 累積緩存高水位 (Chrome SCTP 佇列上限 16MB，8MB 留足安全餘裕並能吃滿高頻寬延遲乘積)
-const MAX_UNACKED_WINDOW_BYTES = 32 * 1024 * 1024; // 32MB 發送端未確認窗口
+let fileCompleteResolver = null;
+const BUFFERED_LOW_THRESHOLD = 512 * 1024; // 512KB 預設低水位
+const BUFFERED_HIGH_THRESHOLD = 2 * 1024 * 1024; // 2MB 預設高水位
+const MAX_UNACKED_WINDOW_BYTES = 16 * 1024 * 1024; // 16MB 預設未確認窗口
+
+/**
+ * 依裝置環境、sctp.maxMessageSize 與當前速率動態計算發送端流控參數，
+ * 避免 Safari/WebKit 與行動裝置因緩衝過深觸發 Bufferbloat 或 DataChannel 強制關閉。
+ */
+function getSenderFlowParams(smoothSpeed = 0) {
+    const sctpMax = state.peerConnection?.sctp?.maxMessageSize || 0;
+    const isConstrained = state.localIsMobile || state.remoteIsMobile || (sctpMax > 0 && sctpMax <= 65536);
+    if (isConstrained) {
+        return {
+            lowThreshold: 256 * 1024,
+            highThreshold: 1024 * 1024,
+            maxUnackedWindow: 8 * 1024 * 1024
+        };
+    }
+    return {
+        lowThreshold: 512 * 1024,
+        highThreshold: smoothSpeed > 40 * 1024 * 1024 ? 4 * 1024 * 1024 : 2 * 1024 * 1024,
+        maxUnackedWindow: 16 * 1024 * 1024
+    };
+}
 
 const BACKPRESSURE_SAMPLE_INTERVAL_MS = 250;
 // 【穩定性修復】大檔案傳輸時網路抖動或 SCTP 重傳退避 (RFC 4960) 造成短暫停滯是正常現象，
@@ -77,29 +119,44 @@ function wakeTransferWaiters() {
         flowResumeResolver = null;
         resolve();
     }
+    if (fileCompleteResolver) {
+        const resolve = fileCompleteResolver;
+        fileCompleteResolver = null;
+        resolve();
+    }
 }
 
-// 【動態 chunk size】依 RFC 8841 a=max-message-size 協商結果決定。
-// Safari/WebKit 的 maxMessageSize 為 65536 (64KB)，SDP 未聲明時規範預設也是 64KB。
-// 上限保守取 64KB 以確保跨瀏覽器相容 (Firefox 舊版對 ordered channel 僅保證 16KB)。
+// 【動態 chunk size】依 RFC 8841 a=max-message-size 協商結果與 4KB/16KB 頁面對齊決定。
 let CHUNK_SIZE = 16 * 1024; // 預設值，連線建立後依 sctp.maxMessageSize 動態調整
-const MAX_SAFE_CHUNK_SIZE = 64 * 1024;
 
 /**
- * 依協商結果計算安全 chunk size (在 PeerConnection 建立後呼叫)
+ * 依協商結果計算頁面對齊的安全 chunk size (在 PeerConnection 建立後與發送前呼叫)
  */
 function negotiateChunkSize() {
     try {
         const sctpMax = state.peerConnection?.sctp?.maxMessageSize || 0;
-        if (sctpMax > 0) {
-            // 取 min(對端可接收上限, 64KB 安全上限)，再預留 1KB 給潛在 framing 開銷
-            CHUNK_SIZE = Math.min(sctpMax - 1024, MAX_SAFE_CHUNK_SIZE);
+        if (sctpMax >= 262144) {
+            CHUNK_SIZE = 64 * 1024;
+        } else if (sctpMax >= 65536) {
+            // 避開 Safari 64KB 上限邊界與 63KB 奇數跨頁，嚴格對齊 32KB
+            CHUNK_SIZE = 32 * 1024;
         } else {
-            CHUNK_SIZE = 16 * 1024; // 無法取得時退回最保守的 16KB
+            CHUNK_SIZE = 16 * 1024;
         }
         console.log(`[傳輸參數] sctp.maxMessageSize=${sctpMax}, 採用 chunk size=${CHUNK_SIZE / 1024}KB`);
     } catch (e) {
         CHUNK_SIZE = 16 * 1024;
+    }
+}
+
+/**
+ * 建立支援 SCTP Priority 的 DataChannel (高優先級控制通道避免被檔案資料流阻塞)
+ */
+function createPrioritizedChannel(pc, label, priority) {
+    try {
+        return pc.createDataChannel(label, { ordered: true, priority });
+    } catch (e) {
+        return pc.createDataChannel(label, { ordered: true });
     }
 }
 
@@ -111,31 +168,37 @@ const BATCH_ACK_INTERVAL = 1024 * 1024; // 每累積寫入 1MB 即發送一次�
 // 心跳與看門狗
 let heartbeatTimer = null;
 let watchdogTimer = null;
+let disconnectedSoftTimer = null;
 let disconnectedGraceTimer = null;
-const DISCONNECTED_GRACE_MS = 6000; // ICE disconnected 持續 6 秒未恢復即主動重連 (不需苦等 15 秒 liveness)
+const DISCONNECTED_SOFT_RECOVERY_MS = 10000; // ICE disconnected 10 秒先嘗試 In-Band ICE Restart
+const DISCONNECTED_GRACE_MS = 20000; // ICE disconnected 持續 20 秒未恢復才完整重建連線
 let lastActivityTime = Date.now();
 let isDisconnectHandled = false;
 
 // 【看門狗】以「檔案進度」而非封包流量判斷停滯。
-// 原本用 candidate-pair bytes 判斷，但 heartbeat ping 本身就會讓 bytes 增加，
-// 導致 fileChannel 死掉時看門狗永遠不會觸發。
 let lastProgressTime = Date.now();
 let progressRecoveryAttempted = false;
 let sendTransferActive = false; // 發送端是否有進行中的傳輸任務 (避免「只選了檔案未發送」被誤判)
-const LIVENESS_TIMEOUT_MS = 15000;        // 控制通道 15 秒完全無訊息 → 視為斷線
-const PROGRESS_SOFT_TIMEOUT_MS = 20000;   // 20 秒無檔案進度 → 嘗試通道內修復
-const PROGRESS_HARD_TIMEOUT_MS = 40000;   // 40 秒無檔案進度 → 完整重連
+const LIVENESS_TIMEOUT_MS = 30000;        // 控制通道 30 秒完全無訊息 → 視為斷線
+const PROGRESS_SOFT_TIMEOUT_MS = 25000;   // 25 秒無檔案進度 → 嘗試通道內修復
+const PROGRESS_HARD_TIMEOUT_MS = 50000;   // 50 秒無檔案進度 → 完整重連
 
 let isFinishSent = false;
 
-// 斷線重連區
+// 斷線重連與信令對齊狀態區
 let isReconnecting = false;
 let reconnectTimer = null;
 let reconnectAttemptTimer = null;
+let reconnectHandoverTimer = null;
+let wsReconnectTimer = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 15;
 // 單次重連嘗試的逾時：時間內 stateChannel 未開通即判定失敗並重試，避免永久卡住
 const RECONNECT_ATTEMPT_TIMEOUT_MS = 12000;
+let lastAcceptedOfferSdp = null;
+let lastHostOfferSentAt = 0;
+let resumeInitiatedForChannel = null;
+let pendingCompletedCleanup = null;
 
 // 信令 WebSocket 保活：Cloudflare 會切斷閒置 100 秒的 WebSocket
 let wsKeepaliveTimer = null;
@@ -195,6 +258,10 @@ function stopWsKeepalive() {
 // 關閉信令 WebSocket (先解除 handler，避免舊連線的 close/error 事件誤觸重連邏輯)
 function closeSignalingWS() {
     stopWsKeepalive();
+    if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+    }
     const ws = state.ws;
     if (!ws) return;
     ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
@@ -233,12 +300,12 @@ function detachAndClosePeer() {
 
 /**
  * 送出本地 ICE candidate。
- * P2P 控制通道已開通時優先走 stateChannel (In-Band)，不依賴可能已被 Cloudflare 切斷的 DO WebSocket；
- * 否則走 DO WebSocket，再不行就暫存等 WS 開通後補送。
+ * 僅在非完整重連期間且正在進行通道內 ICE Restart 時，優先走 stateChannel (In-Band)；
+ * 其餘情況皆走 DO WebSocket，確保重連握手與初始配對候選不流失。
  */
 function sendLocalCandidate(candidate) {
     const json = typeof candidate.toJSON === 'function' ? candidate.toJSON() : candidate;
-    if (state.stateChannel?.readyState === 'open') {
+    if (!isReconnecting && isInBandRenegotiating && state.stateChannel?.readyState === 'open') {
         try {
             state.stateChannel.send(JSON.stringify({ type: 'inband-candidate', candidate: json }));
             return;
@@ -246,7 +313,12 @@ function sendLocalCandidate(candidate) {
             console.warn('[ICE] In-Band candidate 發送失敗，改走信令伺服器:', e);
         }
     }
-    const payload = { type: 'candidate', candidate: json, roomId: state.roomId };
+    const payload = {
+        type: 'candidate',
+        candidate: json,
+        roomId: state.roomId,
+        sessionToken: state.sessionToken
+    };
     if (state.ws?.readyState === WebSocket.OPEN) {
         state.ws.send(JSON.stringify(payload));
     } else {
@@ -261,6 +333,13 @@ function handleSignalingMessage(data) {
                 if (data.sessionToken) {
                     state.sessionToken = data.sessionToken;
                 }
+                // 防呆：若收到與先前已消費完全相同的過期快取 Offer，直接忽略以免無效重建連線
+                if (data.offer?.sdp && data.offer.sdp === lastAcceptedOfferSdp) {
+                    console.warn('[信令] 忽略重複或過期的快取 Offer');
+                    return;
+                }
+                lastAcceptedOfferSdp = data.offer?.sdp || null;
+
                 // 【快速重連對齊】若 Joiner 的舊 PeerConnection 已經設定過 remoteDescription (或已連通)，
                 // 代表 Host 端已經判定斷線並重建了全新的 PeerConnection 發起新 Offer。
                 // 此時必須立即拆掉本地殘留的舊 PC、換上全新 PC 來接收這個 Offer，不需苦等本地逾時。
@@ -274,6 +353,9 @@ function handleSignalingMessage(data) {
                     clearReconnectTimers();
                     releaseInBandLock();
                     wakeTransferWaiters();
+                    isReconnecting = false;
+                    reconnectAttempts = 0;
+                    resumeInitiatedForChannel = null;
 
                     // 保留當前的信令 WebSocket，僅重建 WebRTC 實例
                     detachAndCloseChannel(state.fileChannel);
@@ -299,6 +381,15 @@ function handleSignalingMessage(data) {
                     state.peerConnection.onicecandidate = (event) => {
                         if (event.candidate) sendLocalCandidate(event.candidate);
                     };
+
+                    // 保護計時器：若收到新 Offer 後 12 秒內仍未成功開通 stateChannel，主動重新觸發重連
+                    reconnectHandoverTimer = setTimeout(() => {
+                        reconnectHandoverTimer = null;
+                        if (state.stateChannel?.readyState !== 'open' && !isDisconnectHandled) {
+                            console.warn('[信令快速重連] 12 秒內未完成對齊握手，觸發重新連線...');
+                            handlePeerDisconnection('重連握手逾時', false);
+                        }
+                    }, RECONNECT_ATTEMPT_TIMEOUT_MS);
                 }
 
                 updateStatus('已接收 Offer 信令，正在回應 Answer...', 'yellow');
@@ -315,6 +406,69 @@ function handleSignalingMessage(data) {
                         roomId: state.roomId,
                         sessionToken: state.sessionToken
                     }));
+                }
+            } else if (data.type === 'request-offer' && state.isHost) {
+                // Joiner 先重連上線並請求新 Offer：若距離上次發送 Offer 超過 2 秒，立即重建 PC 並補發新 Offer
+                if (Date.now() - lastHostOfferSentAt <= 2000) {
+                    console.log('[信令喚醒] 剛剛已發送過新 Offer，忽略重複 request-offer');
+                    return;
+                }
+                console.log('[信令喚醒] 收到 Joiner 請求，立即重建連線並發送新 Offer...');
+                stopHeartbeatAndWatchdog();
+                clearReconnectTimers();
+                releaseInBandLock();
+                wakeTransferWaiters();
+                isReconnecting = false;
+                reconnectAttempts = 0;
+                isDisconnectHandled = false;
+                resumeInitiatedForChannel = null;
+
+                detachAndCloseChannel(state.fileChannel);
+                state.fileChannel = null;
+                detachAndCloseChannel(state.stateChannel);
+                state.stateChannel = null;
+                if (state.peerConnection) {
+                    const oldPc = state.peerConnection;
+                    oldPc.onconnectionstatechange = null;
+                    oldPc.oniceconnectionstatechange = null;
+                    oldPc.onicecandidate = null;
+                    oldPc.ondatachannel = null;
+                    try { oldPc.close(); } catch (e) { }
+                }
+
+                pendingCandidates = [];
+                localCandidates = [];
+
+                state.peerConnection = new RTCPeerConnection(state.rtcConfig);
+                setupPeerConnectionListeners(state.peerConnection);
+                state.stateChannel = createPrioritizedChannel(state.peerConnection, 'stateChannel', 'high');
+                setupStateChannelListeners();
+                state.fileChannel = createPrioritizedChannel(state.peerConnection, 'fileChannel', 'low');
+                setupFileChannelListeners();
+                state.peerConnection.onicecandidate = (event) => {
+                    if (event.candidate) sendLocalCandidate(event.candidate);
+                };
+
+                if (!state.sessionToken) {
+                    state.sessionToken = 'st_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+                }
+
+                const offer = await state.peerConnection.createOffer();
+                await state.peerConnection.setLocalDescription(offer);
+                lastHostOfferSentAt = Date.now();
+
+                const offerPayload = {
+                    type: 'offer',
+                    offer: state.peerConnection.localDescription,
+                    roomId: state.roomId,
+                    sessionToken: state.sessionToken,
+                    ipKey: state.localIPv4 ? `ipv4:${state.localIPv4}` : null
+                };
+
+                if (state.ws?.readyState === WebSocket.OPEN) {
+                    state.ws.send(JSON.stringify(offerPayload));
+                } else {
+                    state.pendingOffer = offerPayload;
                 }
             } else if (data.type === 'answer' && state.isHost) {
                 if (state.peerConnection?.signalingState === 'have-local-offer') {
@@ -371,21 +525,23 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     detachAndClosePeer();
     releaseInBandLock();
 
-    // 中斷當前所有正在等待 buffer / ACK / flow-resume 的 promise
+    // 中斷當前所有正在等待 buffer / ACK / flow-resume / file-complete 的 promise
     wakeTransferWaiters();
 
     // 中斷發送迴圈
     currentTransferSessionId++;
     isSendingInProgress = false;
     isFlowPausedByRemote = false;
+    resumeInitiatedForChannel = null;
 
     // 清空接收端尚未寫入的隊列
-    recvQueue = [];
+    resetRecvQueue();
     inFlightBytes = 0;
     isPausedRemote = false;
 
     const isReceivingIncomplete = state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size;
-    const isSendingIncomplete = state.selectedFile && totalSent < state.selectedFile.size;
+    // 以接收端已確認落盤的 ACK 位移為準，避免最後一塊剛進緩衝區就斷線時被誤判為已完成
+    const isSendingIncomplete = Boolean(sendTransferActive && state.selectedFile && lastConfirmedAckOffset < state.selectedFile.size);
     const hasActiveSession = Boolean(state.roomId && (isReceivingIncomplete || isSendingIncomplete));
 
     if (!isFatal && hasActiveSession) {
@@ -423,8 +579,12 @@ export function handlePeerDisconnection(reason = '連線已斷開', isFatal = fa
     state.incomingFileInfo = null;
     state.receivedSize = 0;
     totalSent = 0;
+    lastConfirmedAckOffset = 0;
     sendTransferActive = false;
     awaitingResumeMarker = false;
+    lastAcceptedOfferSdp = null;
+    lastHostOfferSentAt = 0;
+    resumeInitiatedForChannel = null;
     fileReopenTimestamps = [];
     clearReconnectTimers();
     reconnectAttempts = 0;
@@ -440,6 +600,10 @@ function clearReconnectTimers() {
     if (reconnectAttemptTimer) {
         clearTimeout(reconnectAttemptTimer);
         reconnectAttemptTimer = null;
+    }
+    if (reconnectHandoverTimer) {
+        clearTimeout(reconnectHandoverTimer);
+        reconnectHandoverTimer = null;
     }
 }
 
@@ -547,17 +711,37 @@ function createOPFSWorker(isResume = false) {
             const fileToDelete = tempFilename || currentTempFilename;
             const actualFileSize = file ? file.size : (state.incomingFileInfo?.size || 0);
 
+            if (state.stateChannel?.readyState === 'open') {
+                try {
+                    state.stateChannel.send(JSON.stringify({
+                        type: 'file-complete',
+                        size: actualFileSize
+                    }));
+                } catch (e) { }
+            }
+
             const blobUrl = URL.createObjectURL(file);
             triggerAutoDownload(blobUrl, filename, actualFileSize);
 
-            // 完成後正常清理 Worker 與暫存檔
+            // 完成後正常清理 Worker，並將 Blob URL 與暫存檔保留時間延長至 10 分鐘，避免大檔系統下載複製遭截斷
             cleanupOPFSWorker(true, false);
-            setTimeout(async () => {
+            if (pendingCompletedCleanup) {
+                clearTimeout(pendingCompletedCleanup.timer);
+                URL.revokeObjectURL(pendingCompletedCleanup.blobUrl);
+                if (pendingCompletedCleanup.fileToDelete && pendingCompletedCleanup.fileToDelete !== fileToDelete) {
+                    removeOPFSFile(pendingCompletedCleanup.fileToDelete);
+                }
+            }
+            const cleanupTimer = setTimeout(async () => {
                 URL.revokeObjectURL(blobUrl);
                 if (fileToDelete) {
                     await removeOPFSFile(fileToDelete);
                 }
-            }, 30000);
+                if (pendingCompletedCleanup?.timer === cleanupTimer) {
+                    pendingCompletedCleanup = null;
+                }
+            }, 600000);
+            pendingCompletedCleanup = { blobUrl, fileToDelete, timer: cleanupTimer };
         } else if (msg.type === 'error') {
             releaseWakeLock();
             handlePeerDisconnection('接收端寫入錯誤: ' + msg.message, true);
@@ -586,21 +770,22 @@ function createOPFSWorker(isResume = false) {
 async function restartSignalingAndPeerConnection() {
     localCandidates = [];
     pendingCandidates = [];
+    resumeInitiatedForChannel = null;
 
     state.peerConnection = new RTCPeerConnection(state.rtcConfig);
     setupPeerConnectionListeners(state.peerConnection);
-
-    state.stateChannel = state.peerConnection.createDataChannel('stateChannel', { ordered: true });
-    setupStateChannelListeners();
-
-    state.fileChannel = state.peerConnection.createDataChannel('fileChannel', { ordered: true });
-    setupFileChannelListeners();
 
     state.peerConnection.onicecandidate = (event) => {
         if (event.candidate) sendLocalCandidate(event.candidate);
     };
 
     if (state.isHost) {
+        state.stateChannel = createPrioritizedChannel(state.peerConnection, 'stateChannel', 'high');
+        setupStateChannelListeners();
+
+        state.fileChannel = createPrioritizedChannel(state.peerConnection, 'fileChannel', 'low');
+        setupFileChannelListeners();
+
         // 先確定 sessionToken，讓重連 WS 與 offer 使用同一把金鑰
         if (!state.sessionToken) {
             state.sessionToken = 'st_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
@@ -609,6 +794,7 @@ async function restartSignalingAndPeerConnection() {
 
         const offer = await state.peerConnection.createOffer();
         await state.peerConnection.setLocalDescription(offer);
+        lastHostOfferSentAt = Date.now();
 
         const ipKey = state.localIPv4 ? `ipv4:${state.localIPv4}` : null;
         const offerPayload = {
@@ -658,24 +844,29 @@ function startHeartbeatAndWatchdog() {
 
     heartbeatTimer = setInterval(() => {
         if (state.stateChannel?.readyState === 'open') {
-            const isTransferring = (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) ||
-                (state.selectedFile && totalSent < state.selectedFile.size);
-            const idleTime = Date.now() - lastActivityTime;
+            // 無條件每 2 秒送出一次高優先級 ping，避免傳輸期間雙端單邊抑制造成看門狗誤判
+            try {
+                state.stateChannel.send(JSON.stringify({ type: 'ping' }));
+            } catch (e) {
+                console.warn('[Heartbeat] Ping 發送失敗:', e);
+            }
 
-            if (!isTransferring || idleTime > 3000) {
+            // 保底檢查：若先前曾發送 flow-pause 但積壓已消退，主動補發 flow-resume 防止死鎖
+            const limits = getReceiverLimits();
+            if (isPausedRemote && (recvQueuedBytes + inFlightBytes) <= limits.resumeBytes) {
+                isPausedRemote = false;
                 try {
-                    state.stateChannel.send(JSON.stringify({ type: 'ping' }));
-                } catch (e) {
-                    console.warn('[Heartbeat] Ping 發送失敗:', e);
-                }
+                    state.stateChannel.send(JSON.stringify({ type: 'flow-resume' }));
+                    console.log('[接收端 流量控制] 心跳保底補發 flow-resume');
+                } catch (e) { }
             }
         }
-    }, 1000);
+    }, 2000);
 
     watchdogTimer = setInterval(() => {
         const now = Date.now();
         const isReceiving = Boolean(state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size);
-        const isSending = Boolean(sendTransferActive && state.selectedFile && totalSent < state.selectedFile.size);
+        const isSending = Boolean(sendTransferActive && state.selectedFile && lastConfirmedAckOffset < state.selectedFile.size);
 
         if (!isReceiving && !isSending) {
             // 沒有傳輸任務時持續刷新，避免下次開始傳輸時立即誤判
@@ -684,7 +875,12 @@ function startHeartbeatAndWatchdog() {
         }
         if (!state.stateChannel || state.stateChannel.readyState !== 'open') return;
 
-        // 1) 控制通道存活性：對端每秒會回 ping/pong，15 秒完全沒訊息代表 P2P 已死
+        // 流量控制暫停期間屬於合法等待，刷新進度避免誤觸看門狗重連
+        if (isFlowPausedByRemote || isPausedRemote) {
+            markProgress();
+        }
+
+        // 1) 控制通道存活性：高優先級心跳每 2 秒往返一次，30 秒完全沒訊息代表 P2P 已死
         const silentTime = now - lastActivityTime;
         if (silentTime > LIVENESS_TIMEOUT_MS) {
             console.error(`[看門狗] 控制通道 ${(silentTime / 1000).toFixed(1)} 秒無任何訊息，重新連線續傳...`);
@@ -712,6 +908,10 @@ function startHeartbeatAndWatchdog() {
 }
 
 function clearDisconnectedGraceTimer() {
+    if (disconnectedSoftTimer) {
+        clearTimeout(disconnectedSoftTimer);
+        disconnectedSoftTimer = null;
+    }
     if (disconnectedGraceTimer) {
         clearTimeout(disconnectedGraceTimer);
         disconnectedGraceTimer = null;
@@ -719,7 +919,22 @@ function clearDisconnectedGraceTimer() {
 }
 
 function scheduleDisconnectedGraceTimeout(pc) {
-    clearDisconnectedGraceTimer();
+    if (disconnectedSoftTimer || disconnectedGraceTimer) return;
+
+    // 第一階段 (10 秒)：控制通道仍開著時，先嘗試無損通道內 ICE Restart
+    disconnectedSoftTimer = setTimeout(() => {
+        disconnectedSoftTimer = null;
+        if (pc !== state.peerConnection) return;
+        const connState = pc.connectionState;
+        const iceState = pc.iceConnectionState;
+        if ((connState === 'disconnected' || iceState === 'disconnected') &&
+            state.stateChannel?.readyState === 'open') {
+            console.warn(`[ICE 軟恢復] 處於 disconnected 達 ${DISCONNECTED_SOFT_RECOVERY_MS / 1000} 秒，先嘗試通道內 ICE Restart...`);
+            triggerInBandRenegotiation();
+        }
+    }, DISCONNECTED_SOFT_RECOVERY_MS);
+
+    // 第二階段 (20 秒)：若底層無法自癒，再觸發完整重建連線
     disconnectedGraceTimer = setTimeout(() => {
         disconnectedGraceTimer = null;
         if (pc !== state.peerConnection) return;
@@ -840,6 +1055,10 @@ export async function probeIPv4() {
 export async function initHost() {
     localCandidates = [];
     pendingCandidates = [];
+    lastAcceptedOfferSdp = null;
+    lastHostOfferSentAt = 0;
+    resumeInitiatedForChannel = null;
+    lastConfirmedAckOffset = 0;
     state.isHost = true;
     isDisconnectHandled = false;
 
@@ -861,10 +1080,10 @@ export async function initHost() {
         state.peerConnection = new RTCPeerConnection(state.rtcConfig);
         setupPeerConnectionListeners(state.peerConnection);
 
-        state.stateChannel = state.peerConnection.createDataChannel('stateChannel', { ordered: true });
+        state.stateChannel = createPrioritizedChannel(state.peerConnection, 'stateChannel', 'high');
         setupStateChannelListeners();
 
-        state.fileChannel = state.peerConnection.createDataChannel('fileChannel', { ordered: true });
+        state.fileChannel = createPrioritizedChannel(state.peerConnection, 'fileChannel', 'low');
         setupFileChannelListeners();
 
         state.peerConnection.onicecandidate = (event) => {
@@ -878,6 +1097,7 @@ export async function initHost() {
 
         const offer = await state.peerConnection.createOffer();
         await state.peerConnection.setLocalDescription(offer);
+        lastHostOfferSentAt = Date.now();
 
         const offerPayload = {
             type: 'offer',
@@ -900,6 +1120,10 @@ export async function initHost() {
 }
 
 function connectSignalingWS() {
+    if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
+    }
     const targetRoom = state.sessionToken || state.roomId;
     const wsUrl = getWorkerUrl().replace(/^http/, 'ws') + `/ws/${targetRoom}`;
     closeSignalingWS();
@@ -915,6 +1139,18 @@ function connectSignalingWS() {
         }
         while (localCandidates.length > 0) {
             ws.send(JSON.stringify(localCandidates.shift()));
+        }
+
+        // 若為 Joiner 重連且目前 P2P 控制通道未開通，主動請求 Host 發送新 Offer
+        const isP2pOpen = state.stateChannel?.readyState === 'open';
+        if (!state.isHost && state.sessionToken && !isP2pOpen) {
+            try {
+                ws.send(JSON.stringify({
+                    type: 'request-offer',
+                    roomId: state.roomId,
+                    sessionToken: state.sessionToken
+                }));
+            } catch (e) { }
         }
 
         // 保活：Cloudflare 會切斷閒置 100 秒的 WebSocket；DO 端以 setWebSocketAutoResponse 回 pong，不會喚醒 DO
@@ -949,7 +1185,17 @@ function connectSignalingWS() {
         console.log(`[信令 WebSocket 關閉] code=${event.code} reason=${event.reason || '-'}`);
         stopWsKeepalive();
         state.ws = null;
-        if (isReconnecting) failReconnectAttempt(`信令 WebSocket 關閉 (code=${event.code})`);
+        if (isReconnecting) {
+            failReconnectAttempt(`信令 WebSocket 關閉 (code=${event.code})`);
+        } else if (!isDisconnectHandled && state.roomId && state.sessionToken) {
+            // P2P 傳輸仍在運作但背景熱備援 WS 被邊緣關閉，3 秒後靜默恢復備援連線 (不影響現有 P2P)
+            wsReconnectTimer = setTimeout(() => {
+                wsReconnectTimer = null;
+                if (!isReconnecting && !isDisconnectHandled && !state.ws && state.roomId) {
+                    connectSignalingWS();
+                }
+            }, 3000);
+        }
     };
 }
 
@@ -968,6 +1214,10 @@ export async function initJoinerWithRoom(roomId) {
     if (roomId) state.roomId = roomId;
     localCandidates = [];
     pendingCandidates = [];
+    lastAcceptedOfferSdp = null;
+    lastHostOfferSentAt = 0;
+    resumeInitiatedForChannel = null;
+    lastConfirmedAckOffset = 0;
     isDisconnectHandled = false;
     // 初次加入一律以 PIN 碼進房，sessionToken 會在收到 offer 時由 Host 下發
     state.sessionToken = null;
@@ -991,6 +1241,45 @@ export async function initJoinerWithRoom(roomId) {
     } catch (e) {
         showToast(e.message, 'error');
         updateStatus('連線建立中斷', 'red');
+    }
+}
+
+/**
+ * 雙通道開通順序無關的接收端續傳發起器：
+ * 確保無論 stateChannel 或 fileChannel 誰先觸發 onopen，只要雙通道皆就緒即送出 resume-request。
+ */
+function tryInitiateReceiverResume() {
+    if (state.stateChannel?.readyState !== 'open' || state.fileChannel?.readyState !== 'open') return;
+    if (!state.incomingFileInfo || state.receivedSize >= state.incomingFileInfo.size) return;
+    if (resumeInitiatedForChannel === state.fileChannel) return;
+
+    resumeInitiatedForChannel = state.fileChannel;
+    resetRecvQueue();
+    inFlightBytes = 0;
+    isPausedRemote = false;
+    currentOffset = state.receivedSize;
+    lastAckedOffset = state.receivedSize;
+
+    document.getElementById('incoming-file-box')?.classList.remove('hidden');
+    const recvFileName = document.getElementById('recv-file-name');
+    if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
+    updateRecvUi();
+
+    console.log(`[續傳協商] 雙通道就緒，發送內部續傳請求，Offset: ${state.receivedSize}`);
+    if (!opfsWorker || !isWorkerReady) {
+        createOPFSWorker(true);
+    }
+    awaitingResumeMarker = true;
+
+    try {
+        state.stateChannel.send(JSON.stringify({
+            type: 'resume-request',
+            name: state.incomingFileInfo.name,
+            receivedOffset: state.receivedSize
+        }));
+    } catch (e) {
+        console.warn('[續傳協商] resume-request 發送失敗:', e);
+        resumeInitiatedForChannel = null;
     }
 }
 
@@ -1031,12 +1320,9 @@ export function setupStateChannelListeners() {
                 isMobile: state.localIsMobile
             }));
         } catch (e) { }
-        /* 保留休眠連線以實現毫秒級重連
-        if (state.ws) {
-            state.ws.close();
-            state.ws = null;
-        }
-        */
+
+        tryInitiateReceiverResume();
+
         document.getElementById('setup-view')?.classList.add('hidden');
         document.getElementById('signaling-box')?.classList.add('hidden');
         const tfPanel = document.getElementById('transfer-panel');
@@ -1086,29 +1372,7 @@ export function setupFileChannelListeners() {
         if (ch !== state.fileChannel) return;
         console.log('[fileChannel] 檔案傳輸通道已開通');
         markProgress();
-        if (state.incomingFileInfo && state.receivedSize < state.incomingFileInfo.size) {
-            recvQueue = [];
-            inFlightBytes = 0;
-            currentOffset = state.receivedSize;
-            lastAckedOffset = state.receivedSize;
-
-            document.getElementById('incoming-file-box')?.classList.remove('hidden');
-            const recvFileName = document.getElementById('recv-file-name');
-            if (recvFileName) recvFileName.innerText = state.incomingFileInfo.name;
-            updateRecvUi();
-
-            console.log(`[續傳協商] 發送內部續傳請求，Offset: ${state.receivedSize}`);
-            createOPFSWorker(true);
-            awaitingResumeMarker = true;
-
-            if (state.stateChannel?.readyState === 'open') {
-                state.stateChannel.send(JSON.stringify({
-                    type: 'resume-request',
-                    name: state.incomingFileInfo.name,
-                    receivedOffset: state.receivedSize
-                }));
-            }
-        }
+        tryInitiateReceiverResume();
     };
 
     ch.onclose = () => {
@@ -1125,6 +1389,7 @@ export function setupFileChannelListeners() {
         // 立即終止綁在此通道上的發送迴圈，避免舊迴圈在新通道開通後以錯誤 offset 繼續送資料
         currentTransferSessionId++;
         isFlowPausedByRemote = false;
+        resumeInitiatedForChannel = null;
         wakeTransferWaiters();
 
         if (state.stateChannel?.readyState === 'open') {
@@ -1167,7 +1432,8 @@ function handleFileChannelControl(text) {
             if (msg.offset !== state.receivedSize) {
                 console.warn(`[續傳標記] 發送端 offset (${msg.offset}) 與本地已寫入量 (${state.receivedSize}) 不一致`);
             }
-            recvQueue = [];
+            resetRecvQueue();
+            isPausedRemote = false;
             currentOffset = msg.offset;
             awaitingResumeMarker = false;
             markProgress();
@@ -1223,7 +1489,7 @@ function reopenFileChannelAsHost() {
     }
     detachAndCloseChannel(old);
     try {
-        state.fileChannel = pc.createDataChannel('fileChannel', { ordered: true });
+        state.fileChannel = createPrioritizedChannel(pc, 'fileChannel', 'low');
         setupFileChannelListeners();
         console.log('[fileChannel] Host 已建立新的檔案通道，等待開通後續傳');
     } catch (err) {
@@ -1325,6 +1591,7 @@ function handleInBandSignaling(message) {
                 await startHostIceRestart();
             } else if (message.type === 'inband-offer' && !state.isHost) {
                 await pc.setRemoteDescription(message.offer);
+                await processPendingCandidates();
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 state.stateChannel?.send(JSON.stringify({ type: 'inband-answer', answer: pc.localDescription }));
@@ -1332,6 +1599,7 @@ function handleInBandSignaling(message) {
             } else if (message.type === 'inband-answer' && state.isHost) {
                 if (pc.signalingState === 'have-local-offer') {
                     await pc.setRemoteDescription(message.answer);
+                    await processPendingCandidates();
                     console.log('[In-Band 重連] ICE Restart 協商完成');
                 }
                 releaseInBandLock();
@@ -1361,6 +1629,11 @@ export async function handleControlMessage(jsonString) {
             return;
         }
 
+        if (message.type === 'device-info') {
+            state.remoteIsMobile = Boolean(message.isMobile);
+            return;
+        }
+
         if (message.type && message.type.startsWith('inband-')) {
             handleInBandSignaling(message);
             return;
@@ -1377,6 +1650,28 @@ export async function handleControlMessage(jsonString) {
                     ackWindowResolver = null;
                     resolve();
                 }
+                if (fileCompleteResolver && state.selectedFile && lastConfirmedAckOffset >= state.selectedFile.size) {
+                    const resolve = fileCompleteResolver;
+                    fileCompleteResolver = null;
+                    resolve();
+                }
+            }
+            return;
+        }
+
+        if (message.type === 'file-complete') {
+            markProgress();
+            const confirmedSize = typeof message.size === 'number' ? message.size : (state.selectedFile?.size || 0);
+            lastConfirmedAckOffset = Math.max(lastConfirmedAckOffset, confirmedSize);
+            if (ackWindowResolver) {
+                const resolve = ackWindowResolver;
+                ackWindowResolver = null;
+                resolve();
+            }
+            if (fileCompleteResolver) {
+                const resolve = fileCompleteResolver;
+                fileCompleteResolver = null;
+                resolve();
             }
             return;
         }
@@ -1444,11 +1739,13 @@ export async function handleControlMessage(jsonString) {
             lastRecvSpeedTime = performance.now();
             lastRecvSpeedBytes = state.receivedSize;
             smoothRecvSpeed = 0;
-            recvQueue = [];
+            resetRecvQueue();
             inFlightBytes = 0;
+            isPausedRemote = false;
 
             const isResume = state.receivedSize > 0;
             createOPFSWorker(isResume);
+            resumeInitiatedForChannel = state.fileChannel;
 
             if (isResume) {
                 // 發送端此時可能已從 offset 0 開始送資料，續傳標記到達前收到的資料一律丟棄
@@ -1521,46 +1818,82 @@ function updateRecvUi() {
 function drainRecvQueue() {
     if (!isWorkerReady || !opfsWorker) return;
 
-    while (recvQueue.length > 0 && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
-        const item = recvQueue.shift();
-        const chunkSize = item.byteLength || (item.buffer ? item.buffer.byteLength : 0);
-        if (chunkSize === 0) continue;
+    const limits = getReceiverLimits();
+    const MAX_BATCH_BYTES = 2 * 1024 * 1024; // 每次最多打包 2MB 零拷貝送往 OPFS Worker
 
-        inFlightBytes += chunkSize;
+    while (recvQueueHead < recvQueue.length && inFlightBytes < limits.maxInFlight) {
+        const batchBudget = Math.min(MAX_BATCH_BYTES, limits.maxInFlight - inFlightBytes);
+        const batchChunks = [];
+        const transferList = [];
+        const batchStartOffset = currentOffset;
+        let batchBytes = 0;
 
-        let bufferToTransfer = null;
-        if (item instanceof ArrayBuffer) {
-            bufferToTransfer = item;
-        } else if (ArrayBuffer.isView(item)) {
-            bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
+        while (recvQueueHead < recvQueue.length) {
+            const item = recvQueue[recvQueueHead];
+            const chunkSize = item?.byteLength || (item?.buffer ? item.buffer.byteLength : 0);
+            if (chunkSize === 0) {
+                recvQueue[recvQueueHead] = null;
+                recvQueueHead++;
+                continue;
+            }
+            if (batchChunks.length > 0 && batchBytes + chunkSize > batchBudget) {
+                break;
+            }
+
+            recvQueue[recvQueueHead] = null;
+            recvQueueHead++;
+
+            let bufferToTransfer = null;
+            if (item instanceof ArrayBuffer) {
+                bufferToTransfer = item;
+            } else if (ArrayBuffer.isView(item)) {
+                bufferToTransfer = item.buffer.slice(item.byteOffset, item.byteOffset + item.byteLength);
+            }
+
+            if (bufferToTransfer) {
+                batchChunks.push(bufferToTransfer);
+                transferList.push(bufferToTransfer);
+                batchBytes += chunkSize;
+            }
         }
 
-        if (bufferToTransfer) {
-            try {
-                opfsWorker.postMessage({
-                    type: 'write',
-                    chunk: bufferToTransfer,
-                    offset: currentOffset,
-                    size: chunkSize
-                }, [bufferToTransfer]);
-            } catch (err) {
-                opfsWorker.postMessage({
-                    type: 'write',
-                    chunk: bufferToTransfer,
-                    offset: currentOffset,
-                    size: chunkSize
-                });
-            }
-            currentOffset += chunkSize;
+        if (batchChunks.length === 0) break;
+
+        inFlightBytes += batchBytes;
+        recvQueuedBytes = Math.max(0, recvQueuedBytes - batchBytes);
+        currentOffset += batchBytes;
+
+        try {
+            opfsWorker.postMessage({
+                type: 'write-batch',
+                chunks: batchChunks,
+                offset: batchStartOffset,
+                size: batchBytes
+            }, transferList);
+        } catch (err) {
+            opfsWorker.postMessage({
+                type: 'write-batch',
+                chunks: batchChunks,
+                offset: batchStartOffset,
+                size: batchBytes
+            });
         }
     }
 
-    if (inFlightBytes >= MAX_IN_FLIGHT_BYTES) {
+    // O(1) 頭指標前進後適時壓縮陣列，避免記憶體滯留
+    if (recvQueueHead >= recvQueue.length) {
+        resetRecvQueue();
+    } else if (recvQueueHead >= 256) {
+        recvQueue = recvQueue.slice(recvQueueHead);
+        recvQueueHead = 0;
+    }
+
+    if (inFlightBytes >= limits.maxInFlight) {
         flushCumulativeAck();
     }
 
     // 【接收端 流量控制】積壓已消化，通知發送端恢復傳輸
-    if (isPausedRemote && recvQueue.length <= RESUME_QUEUE_COUNT && inFlightBytes < MAX_IN_FLIGHT_BYTES) {
+    if (isPausedRemote && recvQueuedBytes <= limits.resumeBytes && inFlightBytes < limits.maxInFlight) {
         isPausedRemote = false;
         try {
             state.stateChannel?.send(JSON.stringify({ type: 'flow-resume' }));
@@ -1568,32 +1901,37 @@ function drainRecvQueue() {
         } catch (e) { }
     }
 
-    if (recvQueue.length > 100) {
-        console.warn(`[接收端 佇列積壓] 隊列待處理封包: ${recvQueue.length} 個 | Worker 寫入中記憶體 (inFlight): ${(inFlightBytes / 1024).toFixed(1)} KB`);
+    const pendingCount = recvQueue.length - recvQueueHead;
+    if (pendingCount > 100) {
+        console.warn(`[接收端 佇列積壓] 隊列待處理封包: ${pendingCount} 個 (${(recvQueuedBytes / (1024 * 1024)).toFixed(2)} MB) | Worker 寫入中 (inFlight): ${(inFlightBytes / 1024).toFixed(1)} KB`);
     }
 
     const isTotalReceived = state.incomingFileInfo && state.receivedSize >= state.incomingFileInfo.size;
-    if (isTotalReceived && recvQueue.length === 0 && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
+    if (isTotalReceived && recvQueueHead >= recvQueue.length && inFlightBytes === 0 && opfsWorker && !isFinishSent) {
         console.log(`[接收端 準備收尾] 總接收已達標 (${(state.receivedSize / (1024 * 1024)).toFixed(2)} MB)，通知 Worker 執行 Finish...`);
         isFinishSent = true;
         opfsWorker.postMessage({ type: 'finish' });
     }
-
 }
 
 export function handleIncomingData(data) {
+    const byteLen = data?.byteLength || (data?.buffer ? data.buffer.byteLength : 0);
+    if (byteLen === 0) return;
+
     recvQueue.push(data);
+    recvQueuedBytes += byteLen;
     lastActivityTime = Date.now();
     markProgress();
 
-    // 【接收端流量控制】當佇列積壓過大時，通知發送端暫停，
-    // 避免 iOS Safari 因記憶體壓力直接終止頁面導致「斷線」。
+    // 【接收端流量控制】改以實際位元組總量控管 (佇列 + 寫入中)，
+    // 避免行動端與 Safari 因記憶體壓力直接崩潰導致斷線。
+    const limits = getReceiverLimits();
     if (!isPausedRemote && state.incomingFileInfo &&
-        recvQueue.length > PAUSE_QUEUE_COUNT) {
+        (recvQueuedBytes + inFlightBytes) > limits.pauseBytes) {
         isPausedRemote = true;
         try {
             state.stateChannel?.send(JSON.stringify({ type: 'flow-pause' }));
-            console.warn(`[接收端 流量控制] 佇列積壓 ${recvQueue.length} 個分塊，請求發送端暫停`);
+            console.warn(`[接收端 流量控制] 待寫入位元組達 ${((recvQueuedBytes + inFlightBytes) / (1024 * 1024)).toFixed(2)} MB，請求發送端暫停`);
         } catch (e) { }
     }
 
@@ -1629,7 +1967,7 @@ function waitForChannelOpen(ch, timeoutMs) {
 }
 
 /**
- * 發送檔案分塊 (高效雙水位管線 + 2MB 預讀塊極速重構版)
+ * 發送檔案分塊 (自適應流控 + 4MB 雙緩衝預讀 + 完整排空與落盤確認)
  * @param {number|null} startOffset 指定開始傳輸的 Offset (續傳使用)
  */
 export async function sendFileChunks(startOffset = null) {
@@ -1657,6 +1995,11 @@ export async function sendFileChunks(startOffset = null) {
     isSendingInProgress = true;
     sendTransferActive = true;
     markProgress();
+
+    // 確保發送前取得最新協商分塊大小與自適應流控參數
+    negotiateChunkSize();
+    let flowParams = getSenderFlowParams(0);
+    ch.bufferedAmountLowThreshold = flowParams.lowThreshold;
 
     const btnSend = document.getElementById('btn-send');
     if (btnSend) {
@@ -1695,6 +2038,7 @@ export async function sendFileChunks(startOffset = null) {
     bufferLowResolver = null;
     ackWindowResolver = null;
     flowResumeResolver = null;
+    fileCompleteResolver = null;
     let backpressureStallStartedAt = 0;
     let lastBackpressureBuffered = 0;
     let lastBackpressureAck = lastConfirmedAckOffset;
@@ -1729,6 +2073,10 @@ export async function sendFileChunks(startOffset = null) {
                 return;
             }
 
+            // 每個 4MB 區塊動態刷新自適應流控水位
+            flowParams = getSenderFlowParams(smoothSpeed);
+            ch.bufferedAmountLowThreshold = flowParams.lowThreshold;
+
             const blockBuffer = await (nextBlockPromise || readBlockAt(offset));
             if (!blockBuffer) break;
 
@@ -1737,7 +2085,7 @@ export async function sendFileChunks(startOffset = null) {
             nextBlockPromise = readBlockAt(offset + blockLength);
 
             let blockOffset = 0;
-            let nextYieldAt = 1024 * 1024;
+            let nextYieldAt = 512 * 1024;
 
             while (blockOffset < blockLength) {
                 if (mySessionId !== currentTransferSessionId) return;
@@ -1749,7 +2097,7 @@ export async function sendFileChunks(startOffset = null) {
                 }
 
                 // 【ACK 窗口流控】使用事件驅動 Promise 等待 ACK 到達，不輪詢 setTimeout (避免背景分頁節流)
-                while (offset - lastConfirmedAckOffset > MAX_UNACKED_WINDOW_BYTES) {
+                while (offset - lastConfirmedAckOffset > flowParams.maxUnackedWindow) {
                     await new Promise((resolve) => {
                         ackWindowResolver = resolve;
                         setTimeout(() => {
@@ -1785,14 +2133,14 @@ export async function sendFileChunks(startOffset = null) {
                     }
                 }
 
-                if (ch.bufferedAmount > BUFFERED_HIGH_THRESHOLD) {
+                if (ch.bufferedAmount > flowParams.highThreshold) {
                     if (backpressureStallStartedAt === 0) {
                         backpressureStallStartedAt = performance.now();
                         lastBackpressureBuffered = ch.bufferedAmount;
                         lastBackpressureAck = lastConfirmedAckOffset;
                     }
 
-                    while (ch.bufferedAmount > BUFFERED_LOW_THRESHOLD) {
+                    while (ch.bufferedAmount > flowParams.lowThreshold) {
                         await new Promise((resolve) => {
                             bufferLowResolver = resolve;
                             setTimeout(() => {
@@ -1811,8 +2159,11 @@ export async function sendFileChunks(startOffset = null) {
                         const currentBuffered = ch.bufferedAmount;
                         const currentAck = lastConfirmedAckOffset;
                         if (currentBuffered !== lastBackpressureBuffered || currentAck !== lastBackpressureAck) {
-                            // 只要傳送緩衝有消化，代表底層網路仍在推進，同步刷新進度時間
-                            if (currentBuffered < lastBackpressureBuffered) markProgress();
+                            // 只要傳送緩衝有消化，代表底層網路仍在推進，同步刷新活躍與進度時間
+                            if (currentBuffered < lastBackpressureBuffered) {
+                                lastActivityTime = Date.now();
+                                markProgress();
+                            }
                             backpressureStallStartedAt = now;
                             recoveryRequested = false;
                             lastBackpressureBuffered = currentBuffered;
@@ -1827,7 +2178,6 @@ export async function sendFileChunks(startOffset = null) {
                                 recoveryRequested = true;
 
                                 // 遵循 W3C 規範：背壓停滯僅嘗試無損的 In-Band ICE Restart，絕不在此處直接拆掉 PC
-                                // (真正死透的連線會由 ICE disconnected 6s 逾時、connectionState=failed 或看門狗處理)
                                 if (controlOpen && pcState === 'connected' && (iceState === 'connected' || iceState === 'completed')) {
                                     try {
                                         await triggerInBandRenegotiation();
@@ -1847,17 +2197,47 @@ export async function sendFileChunks(startOffset = null) {
                 const chunkSize = nextBlockOffset - blockOffset;
                 const chunkView = new Uint8Array(blockBuffer, blockOffset, chunkSize);
 
-                ch.send(chunkView);
+                // 單塊容錯重試：若底層緩衝區瞬時滿載拋錯但通道仍活著，退避後重試最多 5 次
+                let sendSuccess = false;
+                for (let attempt = 0; attempt < 5; attempt++) {
+                    if (mySessionId !== currentTransferSessionId) return;
+                    if (!channelAlive()) {
+                        isSendingInProgress = false;
+                        return;
+                    }
+                    try {
+                        ch.send(chunkView);
+                        sendSuccess = true;
+                        break;
+                    } catch (sendErr) {
+                        if (!channelAlive()) {
+                            isSendingInProgress = false;
+                            return;
+                        }
+                        console.warn(`[發送端] ch.send 暫時失敗 (第 ${attempt + 1} 次, buffered=${ch.bufferedAmount}):`, sendErr?.message || sendErr);
+                        await new Promise((resolve) => {
+                            bufferLowResolver = resolve;
+                            setTimeout(() => {
+                                if (bufferLowResolver === resolve) {
+                                    bufferLowResolver = null;
+                                    resolve();
+                                }
+                            }, 50 * (attempt + 1));
+                        });
+                    }
+                }
+                if (!sendSuccess) {
+                    throw new Error('DataChannel 發送緩衝區連續寫入失敗');
+                }
 
                 blockOffset += chunkSize;
                 offset += chunkSize;
                 totalSent = offset;
 
-                // 【修復】每發送 1MB 透過 MessageChannel 零延遲讓出主執行緒，
-                // 避免 UI 凍結，且在背景分頁時不會被 Chrome 的 setTimeout 1 秒節流卡住速率
+                // 每發送 512KB 透過 MessageChannel 零延遲讓出主執行緒，兼顧高吞吐量與心跳/ACK 及時排程
                 if (blockOffset >= nextYieldAt) {
                     await yieldToEventLoop();
-                    nextYieldAt += 1024 * 1024;
+                    nextYieldAt += 512 * 1024;
                 }
 
                 const now = performance.now();
@@ -1896,14 +2276,68 @@ export async function sendFileChunks(startOffset = null) {
 
         if (mySessionId !== currentTransferSessionId) return;
 
-        console.log(`[發送端 完成全數發送] 發送 file-end 信號...`);
+        // 1) 等待底層傳送緩衝完全排空，避免尾端資料仍在記憶體時就宣告結束
+        const progStatus = document.getElementById('progress-status');
+        if (progStatus) progStatus.innerText = '正在排空傳送緩衝...';
+        while (ch.bufferedAmount > 0) {
+            if (mySessionId !== currentTransferSessionId) return;
+            if (!channelAlive()) {
+                isSendingInProgress = false;
+                return;
+            }
+            await new Promise((resolve) => {
+                bufferLowResolver = resolve;
+                setTimeout(() => {
+                    if (bufferLowResolver === resolve) {
+                        bufferLowResolver = null;
+                        resolve();
+                    }
+                }, 50);
+            });
+        }
+
+        if (mySessionId !== currentTransferSessionId) return;
+        console.log(`[發送端 完成全數發送] 發送 file-end 信號，等待接收端確認落盤...`);
+        if (progStatus) progStatus.innerText = '正在確認接收端寫入磁碟...';
 
         if (state.stateChannel?.readyState === 'open') {
             state.stateChannel.send(JSON.stringify({ type: 'file-end' }));
             lastActivityTime = Date.now();
         }
 
-        const progStatus = document.getElementById('progress-status');
+        // 2) 等待接收端回報最終 ACK 或 file-complete，確保尾端區塊已完整落盤
+        let lastConfirmProgressAt = Date.now();
+        let lastSeenAck = lastConfirmedAckOffset;
+        while (lastConfirmedAckOffset < totalSize) {
+            if (mySessionId !== currentTransferSessionId) return;
+            if (!channelAlive() || state.stateChannel?.readyState !== 'open') {
+                isSendingInProgress = false;
+                return;
+            }
+            if (lastConfirmedAckOffset > lastSeenAck) {
+                lastSeenAck = lastConfirmedAckOffset;
+                lastConfirmProgressAt = Date.now();
+            } else if (Date.now() - lastConfirmProgressAt > 30000) {
+                console.warn('[發送端] 等待最終落盤確認逾時 30 秒，結束本次等待');
+                break;
+            }
+            await new Promise((resolve) => {
+                fileCompleteResolver = resolve;
+                setTimeout(() => {
+                    if (fileCompleteResolver === resolve) {
+                        fileCompleteResolver = null;
+                        resolve();
+                    }
+                }, 500);
+            });
+        }
+
+        if (mySessionId !== currentTransferSessionId) return;
+        if (lastConfirmedAckOffset < totalSize) {
+            isSendingInProgress = false;
+            return;
+        }
+
         const progPercent = document.getElementById('progress-percent');
         const progBar = document.getElementById('progress-bar');
         if (progStatus) progStatus.innerText = '傳送完畢';
@@ -1934,12 +2368,24 @@ export async function sendFileChunks(startOffset = null) {
 }
 
 /**
- * 釋放 OPFS Worker 與內部資源 (修復：狀態完整復原)
+ * 釋放 OPFS Worker 與內部資源 (安全關閉 SyncAccessHandle 避免鎖殘留)
  */
 export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
-    if (opfsWorker) {
-        try { opfsWorker.terminate(); } catch (e) { }
-        opfsWorker = null;
+    const workerToClose = opfsWorker;
+    opfsWorker = null;
+
+    if (workerToClose) {
+        if (!isSuccess) {
+            // 非成功完成時先要求 Worker 刷新並關閉 SyncAccessHandle，再於短暫延遲後終止執行緒
+            try {
+                workerToClose.postMessage({ type: 'close-only' });
+            } catch (e) { }
+            setTimeout(() => {
+                try { workerToClose.terminate(); } catch (e) { }
+            }, 60);
+        } else {
+            try { workerToClose.terminate(); } catch (e) { }
+        }
     }
 
     if (ackFlushTimer) {
@@ -1952,14 +2398,41 @@ export function cleanupOPFSWorker(isSuccess = false, forceDelete = false) {
         currentTempFilename = null;
     }
 
-    recvQueue = [];
+    resetRecvQueue();
     isWorkerReady = false;
     isFinishSent = false;
+    isPausedRemote = false;
     inFlightBytes = 0;
     wakeTransferWaiters();
     if (forceDelete || isSuccess) {
         currentOffset = 0;
         lastAckedOffset = 0;
+    }
+}
+
+/**
+ * 僅清理超過指定存活時間的過期暫存檔 (預設 12 小時)，避免多開分頁誤刪進行中的傳輸檔
+ */
+export async function cleanupStaleOPFS(maxAgeMs = 12 * 60 * 60 * 1000) {
+    if (!navigator.storage?.getDirectory) return;
+
+    try {
+        const rootDir = await navigator.storage.getDirectory();
+        const now = Date.now();
+        for await (const [name, handle] of rootDir.entries()) {
+            if (handle.kind !== 'file' || !/^temp_.*\.tmp$/.test(name)) continue;
+            try {
+                const file = await handle.getFile();
+                if (now - file.lastModified > maxAgeMs) {
+                    await rootDir.removeEntry(name);
+                    console.log(`[OPFS 清理] 已移除過期暫存檔: ${name}`);
+                }
+            } catch (err) {
+                // 若該檔案正被另一分頁持有鎖定或讀取失敗則略過
+            }
+        }
+    } catch (err) {
+        console.warn('[OPFS 清理] 過期清理失敗:', err);
     }
 }
 

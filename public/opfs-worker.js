@@ -11,7 +11,40 @@ let targetFileSize = 0;
 let workerWriteCount = 0;
 let pendingAckBytes = 0;
 let ackDebounceTimer = null;
-const ACK_BATCH_THRESHOLD = 256 * 1024; // 累積寫入 256KB 再回傳 ACK，減少 75% 的跨線程 IPC
+const ACK_BATCH_THRESHOLD = 512 * 1024; // 累積寫入 512KB 再回傳 ACK，減少跨線程 IPC 開銷
+const STAGING_BUFFER_SIZE = 2 * 1024 * 1024; // 2MB 聚合寫入緩衝池，大幅減少系統呼叫次數
+const stagingBuffer = new Uint8Array(STAGING_BUFFER_SIZE);
+
+/**
+ * 將單一連續 Uint8Array 寫入指定位移，並驗證是否完整寫入磁碟
+ */
+function writeBytesAt(view, targetOffset) {
+    let bytesWritten = 0;
+    while (bytesWritten < view.byteLength) {
+        const subView = view.subarray(bytesWritten);
+        const writeStart = performance.now();
+        const written = accessHandle.write(
+            subView,
+            { at: targetOffset + bytesWritten }
+        );
+        const writeCost = performance.now() - writeStart;
+        if (writeCost > 100) {
+            console.warn('[OPFS SLOW WRITE]', {
+                offset: targetOffset + bytesWritten,
+                requestBytes: subView.byteLength,
+                writtenBytes: written,
+                costMs: writeCost
+            });
+        }
+        if (written === 0) {
+            throw new Error(
+                `OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`
+            );
+        }
+        bytesWritten += written;
+    }
+    return bytesWritten;
+}
 
 self.addEventListener('error', (err) => {
     console.error('[OPFS Worker 全域錯誤]:', err);
@@ -80,7 +113,7 @@ self.onmessage = async (event) => {
                 // { create: true } 存在即開啟，不存在即建立，不破壞舊有檔案內容
                 fileHandle = await rootDir.getFileHandle(tempFilename, { create: true });
 
-                let retries = 5;
+                let retries = 8;
                 while (retries > 0) {
                     try {
                         accessHandle = await fileHandle.createSyncAccessHandle();
@@ -89,7 +122,7 @@ self.onmessage = async (event) => {
                         retries--;
                         if (retries === 0) throw handleErr;
                         console.warn(`[OPFS Worker] createSyncAccessHandle 失敗，正在重試 (${retries} 次殘餘)...`, handleErr);
-                        await new Promise(resolve => setTimeout(resolve, 200));
+                        await new Promise(resolve => setTimeout(resolve, 250));
                     }
                 }
 
@@ -112,35 +145,11 @@ self.onmessage = async (event) => {
                 }
 
                 workerWriteCount++;
-                const view = new Uint8Array(chunk);
-                let bytesWritten = 0;
-                
-                while (bytesWritten < view.byteLength) {
-                    const subView = view.subarray(bytesWritten);
-                    const writeStart = performance.now();
-                    const written = accessHandle.write(
-                        subView,
-                        { at: offset + bytesWritten }
-                    );
-                    const writeCost = performance.now() - writeStart;
-                    if (writeCost > 50) {
-                        console.warn('[OPFS SLOW WRITE]', {
-                            offset: offset + bytesWritten,
-                            requestBytes: subView.byteLength,
-                            writtenBytes: written,
-                            costMs: writeCost
-                        });
-                    }
-                    if (written === 0) {
-                        throw new Error(
-                            `OPFS 寫入中斷：磁碟可能已滿 (已寫入 ${bytesWritten}/${view.byteLength} bytes)`
-                        );
-                    }
-                    bytesWritten += written;
-                }
+                const view = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                const bytesWritten = writeBytesAt(view, offset);
 
                 const totalWriteCost = performance.now() - writeMessageStart;
-                if (totalWriteCost > 50) {
+                if (totalWriteCost > 100) {
                     console.warn('[OPFS WRITE MESSAGE SLOW]', {
                         offset,
                         size,
@@ -163,6 +172,95 @@ self.onmessage = async (event) => {
                 await cleanup();
                 self.postMessage({ type: 'error', message: err.message || 'OPFS 寫入失敗' });
             }
+            break;
+        }
+
+        case 'write-batch': {
+            const writeMessageStart = performance.now();
+            const { chunks, offset, size } = data;
+            try {
+                if (!accessHandle) {
+                    throw new Error('OPFS 寫入句柄未就緒或已關閉');
+                }
+
+                workerWriteCount++;
+                let currentWriteOffset = offset;
+                let stagedLen = 0;
+                let totalWritten = 0;
+
+                if (Array.isArray(chunks)) {
+                    for (let i = 0; i < chunks.length; i++) {
+                        const buf = chunks[i];
+                        const view = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+                        if (view.byteLength === 0) continue;
+
+                        if (view.byteLength >= STAGING_BUFFER_SIZE) {
+                            if (stagedLen > 0) {
+                                const flushed = writeBytesAt(stagingBuffer.subarray(0, stagedLen), currentWriteOffset);
+                                currentWriteOffset += flushed;
+                                totalWritten += flushed;
+                                stagedLen = 0;
+                            }
+                            const written = writeBytesAt(view, currentWriteOffset);
+                            currentWriteOffset += written;
+                            totalWritten += written;
+                        } else if (stagedLen + view.byteLength > STAGING_BUFFER_SIZE) {
+                            const flushed = writeBytesAt(stagingBuffer.subarray(0, stagedLen), currentWriteOffset);
+                            currentWriteOffset += flushed;
+                            totalWritten += flushed;
+                            stagingBuffer.set(view, 0);
+                            stagedLen = view.byteLength;
+                        } else {
+                            stagingBuffer.set(view, stagedLen);
+                            stagedLen += view.byteLength;
+                        }
+                    }
+                }
+
+                if (stagedLen > 0) {
+                    const flushed = writeBytesAt(stagingBuffer.subarray(0, stagedLen), currentWriteOffset);
+                    currentWriteOffset += flushed;
+                    totalWritten += flushed;
+                    stagedLen = 0;
+                }
+
+                const totalWriteCost = performance.now() - writeMessageStart;
+                if (totalWriteCost > 100) {
+                    console.warn('[OPFS WRITE BATCH SLOW]', {
+                        offset,
+                        size,
+                        actualBytes: totalWritten,
+                        totalCostMs: totalWriteCost,
+                        workerWriteCount
+                    });
+                }
+
+                pendingAckBytes += (totalWritten || size || 0);
+
+                if (pendingAckBytes >= ACK_BATCH_THRESHOLD) {
+                    flushAck();
+                } else if (!ackDebounceTimer) {
+                    ackDebounceTimer = setTimeout(flushAck, 10);
+                }
+            } catch (err) {
+                console.error(`[OPFS Worker] 批次寫入第 ${workerWriteCount} 次時失敗 (offset: ${offset}):`, err);
+                await cleanup();
+                self.postMessage({ type: 'error', message: err.message || 'OPFS 批次寫入失敗' });
+            }
+            break;
+        }
+
+        case 'close-only': {
+            // 斷線重連或清理時僅刷新並安全釋放 SyncAccessHandle，保留暫存檔供續傳使用
+            flushAck();
+            if (accessHandle) {
+                try {
+                    accessHandle.flush();
+                    accessHandle.close();
+                } catch (e) { }
+                accessHandle = null;
+            }
+            self.postMessage({ type: 'closed' });
             break;
         }
 

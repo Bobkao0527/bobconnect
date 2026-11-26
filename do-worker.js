@@ -78,7 +78,7 @@ export class SignalRoom {
           try {
             const meta = socket.deserializeAttachment();
             const isMatch = meta && (meta.roomId === roomId || meta.sessionToken === roomId);
-            if (isMatch && meta.offer) {
+            if (isMatch && meta.offer && !meta.offerConsumed) {
               server.send(JSON.stringify({
                 type: "offer",
                 offer: meta.offer,
@@ -194,6 +194,8 @@ export class SignalRoom {
             sessionToken: sessionToken,
             ipKey: ipKey,
             offer: data.offer,
+            // 標記此 Offer 尚未被消費；收到對應 Answer 後會標為已消費，避免重連 Joiner 拿到過期描述
+            offerConsumed: false,
             // 新 offer 代表新一代 ICE，舊 candidates 已失效；清空也避免長連線累積到上限被關閉
             candidates: [],
             timestamp: Date.now()
@@ -244,6 +246,45 @@ export class SignalRoom {
 
         this.broadcast(ws, data);
       } else if (data.type === "answer") {
+        // 補齊 Joiner 端 socket 的 roomId / sessionToken，確保後續雙向重連廣播可精準命中
+        const targetRoomId = data.roomId || updatedRateMeta.roomId;
+        const targetSessionToken = data.sessionToken || updatedRateMeta.sessionToken;
+        ws.serializeAttachment({
+          ...updatedRateMeta,
+          ...(targetRoomId ? { roomId: targetRoomId } : {}),
+          ...(targetSessionToken ? { sessionToken: targetSessionToken } : {})
+        });
+
+        // 將同會話中 Host 的 Offer 標記為已消費並清空暫存 candidates，防止重連時補發過期舊 Offer
+        for (const socket of this.state.getWebSockets()) {
+          if (socket === ws || socket.readyState !== 1) continue;
+          try {
+            const otherMeta = socket.deserializeAttachment();
+            const isSameSession = otherMeta && otherMeta.offer &&
+              ((targetRoomId && otherMeta.roomId === targetRoomId) ||
+                (targetSessionToken && otherMeta.sessionToken === targetSessionToken));
+            if (isSameSession) {
+              socket.serializeAttachment({
+                ...otherMeta,
+                offerConsumed: true,
+                candidates: []
+              });
+            }
+          } catch (e) {}
+        }
+
+        this.broadcast(ws, data);
+      } else if (data.type === "request-offer") {
+        // Joiner 先重連上線時主動請求 Host 產生新 Offer
+        const targetRoomId = data.roomId || updatedRateMeta.roomId;
+        const targetSessionToken = data.sessionToken || updatedRateMeta.sessionToken;
+        if (targetRoomId || targetSessionToken) {
+          ws.serializeAttachment({
+            ...updatedRateMeta,
+            ...(targetRoomId ? { roomId: targetRoomId } : {}),
+            ...(targetSessionToken ? { sessionToken: targetSessionToken } : {})
+          });
+        }
         this.broadcast(ws, data);
       }
     } catch (e) {
